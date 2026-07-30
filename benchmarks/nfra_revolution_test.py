@@ -419,11 +419,11 @@ def run_benchmark() -> Dict:
         print(f"\n  [1/7] Generating synthetic hierarchical data...")
         train_ds = HierarchicalDataset(NUM_SEQS, SEQ_LEN + 1, seed=SEED)
         eval_ds  = HierarchicalDataset(max(256, NUM_SEQS // 8), SEQ_LEN + 1, seed=SEED + 1)
-    nw = min(4, os.cpu_count() or 1) if HAS_CUDA else 0
+    nw = 0  # num_workers=0 to avoid Kaggle multiprocessing deadlocks
     train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
-                              pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
+                              pin_memory=True, num_workers=nw)
     eval_loader  = DataLoader(eval_ds,  batch_size=BATCH, shuffle=False,
-                              pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
+                              pin_memory=True, num_workers=nw)
     print(f"  └- Train: {len(train_ds):,} seqs | Eval: {len(eval_ds):,} seqs | "
           f"Vocab: {VOCAB} | {time.time()-t0:.0f}s")
 
@@ -506,8 +506,10 @@ def run_benchmark() -> Dict:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
         print(f"\n  -- {label} --")
-        print(f"  └- First eval at step {EVAL_GAP} (dots every 10 steps, ~1-2 min)")
+        print(f"  └- Creating optimizer...", end=' ', flush=True)
         opt, sched = make_optimizer(model, lr=LR, warmup=STEPS // 10, total=STEPS)
+        print(f"done. Training {STEPS} steps...")
+        print(f"  └- First eval at step {EVAL_GAP} (~{EVAL_GAP * BATCH * SEQ_LEN * GRAD_ACCUM // 1000}s)")
         scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
         t_start = time.perf_counter()
         total_tokens = 0
@@ -544,7 +546,7 @@ def run_benchmark() -> Dict:
                     step += 1
                     total_tokens += x.numel() * GRAD_ACCUM
 
-                    if step % 50 == 0 and step % EVAL_GAP != 0:
+                    if step <= 5 or (step % 50 == 0 and step % EVAL_GAP != 0):
                         print(f"  step {step}/{STEPS}")
                     if step % EVAL_GAP == 0:
                         ppl, el = evaluate(model, eval_loader, max_batches=15)
