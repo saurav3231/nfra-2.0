@@ -146,8 +146,8 @@ class TemporalGridEncoder(nn.Module):
         t = torch.arange(S, device=device).float() / S
         freqs = 2.0 * math.pi * torch.exp(self.log_freq)
         angle = freqs[:, None] * t[None, :] + self.phase[:, None]
-        code = torch.cat([angle.sin(), angle.cos()], dim=0)
-        return self.proj(code.T)
+        code = torch.stack([angle.sin(), angle.cos()], dim=-1)
+        return self.proj(code.reshape(S, 2 * self.n_osc))
 
 
 class BrainMixer(nn.Module):
@@ -194,6 +194,11 @@ class BrainMixer(nn.Module):
 
         self.grid_encoder = TemporalGridEncoder(dim)
 
+        # Cache for phase/coherence (plain attrs, not buffers — dynamic shapes)
+        self._cache_S = -1
+        self._cache_phase = None
+        self._cache_coherence = None
+
         self._dim = dim
 
     def forward(
@@ -220,42 +225,43 @@ class BrainMixer(nn.Module):
             ach = hormones[:, 0:1].view(B, 1, 1, 1)
             alpha = 0.8 + 0.19 * alpha + 0.1 * ach * alpha
 
-        positions = torch.arange(S, device=x.device)
-        phases = (
-            2.0 * math.pi * self.frequencies[:, None] * positions[None, :] / S
-            + self.phases[:, None]
-        )
-        phase_signal = torch.sin(phases)
+        # Build or retrieve cached phase signal and sparse coherence
+        if self._cache_S != S:
+            positions = torch.arange(S, device=x.device)
+            phases = (
+                2.0 * math.pi * self.frequencies[:, None] * positions[None, :] / S
+                + self.phases[:, None]
+            )
+            self._cache_phase = torch.sin(phases)
 
-        phase_mean = torch.cos(
-            phases[:, None, :] - phases[None, :, :]
-        ).mean(dim=-1)
-        coherence = torch.sigmoid(self.phase_gate_raw) * (phase_mean > 0.0).float()
+            phase_mean = torch.cos(
+                phases[:, None, :] - phases[None, :, :]
+            ).mean(dim=-1)
+            coherence = torch.sigmoid(self.phase_gate_raw) * (phase_mean > 0.0).float()
 
-        topk = max(2, H // 4)
-        _, topk_idx = coherence.topk(topk, dim=-1)
-        sparse_coherence = torch.zeros_like(coherence)
-        sparse_coherence.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
+            topk = max(2, H // 4)
+            _, topk_idx = coherence.topk(topk, dim=-1)
+            sparse = torch.zeros_like(coherence)
+            sparse.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
+            self._cache_coherence = sparse
+            self._cache_S = S
 
+        phase_signal = self._cache_phase
+        sparse_coherence = self._cache_coherence
+
+        # Preallocate output buffer, avoid list+cat, replace einsum with bmm
+        out = torch.empty_like(value)
         h = torch.zeros(B, H, 1, Hd, device=x.device, dtype=x.dtype)
-        outputs = []
-
         for t in range(S):
-            c = value[:, :, t:t+1]
-            g = gate[:, :, t:t+1]
-
+            g_t = gate[:, :, t:t+1]
+            v_t = value[:, :, t:t+1]
             h_3d = h.squeeze(2)
-            cross_3d = torch.einsum('ij,bjd->bid', sparse_coherence, h_3d)
-            cross = cross_3d.unsqueeze(2)
-
-            h = h * alpha + g * c + 0.05 * cross
-
+            cross = torch.bmm(sparse_coherence.unsqueeze(0).expand(B, -1, -1), h_3d).unsqueeze(2)
+            h = h * alpha + g_t * v_t + 0.05 * cross
             phase_amp = phase_signal[:, t].view(1, H, 1, 1)
             h = h * (1.0 + 0.05 * phase_amp)
+            out[:, :, t:t+1] = h
 
-            outputs.append(h)
-
-        out = torch.cat(outputs, dim=2)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
 
         router_state = out[..., -self.head_dim:]

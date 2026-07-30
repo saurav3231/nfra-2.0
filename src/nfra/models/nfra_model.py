@@ -122,6 +122,11 @@ class NFRAForCausalLM(nn.Module):
         else:
             self.energy_allocator = None
             
+        # Static check: all layers have neuromodulator (brain mode) or none
+        self._has_neuromodulator = (
+            hasattr(self.layers[0], 'neuromodulator') if self.layers else False
+        )
+            
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
 
@@ -132,29 +137,26 @@ class NFRAForCausalLM(nn.Module):
         if energy_budget is not None and not (0.0 <= energy_budget <= 1.0):
             raise ValueError("energy_budget must be between 0.0 and 1.0")
             
-        batch_size, seq_len = input_ids.shape
-        
         hidden_states = self.embed_tokens(input_ids)
         
+        # Convert budgets to floats ONCE before the loop to avoid per-layer GPU sync
         if self.energy_allocator is not None and energy_budget is not None:
-            budgets = self.energy_allocator(hardware_factor=energy_budget)
+            budgets_t = self.energy_allocator(hardware_factor=energy_budget)
+            budgets = budgets_t.detach().cpu().tolist()
         elif energy_budget is not None:
             budgets = [energy_budget] * self.config.num_layers
         else:
             budgets = [1.0] * self.config.num_layers
         
         hormones = None
-        for i, layer in enumerate(self.layers):
-            budget = budgets[i]
-            if hasattr(budget, 'item'):
-                budget = budget.item()
-            
-            if hasattr(layer, 'neuromodulator'):
+        if self._has_neuromodulator:
+            for i, layer in enumerate(self.layers):
                 hidden_states, hormones = layer(
-                    hidden_states, hormones=hormones, energy_budget=budget
+                    hidden_states, hormones=hormones, energy_budget=budgets[i]
                 )
-            else:
-                hidden_states = layer(hidden_states, energy_budget=budget)
+        else:
+            for i, layer in enumerate(self.layers):
+                hidden_states = layer(hidden_states, energy_budget=budgets[i])
         
         logits = self.lm_head(hidden_states)
         

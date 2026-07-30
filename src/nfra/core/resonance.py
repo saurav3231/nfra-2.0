@@ -4,6 +4,7 @@ Resonance-based sparse activation mechanisms for NFRA 3.1
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Tuple, Optional
 import math
 
@@ -63,11 +64,11 @@ class CausalResonanceMixer(nn.Module):
     """
     Multi-band gated linear recurrence with position-modulated resonance.
 
-    Each band is a first-order recurrence: h_t = alpha * h_{t-1} + content_t
+    Each band is a first-order recurrence: h_t = decay * h_{t-1} + content_t
     with learned frequency modulation and per-band output gating.
 
-    O(S * D) complexity. Energy budget scales the recurrence decay (lower budget
-    = faster decay = less context retained).
+    Uses a preallocated output buffer to avoid Python list.append + cat overhead,
+    making torch.compile fusion more effective.
     """
 
     def __init__(self, dim: int, n_bands: int = 4, max_positions: int = 2048):
@@ -75,7 +76,7 @@ class CausalResonanceMixer(nn.Module):
         self.dim = dim
         self.n_bands = n_bands
         self.band_dim = dim // n_bands
-        assert dim % n_bands == 0, f"dim ({dim}) must be divisible by n_bands ({n_bands})"
+        assert dim % n_bands == 0
 
         self.proj_in = nn.Linear(dim, dim * 2)
         self.proj_out = nn.Linear(dim, dim)
@@ -119,14 +120,13 @@ class CausalResonanceMixer(nn.Module):
         pos_mod = pos_mod.view(1, self.n_bands, S, 1)
         content = content * (1.0 + 0.1 * pos_mod)
 
+        # Preallocate output buffer, avoid list+cat overhead
+        out = torch.empty_like(content)
         h = torch.zeros_like(content[:, :, 0:1])
-        outputs = []
         for t in range(S):
-            c = content[:, :, t:t+1]
-            h = h * decay + c
-            outputs.append(h)
+            h = h * decay + content[:, :, t:t+1]
+            out[:, :, t:t+1] = h
 
-        out = torch.cat(outputs, dim=2)
         band_weights = torch.sigmoid(self.band_gate_logits)
         out = out * band_weights.view(1, self.n_bands, 1, 1)
 
@@ -138,14 +138,7 @@ class CausalResonanceMixer(nn.Module):
 
 class ParallelGatedRecurrence(nn.Module):
     """
-    Multi-head gated recurrence for high GPU utilization.
-
-    Each head: h_t = α * h_{t-1} + gate_t ⊙ v_t
-    α is learned per head (position-independent).
-    gate_t = sigmoid(W_g @ x_t) is data-dependent.
-
-    The scan loop is O(S) but each step is just a saxpy on (B, H, head_dim).
-    At B=8, H=16, head_dim=48 this is ~6K elements/step — negligible vs matmuls.
+    Multi-head gated recurrence with preallocated buffer for torch.compile fusion.
     """
 
     def __init__(self, dim: int, n_heads: int = 16):
@@ -175,15 +168,13 @@ class ParallelGatedRecurrence(nn.Module):
         alpha = 0.8 + 0.19 * alpha
         alpha = alpha.view(1, H, 1, Hd)
 
+        # Preallocate output, avoid list+cat
+        out = torch.empty_like(value)
         h = torch.zeros(B, H, 1, Hd, device=x.device, dtype=x.dtype)
-        outputs = []
         for t in range(S):
-            c = value[:, :, t:t+1]
-            g = gate[:, :, t:t+1]
-            h = h * alpha + g * c
-            outputs.append(h)
+            h = h * alpha + gate[:, :, t:t+1] * value[:, :, t:t+1]
+            out[:, :, t:t+1] = h
 
-        out = torch.cat(outputs, dim=2)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
         return self.proj_out(out)
 
@@ -191,17 +182,7 @@ class ParallelGatedRecurrence(nn.Module):
 class MultiScaleGatedRecurrence(nn.Module):
     """
     Multi-scale gated recurrence with hierarchical decay rates.
-
-    Heads organized as [8, 4, 2, 1] + 1 router = 16 total.
-    Each level has a different decay rate (temporal resolution):
-      Level 0: 8 heads,  α ≈ 0.90  — fast, high temporal resolution
-      Level 1: 4 heads,  α ≈ 0.95  — medium
-      Level 2: 2 heads,  α ≈ 0.98  — slow
-      Level 3: 1 head,   α ≈ 0.995 — long-term memory
-      Router:  1 head,   α ≈ 0.90  — produces per-position gating scores
-
-    Total heads is self-computed from head_counts. The caller must ensure
-    dim is divisible by total_heads (default 16 for dim=768).
+    Uses preallocated buffer for torch.compile fusion.
     """
 
     def __init__(self, dim: int, n_heads: Optional[int] = 16):
@@ -241,15 +222,13 @@ class MultiScaleGatedRecurrence(nn.Module):
         alpha = torch.sigmoid(self.log_alpha)
         alpha = alpha.view(1, H, 1, Hd)
 
+        # Preallocate output, avoid list+cat
+        out = torch.empty_like(value)
         h = torch.zeros(B, H, 1, Hd, device=x.device, dtype=x.dtype)
-        outputs = []
         for t in range(S):
-            c = value[:, :, t:t+1]
-            g = gate[:, :, t:t+1]
-            h = h * alpha + g * c
-            outputs.append(h)
+            h = h * alpha + gate[:, :, t:t+1] * value[:, :, t:t+1]
+            out[:, :, t:t+1] = h
 
-        out = torch.cat(outputs, dim=2)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
 
         router_state = out[..., -self.head_dim:]
@@ -260,13 +239,10 @@ class MultiScaleGatedRecurrence(nn.Module):
 
 class ResonanceGuidedLocalAttention(nn.Module):
     """
-    Fixed-window local attention gated by resonance scores — GPU-efficient.
+    Fixed-window local attention gated by resonance scores.
 
-    Uses a pre-built causal sliding window mask (window=64) and learns a
-    per-position gate from the router score. When the gate ≈ 0, attention
-    contributes nothing — the model learns when to attend.
-
-    No per-position loops, no GPU-CPU syncs. Single batched matmul.
+    Uses F.scaled_dot_product_attention (FlashAttention on compatible GPUs)
+    and caches the sliding-window mask to avoid recomputation.
     """
 
     def __init__(self, dim: int, n_heads: int = 2, head_dim: int = 64, window: int = 64):
@@ -282,6 +258,7 @@ class ResonanceGuidedLocalAttention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.router_bias = nn.Parameter(torch.zeros(1))
+        self.register_buffer('_cached_mask', torch.zeros(0, 0), persistent=False)
 
     def forward(
         self, x: torch.Tensor, router_score: torch.Tensor
@@ -293,17 +270,28 @@ class ResonanceGuidedLocalAttention(nn.Module):
         k = self.k_proj(x).view(B, S, H, Hd).transpose(1, 2)
         v = self.v_proj(x).view(B, S, H, Hd).transpose(1, 2)
 
-        positions = torch.arange(S, device=x.device)
-        rel_dist = positions[:, None] - positions[None, :]
-        local_mask = (rel_dist.abs() <= self.window // 2) & (rel_dist >= 0)
-        mask = local_mask.float()
-        mask = mask.masked_fill(mask == 0.0, float('-inf'))
-        mask = mask.masked_fill(mask == 1.0, 0.0)
+        # Build or retrieve cached causal sliding-window mask
+        if self._cached_mask.shape[-1] != S:
+            positions = torch.arange(S, device=x.device)
+            rel_dist = positions[:, None] - positions[None, :]
+            local_mask = (rel_dist.abs() <= self.window // 2) & (rel_dist >= 0)
+            mask = local_mask.float()
+            mask = mask.masked_fill(mask == 0.0, float('-inf'))
+            mask = mask.masked_fill(mask == 1.0, 0.0)
+            self._cached_mask = mask
+        attn_mask = self._cached_mask
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd ** 0.5)
-        scores = scores + mask[None, None, :, :]
-        attn_weights = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn_weights, v)
+        # FlashAttention via scaled_dot_product_attention
+        if hasattr(F, 'scaled_dot_product_attention'):
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+            )
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd ** 0.5)
+            scores = scores + attn_mask[None, None, :, :]
+            attn_weights = torch.softmax(scores, dim=-1)
+            out = torch.matmul(attn_weights, v)
+
         out = out.transpose(1, 2).contiguous().view(B, S, H * Hd)
         out = self.o_proj(out)
 

@@ -405,6 +405,11 @@ class NFRA_Brain_Block(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Precompute depth weights for tensorized thinking depth
+        dw = torch.tensor([0.5 ** d for d in range(max_thinking_depth)])
+        self.register_buffer('depth_weights', dw, persistent=False)
+        self.register_buffer('depth_cumsum', dw.cumsum(0), persistent=False)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -417,13 +422,17 @@ class NFRA_Brain_Block(nn.Module):
 
         if energy_budget is not None:
             budget_factor = 1.0 - energy_budget
-            hc = hormones.clone()
-            hc[:, 4:5] = hormones[:, 4:5] + budget_factor * (1.0 - hormones[:, 4:5])
-            hormones = hc
+            cort = hormones[:, 4:5]
+            hormones = torch.cat([
+                hormones[:, :4],
+                cort + budget_factor * (1.0 - cort),
+                hormones[:, 5:],
+            ], dim=-1)
 
-        da = hormones[:, 2:3].view(B, 1, 1)
-        thinking_depth = max(1, min(self.max_thinking_depth,
-                                    int(1.0 + da.mean().item() * (self.max_thinking_depth - 1))))
+        # Tensor-based thinking depth: no .item() sync, no Python-level dynamic loop
+        da = hormones[:, 2:3].mean(dim=-1, keepdim=True).view(-1, 1, 1)
+        depth_f = 1.0 + da * (self.max_thinking_depth - 1)
+        depth_f = depth_f.clamp(1.0, self.max_thinking_depth)
 
         prediction = self.predictor(x)
         error = x - prediction
@@ -434,14 +443,20 @@ class NFRA_Brain_Block(nn.Module):
         gist = self.gist_proj(n)
         gist_gate = torch.sigmoid(self.gist_gate(n))
 
-        state = 0.0
-        for depth in range(thinking_depth):
+        # Always loop max_thinking_depth times with tensor mask
+        dw = self.depth_weights
+        state = torch.zeros_like(n)
+        for d in range(self.max_thinking_depth):
             recurrence_out, router_score = self.mixer(n, hormones=hormones)
             deep = self.thalamus(n, hormones, recurrence_out)
             combined = gist * gist_gate + deep * (1.0 - gist_gate)
-            state = state + combined * (0.5 ** depth)
+            depth_mask = (depth_f > d).float()
+            state = state + depth_mask * dw[d] * combined
 
-        state = state / sum(0.5 ** d for d in range(thinking_depth))
+        # Tensor normalization: gather norm factor per batch element
+        depth_idx = (depth_f.long().clamp(0, self.max_thinking_depth - 1)).view(-1)
+        norm = self.depth_cumsum[depth_idx].view(B, 1, 1)
+        state = state / (norm + 1e-8)
         state = self.dropout(state)
         x = residual + state
 
