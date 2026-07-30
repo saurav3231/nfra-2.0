@@ -46,15 +46,52 @@ CONFIGS = {
     'rigorous':  dict(layers=24, steps=5000, eval_gap=500,  data_seq=8192),
 }
 
-# -- Device ----------------------------------------------------------
+# -- Device & GPU Auto-Tuning ---------------------------------------
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 HAS_CUDA = DEVICE.type == 'cuda'
+USE_AMP = False
+GPU_MEM_GB = 0.0
+GPU_CC = (0, 0)
+
 if HAS_CUDA:
-    gpu = torch.cuda.get_device_name(0)
-    mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"  GPU: {gpu}  ({mem:.1f} GB)")
+    gpu_name = torch.cuda.get_device_name(0)
+    GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9
+    GPU_CC = (torch.cuda.get_device_capability(0))
+    print(f"  GPU: {gpu_name}  ({GPU_MEM_GB:.1f} GB)  CC {GPU_CC[0]}.{GPU_CC[1]}")
+
+    # -- cuDNN auto-tuner
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # -- TF32 matmul (Tensor Cores on Ampere+; T4 uses FP16)
+    torch.set_float32_matmul_precision('medium')
+
+    # -- Automatic Mixed Precision (FP16 on T4/V100, BF16 on A100+)
+    if GPU_CC >= (8, 0):
+        USE_AMP = True
+        amp_dtype = torch.bfloat16
+        print(f"  [AMP] bfloat16 enabled (A100+ GPU)")
+    elif GPU_CC >= (7, 0):
+        USE_AMP = True
+        amp_dtype = torch.float16
+        print(f"  [AMP] float16 enabled (T4/V100 GPU)")
+    else:
+        print(f"  [AMP] disabled (compute capability < 7.0)")
+
+    # -- Dynamic batch size based on GPU memory
+    # T4-15GB: 32, A100-40GB: 64, A100-80GB: 96
+    if GPU_MEM_GB >= 70:
+        DEFAULT_BATCH = 96
+    elif GPU_MEM_GB >= 35:
+        DEFAULT_BATCH = 64
+    elif GPU_MEM_GB >= 14:
+        DEFAULT_BATCH = 32
+    else:
+        DEFAULT_BATCH = 16
 else:
+    DEFAULT_BATCH = 8
     print("  WARNING: Running on CPU — results will not reflect GPU performance.")
+    print("  [OPT] CPU mode: gradient checkpointing disabled, small batch")
 
 SEED = 42
 torch.manual_seed(SEED)
@@ -224,7 +261,8 @@ def evaluate(model: nn.Module, loader: DataLoader, max_batches: int = 25,
         if i >= max_batches:
             break
         x, y = x.to(DEVICE), y.to(DEVICE)
-        loss = compute_loss(model, x, y, energy_budget=energy_budget)
+        with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
+            loss = compute_loss(model, x, y, energy_budget=energy_budget)
         total_loss += loss.item() * x.size(0)
         n += x.size(0)
     model.train()
@@ -237,14 +275,21 @@ def measure_throughput(model: nn.Module, batch_size: int = 8,
     x = torch.randint(0, 1024, (batch_size, seq_len), device=DEVICE)
     y = torch.randint(0, 1024, (batch_size, seq_len), device=DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
     if HAS_CUDA:
         torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(n_steps):
         opt.zero_grad()
-        loss = compute_loss(model, x, y)
-        loss.backward()
-        opt.step()
+        with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
+            loss = compute_loss(model, x, y)
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            opt.step()
     if HAS_CUDA:
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
@@ -300,7 +345,11 @@ def run_benchmark() -> Dict:
     DIM = 768
     N_HEADS = 16
     SEQ_LEN = 256
-    BATCH = 8
+    BATCH = globals().get('DEFAULT_BATCH', 8)
+    GRAD_ACCUM = 1
+    # Double effective batch on GPU with AMP
+    if HAS_CUDA and USE_AMP:
+        GRAD_ACCUM = 2
     LR = 3e-4
 
     print("+==========================================================+")
@@ -318,8 +367,11 @@ def run_benchmark() -> Dict:
     t0 = time.time()
     train_ds = HierarchicalDataset(NUM_SEQS, SEQ_LEN + 1, seed=SEED)
     eval_ds  = HierarchicalDataset(max(256, NUM_SEQS // 8), SEQ_LEN + 1, seed=SEED + 1)
-    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=0)
-    eval_loader  = DataLoader(eval_ds,  batch_size=BATCH, shuffle=False, num_workers=0)
+    nw = min(4, os.cpu_count() or 1) if HAS_CUDA else 0
+    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
+                              pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
+    eval_loader  = DataLoader(eval_ds,  batch_size=BATCH, shuffle=False,
+                              pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
     print(f"  └- Train: {len(train_ds)} seqs | Eval: {len(eval_ds)} seqs | "
           f"Vocab: {VOCAB} | {time.time()-t0:.0f}s")
 
@@ -336,6 +388,23 @@ def run_benchmark() -> Dict:
         num_layers=L, n_bands=N_HEADS, dropout=0.1,
     )).to(DEVICE)
     nfra_p = count_params(nfra_model)
+
+    # -- torch.compile (fuses small ops, reduces CPU overhead) ----
+    USE_COMPILE = os.environ.get('NFRA_COMPILE', '1') == '1'
+    if USE_COMPILE and HAS_CUDA and torch.__version__ >= '2.0':
+        for label in ['transformer', 'nfra_brain']:
+            model = tf_model if label == 'transformer' else nfra_model
+            try:
+                compiled = torch.compile(model, mode='reduce-overhead', dynamic=True)
+                model.forward = compiled.__call__
+                dummy = torch.randint(0, VOCAB, (2, 64), device=DEVICE)
+                with torch.no_grad():
+                    model(dummy, labels=dummy)
+                print(f"  [{label}] torch.compile + warmup ✓")
+            except Exception as e:
+                print(f"  [{label}] torch.compile skipped ({e})")
+    elif USE_COMPILE and not HAS_CUDA:
+        print("  torch.compile skipped (no GPU)")
 
     ratio = nfra_p / max(tf_p, 1)
     print(f"  |  {'Model':<20s} | {'Params':>12s} | {'vs TF':>10s} |")
@@ -355,10 +424,12 @@ def run_benchmark() -> Dict:
     for label, model in [('transformer', tf_model), ('nfra_brain', nfra_model)]:
         print(f"\n  -- {label} --")
         opt, sched = make_optimizer(model, lr=LR, warmup=STEPS // 10, total=STEPS)
+        scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
         t_start = time.perf_counter()
         total_tokens = 0
         step = 0
         epoch = 0
+        accum_step = 0
 
         while step < STEPS:
             epoch += 1
@@ -366,27 +437,41 @@ def run_benchmark() -> Dict:
                 if step >= STEPS:
                     break
                 x, y = x.to(DEVICE), y.to(DEVICE)
-                opt.zero_grad()
-                loss = compute_loss(model, x, y)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                sched.step()
-                total_tokens += x.numel()
-                step += 1
+                with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
+                    loss = compute_loss(model, x, y)
+                    loss = loss / GRAD_ACCUM
+                if scaler:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                accum_step += 1
 
-                if step % EVAL_GAP == 0:
-                    ppl, el = evaluate(model, eval_loader, max_batches=15)
-                    elapsed = time.perf_counter() - t_start
-                    tok_s = total_tokens / max(elapsed, 0.01)
-                    lr_now = sched.get_last_lr()[0]
-                    histories[label].append({
-                        'step': step, 'loss': el, 'ppl': ppl,
-                        'tok_s': tok_s, 'lr': lr_now, 'tokens': total_tokens,
-                    })
-                    print(f"  Step {step:5d}/{STEPS} | loss {el:.4f} | "
-                          f"ppl {ppl:6.2f} | {tok_s:7.0f} tok/s | "
-                          f"lr {lr_now:.2e}")
+                if accum_step % GRAD_ACCUM == 0:
+                    if scaler:
+                        scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        opt.step()
+                    sched.step()
+                    opt.zero_grad()
+                    step += 1
+                    total_tokens += x.numel() * GRAD_ACCUM
+
+                    if step % EVAL_GAP == 0:
+                        ppl, el = evaluate(model, eval_loader, max_batches=15)
+                        elapsed = time.perf_counter() - t_start
+                        tok_s = total_tokens / max(elapsed, 0.01)
+                        lr_now = sched.get_last_lr()[0]
+                        histories[label].append({
+                            'step': step, 'loss': el, 'ppl': ppl,
+                            'tok_s': tok_s, 'lr': lr_now, 'tokens': total_tokens,
+                        })
+                        print(f"  Step {step:5d}/{STEPS} | loss {el:.4f} | "
+                              f"ppl {ppl:6.2f} | {tok_s:7.0f} tok/s | "
+                              f"lr {lr_now:.2e}")
 
         elapsed = time.perf_counter() - t_start
         avg_tok_s = total_tokens / elapsed
