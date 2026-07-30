@@ -393,12 +393,15 @@ def run_benchmark() -> Dict:
     USE_WIKI = DATA_SOURCE == 'wikitext2' and HAS_DATASETS
     VOCAB = VOCAB_SIZE if USE_WIKI else 4096  # 96 chars or 4096 synthetic
 
+    DIM = 768
+    N_HEADS = 16
+
     print("+==========================================================+")
     print("|         NFRA BRAIN — REPRODUCIBLE REVOLUTION TEST       |")
     print("+==========================================================+")
     print(f"|  Mode:  {MODE:<53s}|")
     print(f"|  Layers:         {L:<6d}   Steps: {STEPS:<6d}        |")
-    print(f"|  Hidden:         768     Heads: 16              |")
+    print(f"|  Hidden:         {DIM:<6d}   Heads: {N_HEADS:<6d}      |")
     print(f"|  Vocab:          {VOCAB:<6d}   SeqLen:{SEQ_LEN:<6d}    |")
     print(f"|  Data:           {'WikiText-2' if USE_WIKI else 'Synthetic':<53s}|")
     print(f"|  Device:         {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU':<53s}|")
