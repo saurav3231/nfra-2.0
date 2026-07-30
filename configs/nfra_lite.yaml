@@ -1,0 +1,36 @@
+# NFRA Lite Configuration
+# Optimized for very old and low-power hardware (e.g., Intel Core i5-337U)
+
+mode: "lite"
+
+model:
+  vocab_size: 50257
+  hidden_size: 384
+  num_layers: 8
+  fractal_scales: [1, 2]      # Only 2 scales for speed
+  dropout: 0.1
+  max_position_embeddings: 1024
+
+advanced:
+  use_mixture_of_fractals: false
+  use_selective_scanning: false
+  use_dynamic_precision: false
+  num_fractal_experts: 0
+  top_k_experts: 0
+
+training:
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  batch_size: 8
+  max_seq_length: 512
+  energy_budget: 0.5          # Very aggressive sparsity
+
+energy:
+  aggressive_sparsity: true
+  min_sparsity: 0.92
+  max_sparsity: 0.97
+
+hardware:
+  target_device: "cpu"
+  precision: "int8"
+  max_threads: 4

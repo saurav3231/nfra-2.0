@@ -1,0 +1,32 @@
+# NFRA 2.0 Configuration - Tiny Model
+# Optimized for very low-power devices (Raspberry Pi, old phones)
+
+model:
+  vocab_size: 50257
+  hidden_size: 256
+  num_layers: 6
+  fractal_scales: [1, 2, 4]
+  dropout: 0.1
+
+advanced:
+  use_mixture_of_fractals: true
+  use_selective_scanning: true
+  use_dynamic_precision: true
+  num_fractal_experts: 4
+  top_k_experts: 2
+
+training:
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  batch_size: 8
+  max_seq_length: 256
+  energy_budget: 0.6
+
+dataset:
+  name: "wikitext"
+  config: "wikitext-2-raw-v1"
+  max_samples: 10000
+
+hardware:
+  device: "auto"
+  precision: "auto"
