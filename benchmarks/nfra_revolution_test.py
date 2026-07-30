@@ -34,6 +34,19 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from nfra import NFRAConfig, NFRAForCausalLM, NFRA_Brain_Block
 
+# -- Data Source ----------------------------------------------------
+# 'wikitext2' (default) or 'synthetic'
+DATA_SOURCE = os.environ.get('NFRA_DATA', 'wikitext2')
+HAS_DATASETS = False
+if DATA_SOURCE == 'wikitext2':
+    try:
+        from datasets import load_dataset
+        HAS_DATASETS = True
+    except ImportError:
+        print("  WARNING: 'datasets' not installed, falling back to synthetic data")
+        print("  Install with: pip install datasets")
+        DATA_SOURCE = 'synthetic'
+
 # -- Experiment Mode -------------------------------------------------
 # 'quick'     → 4 layers, 200 steps  (verifies code, ~2 min on T4)
 # 'standard'  → 12 layers, 1500 steps (credible, ~30 min on T4)
@@ -99,20 +112,48 @@ np.random.seed(SEED)
 
 
 # =====================================================================
-# 1. DATA — Hierarchical synthetic benchmark
+# 1. DATA — WikiText-2 (standard) or hierarchical synthetic (fallback)
 # =====================================================================
+
+CHAR_VOCAB = ['\n', ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+',
+              ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8',
+              '9', ':', ';', '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E',
+              'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
+              'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_',
+              'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+              'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+              '{', '|', '}', '~']
+CHAR2IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
+VOCAB_SIZE = len(CHAR_VOCAB)  # 96
+
+class WikiText2Dataset(Dataset):
+    """Character-level WikiText-2 language modeling dataset."""
+
+    def __init__(self, split: str = 'train', seq_len: int = 256):
+        super().__init__()
+        self.seq_len = seq_len
+        print(f"  └- Loading WikiText-2 ({split})...", end=' ')
+        text = load_dataset("wikitext", "wikitext-2-raw-v1", split=split, trust_remote_code=True)
+        full_text = '\n'.join(text['text'])
+        ids = [CHAR2IDX.get(c, 0) for c in full_text]
+        self.data = torch.tensor(ids, dtype=torch.long)
+        self.num_seqs = len(self.data) // seq_len
+        self.data = self.data[:self.num_seqs * seq_len + 1]
+        print(f"{self.num_seqs} seqs of {seq_len}")
+
+    def __len__(self):
+        return self.num_seqs
+
+    def __getitem__(self, idx):
+        start = idx * self.seq_len
+        x = self.data[start:start + self.seq_len]
+        y = self.data[start + 1:start + self.seq_len + 1]
+        return x, y
+
 
 class HierarchicalDataset(Dataset):
     """
-    Synthetic language data with 3 nested timescales.
-
-    Generation:
-        topic(t)  ~  Cat(π[ topic(t-1) ])         # slow: topic drift
-        word(t)   ~  Cat(φ[ topic(t) ])            # medium: topic-specific vocab
-        token(t)  ~  Cat(θ[ word(t), token(t-1) ]) # fast: local bigram
-
-    This creates genuine multi-scale dependencies that favour models
-    with explicit multi-scale processing like NFRA Brain.
+    Synthetic language data with 3 nested timescales (fallback when datasets unavailable).
 
     Vocabulary: 4096 tokens, 32 topics, perfect for 768-dim models.
     """
@@ -341,38 +382,44 @@ def run_benchmark() -> Dict:
     STEPS = cfg['steps']
     EVAL_GAP = cfg['eval_gap']
     NUM_SEQS = cfg['data_seq']
-    VOCAB = 4096
-    DIM = 768
-    N_HEADS = 16
     SEQ_LEN = 256
     BATCH = globals().get('DEFAULT_BATCH', 8)
     GRAD_ACCUM = 1
-    # Double effective batch on GPU with AMP
     if HAS_CUDA and USE_AMP:
         GRAD_ACCUM = 2
     LR = 3e-4
+
+    # Choose dataset: WikiText-2 (preferred) or synthetic fallback
+    USE_WIKI = DATA_SOURCE == 'wikitext2' and HAS_DATASETS
+    VOCAB = VOCAB_SIZE if USE_WIKI else 4096  # 96 chars or 4096 synthetic
 
     print("+==========================================================+")
     print("|         NFRA BRAIN — REPRODUCIBLE REVOLUTION TEST       |")
     print("+==========================================================+")
     print(f"|  Mode:  {MODE:<53s}|")
     print(f"|  Layers:         {L:<6d}   Steps: {STEPS:<6d}        |")
-    print(f"|  Hidden:         {DIM:<6d}   Heads: {N_HEADS:<6d}      |")
+    print(f"|  Hidden:         768     Heads: 16              |")
     print(f"|  Vocab:          {VOCAB:<6d}   SeqLen:{SEQ_LEN:<6d}    |")
+    print(f"|  Data:           {'WikiText-2' if USE_WIKI else 'Synthetic':<53s}|")
     print(f"|  Device:         {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU':<53s}|")
     print("+==========================================================+")
 
     # -- 1. DATA --------------------------------------------------
-    print("\n  [1/7] Generating synthetic hierarchical data...")
     t0 = time.time()
-    train_ds = HierarchicalDataset(NUM_SEQS, SEQ_LEN + 1, seed=SEED)
-    eval_ds  = HierarchicalDataset(max(256, NUM_SEQS // 8), SEQ_LEN + 1, seed=SEED + 1)
+    if USE_WIKI:
+        print(f"\n  [1/7] Loading WikiText-2 character-level...")
+        train_ds = WikiText2Dataset('train', seq_len=SEQ_LEN + 1)
+        eval_ds  = WikiText2Dataset('validation', seq_len=SEQ_LEN + 1)
+    else:
+        print(f"\n  [1/7] Generating synthetic hierarchical data...")
+        train_ds = HierarchicalDataset(NUM_SEQS, SEQ_LEN + 1, seed=SEED)
+        eval_ds  = HierarchicalDataset(max(256, NUM_SEQS // 8), SEQ_LEN + 1, seed=SEED + 1)
     nw = min(4, os.cpu_count() or 1) if HAS_CUDA else 0
     train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
                               pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
     eval_loader  = DataLoader(eval_ds,  batch_size=BATCH, shuffle=False,
                               pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
-    print(f"  └- Train: {len(train_ds)} seqs | Eval: {len(eval_ds)} seqs | "
+    print(f"  └- Train: {len(train_ds):,} seqs | Eval: {len(eval_ds):,} seqs | "
           f"Vocab: {VOCAB} | {time.time()-t0:.0f}s")
 
     # -- 2. CREATE MODELS -----------------------------------------
@@ -415,13 +462,14 @@ def run_benchmark() -> Dict:
 
     # -- 3. TRAINING ----------------------------------------------
     print(f"\n  [3/7] Training both models ({STEPS} steps)...")
+    print(f"  └- NFRA Brain trains FIRST, then Transformer")
 
     histories = {
-        'transformer': [],
         'nfra_brain':  [],
+        'transformer': [],
     }
 
-    for label, model in [('transformer', tf_model), ('nfra_brain', nfra_model)]:
+    for label, model in [('nfra_brain', nfra_model), ('transformer', tf_model)]:
         print(f"\n  -- {label} --")
         opt, sched = make_optimizer(model, lr=LR, warmup=STEPS // 10, total=STEPS)
         scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
