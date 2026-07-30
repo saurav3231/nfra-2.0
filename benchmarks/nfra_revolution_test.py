@@ -444,22 +444,21 @@ def run_benchmark() -> Dict:
     # -- torch.compile (fuses small ops, reduces CPU overhead) ----
     USE_COMPILE = os.environ.get('NFRA_COMPILE', '1') == '1'
     if USE_COMPILE and HAS_CUDA and torch.__version__ >= '2.0':
-        try:
-            tf_model = torch.compile(tf_model, mode='reduce-overhead', dynamic=True)
-            dummy = torch.randint(0, VOCAB, (2, 64), device=DEVICE)
-            with torch.no_grad():
-                tf_model(dummy)
-            print("  [transformer] torch.compile + warmup ✓")
-        except Exception as e:
-            print(f"  [transformer] torch.compile skipped ({e})")
-        try:
-            nfra_model = torch.compile(nfra_model, mode='reduce-overhead', dynamic=True)
-            dummy = torch.randint(0, VOCAB, (2, 64), device=DEVICE)
-            with torch.no_grad():
-                nfra_model(dummy, labels=dummy)
-            print("  [nfra_brain] torch.compile + warmup ✓")
-        except Exception as e:
-            print(f"  [nfra_brain] torch.compile skipped ({e})")
+        torch._dynamo.config.suppress_errors = True
+        for label in ['transformer', 'nfra_brain']:
+            try:
+                model = tf_model if label == 'transformer' else nfra_model
+                compiled = torch.compile(model, mode='reduce-overhead', dynamic=True)
+                dummy = torch.randint(0, VOCAB, (2, 64), device=DEVICE)
+                with torch.no_grad():
+                    compiled(dummy)
+                if label == 'transformer':
+                    tf_model = compiled
+                else:
+                    nfra_model = compiled
+                print(f"  [{label}] torch.compile + warmup ✓")
+            except Exception:
+                print(f"  [{label}] torch.compile skipped")
     elif USE_COMPILE and not HAS_CUDA:
         print("  torch.compile skipped (no GPU)")
 
