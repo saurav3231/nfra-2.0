@@ -506,7 +506,7 @@ def run_benchmark() -> Dict:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
         print(f"\n  -- {label} --")
-        print(f"  └- First eval at step {EVAL_GAP} (~{EVAL_GAP * BATCH * SEQ_LEN / 50000:.0f}s for 50k tok/s)")
+        print(f"  └- First eval at step {EVAL_GAP} (dots every 10 steps, ~1-2 min)")
         opt, sched = make_optimizer(model, lr=LR, warmup=STEPS // 10, total=STEPS)
         scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
         t_start = time.perf_counter()
@@ -544,6 +544,8 @@ def run_benchmark() -> Dict:
                     step += 1
                     total_tokens += x.numel() * GRAD_ACCUM
 
+                    if step % 50 == 0 and step % EVAL_GAP != 0:
+                        print(f"  step {step}/{STEPS}")
                     if step % EVAL_GAP == 0:
                         ppl, el = evaluate(model, eval_loader, max_batches=15)
                         elapsed = time.perf_counter() - t_start
