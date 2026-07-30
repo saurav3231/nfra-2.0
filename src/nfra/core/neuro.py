@@ -193,11 +193,6 @@ class BrainMixer(nn.Module):
 
         self.grid_encoder = TemporalGridEncoder(dim)
 
-        # Cache for phase/coherence (plain attrs, not buffers — dynamic shapes)
-        self._cache_S = -1
-        self._cache_phase = None
-        self._cache_coherence = None
-
         self._dim = dim
 
     def forward(
@@ -225,29 +220,23 @@ class BrainMixer(nn.Module):
             alpha = 0.8 + 0.19 * alpha + 0.1 * ach * alpha
             alpha = alpha.clamp(max=0.99)
 
-        # Build or retrieve cached phase signal and sparse coherence
-        if self._cache_S != S:
-            positions = torch.arange(S, device=x.device)
-            phases = (
-                2.0 * math.pi * self.frequencies[:, None] * positions[None, :] / S
-                + self.phases[:, None]
-            )
-            self._cache_phase = torch.sin(phases)
+        # Phase signal and sparse coherence (recomputed each forward for gradient flow)
+        positions = torch.arange(S, device=x.device)
+        phases = (
+            2.0 * math.pi * self.frequencies[:, None] * positions[None, :] / S
+            + self.phases[:, None]
+        )
+        phase_signal = torch.sin(phases)
 
-            phase_mean = torch.cos(
-                phases[:, None, :] - phases[None, :, :]
-            ).mean(dim=-1)
-            coherence = torch.sigmoid(self.phase_gate_raw) * torch.sigmoid(phase_mean * 5.0)
+        phase_mean = torch.cos(
+            phases[:, None, :] - phases[None, :, :]
+        ).mean(dim=-1)
+        coherence = torch.sigmoid(self.phase_gate_raw) * torch.sigmoid(phase_mean * 5.0)
 
-            topk = max(2, H // 4)
-            _, topk_idx = coherence.topk(topk, dim=-1)
-            sparse = torch.zeros_like(coherence)
-            sparse.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
-            self._cache_coherence = sparse
-            self._cache_S = S
-
-        phase_signal = self._cache_phase
-        sparse_coherence = self._cache_coherence
+        topk = max(2, H // 4)
+        _, topk_idx = coherence.topk(topk, dim=-1)
+        sparse_coherence = torch.zeros_like(coherence)
+        sparse_coherence.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
 
         # Preallocate output buffer, avoid list+cat, replace einsum with bmm
         out = torch.empty_like(value)
