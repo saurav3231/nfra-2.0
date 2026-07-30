@@ -48,9 +48,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nfra-research/nfra-2.0"
-Documentation = "https://nfra.readthedocs.io"
-Repository = "https://github.com/nfra-research/nfra-2.0"
+Homepage = "https://github.com/saurav3231/nfra-2.0"
+Documentation = "https://github.com/saurav3231/nfra-2.0"
+Repository = "https://github.com/saurav3231/nfra-2.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]
