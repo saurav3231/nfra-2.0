@@ -21,7 +21,7 @@
 +======================================================================+
 """
 
-import os, sys, time, math, json, csv
+import os, sys, time, math, json, csv, warnings
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
@@ -441,24 +441,30 @@ def run_benchmark() -> Dict:
     )).to(DEVICE)
     nfra_p = count_params(nfra_model)
 
-    # -- torch.compile (fuses small ops, reduces CPU overhead) ----
-    USE_COMPILE = os.environ.get('NFRA_COMPILE', '1') == '1'
+    # -- torch.compile (opt-in, default off) -------------------------
+    # NFRA Brain's complex ops compile for 5-10+ min on T4 with marginal gain.
+    # Set NFRA_COMPILE=1 to compile transformer only (fast, ~30s).
+    # Set NFRA_COMPILE_BRAIN=1 to also compile brain (slow, 5-10+ min).
+    USE_COMPILE = os.environ.get('NFRA_COMPILE', '0') == '1'
     if USE_COMPILE and HAS_CUDA and torch.__version__ >= '2.0':
         torch._dynamo.config.suppress_errors = True
-        for label in ['transformer', 'nfra_brain']:
+        for label, model in [('transformer', tf_model), ('nfra_brain', nfra_model)]:
+            if label == 'nfra_brain' and os.environ.get('NFRA_COMPILE_BRAIN', '0') != '1':
+                print(f"  [{label}] compile skipped (set NFRA_COMPILE_BRAIN=1)")
+                continue
+            print(f"  [{label}] torch.compile...", end=' ', flush=True)
+            t_comp = time.time()
             try:
-                model = tf_model if label == 'transformer' else nfra_model
-                compiled = torch.compile(model, mode='reduce-overhead', dynamic=True)
-                dummy = torch.randint(0, VOCAB, (2, 64), device=DEVICE)
+                compiled = torch.compile(model, mode='default', dynamic=True)
                 with torch.no_grad():
-                    compiled(dummy)
+                    compiled(torch.randint(0, VOCAB, (2, 64), device=DEVICE))
                 if label == 'transformer':
                     tf_model = compiled
                 else:
                     nfra_model = compiled
-                print(f"  [{label}] torch.compile + warmup ✓")
+                print(f"✓ ({time.time()-t_comp:.1f}s)")
             except Exception:
-                print(f"  [{label}] torch.compile skipped")
+                print(f"→ eager mode")
     elif USE_COMPILE and not HAS_CUDA:
         print("  torch.compile skipped (no GPU)")
 
@@ -473,30 +479,34 @@ def run_benchmark() -> Dict:
     print(f"\n  [3/7] Training both models ({STEPS} steps)...")
     print(f"  └- NFRA Brain trains FIRST, then Transformer")
 
-    # Estimate memory per batch and warn if too high
-    est_mem_per_batch = (nfra_p * 4 * 6) / (1024**3)  # ~6x params for optimizer states + grads + activations
-    est_train_mem = est_mem_per_batch * BATCH
-    if HAS_CUDA and est_train_mem > GPU_MEM_GB * 0.6:
-        print(f"  └- WARNING: estimated memory {est_train_mem:.1f}GB > 60% of GPU ({GPU_MEM_GB:.1f}GB)")
-        print(f"  └- Reducing batch size to avoid OOM")
-        while est_train_mem > GPU_MEM_GB * 0.6 and BATCH > 2:
+    # Rough memory estimate (params dominate, not batch)
+    # FP16 weights + FP32 Adam(2x) + FP16 grads + activations + CUDA overhead
+    mem_param = nfra_p * (2 + 8 + 2) / 1e9       # 12 bytes/param
+    mem_activ = BATCH * SEQ_LEN * DIM * L * 5 * 2 / 1e9  # activations
+    est_mem = mem_param + mem_activ + 0.5          # +0.5 GB CUDA overhead
+    if HAS_CUDA and est_mem > GPU_MEM_GB * 0.6:
+        print(f"  └- Estimated memory {est_mem:.1f}GB > 60% of GPU ({GPU_MEM_GB:.1f}GB)")
+        while est_mem > GPU_MEM_GB * 0.6 and BATCH > 2:
             BATCH = BATCH // 2
+            mem_activ = BATCH * SEQ_LEN * DIM * L * 5 * 2 / 1e9
+            est_mem = mem_param + mem_activ + 0.5
             train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
                                       pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
             eval_loader  = DataLoader(eval_ds,  batch_size=BATCH, shuffle=False,
                                       pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
-            est_train_mem = est_mem_per_batch * BATCH
 
     histories = {
         'nfra_brain':  [],
         'transformer': [],
     }
 
+    warnings.filterwarnings('ignore', 'Detected call of.*lr_scheduler.*before.*optimizer')
     for label, model in [('nfra_brain', nfra_model), ('transformer', tf_model)]:
         if HAS_CUDA:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
         print(f"\n  -- {label} --")
+        print(f"  └- First eval at step {EVAL_GAP} (~{EVAL_GAP * BATCH * SEQ_LEN / 50000:.0f}s for 50k tok/s)")
         opt, sched = make_optimizer(model, lr=LR, warmup=STEPS // 10, total=STEPS)
         scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
         t_start = time.perf_counter()
