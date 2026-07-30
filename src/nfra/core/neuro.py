@@ -144,7 +144,7 @@ class TemporalGridEncoder(nn.Module):
 
     def forward(self, S: int, device: torch.device) -> torch.Tensor:
         t = torch.arange(S, device=device).float() / S
-        freqs = 2.0 * math.pi * torch.exp(self.log_freq)
+        freqs = 2.0 * math.pi * torch.exp(self.log_freq.clamp(max=10.0))
         angle = freqs[:, None] * t[None, :] + self.phase[:, None]
         code = torch.stack([angle.sin(), angle.cos()], dim=-1)
         return self.proj(code.reshape(S, 2 * self.n_osc))
@@ -172,9 +172,8 @@ class BrainMixer(nn.Module):
         self.head_counts = [8, 4, 2, 1]
         self.n_heads = sum(self.head_counts) + 1
         self.head_dim = dim // self.n_heads
-        assert dim == self.n_heads * self.head_dim, (
-            f"dim ({dim}) must be divisible by {self.n_heads}"
-        )
+        if dim != self.n_heads * self.head_dim:
+            raise ValueError(f"dim ({dim}) must be divisible by {self.n_heads}")
 
         self.proj_gate = nn.Linear(dim, dim, bias=False)
         self.proj_value = nn.Linear(dim, dim, bias=False)
@@ -224,6 +223,7 @@ class BrainMixer(nn.Module):
         if hormones is not None:
             ach = hormones[:, 0:1].view(B, 1, 1, 1)
             alpha = 0.8 + 0.19 * alpha + 0.1 * ach * alpha
+            alpha = alpha.clamp(max=0.99)
 
         # Build or retrieve cached phase signal and sparse coherence
         if self._cache_S != S:
@@ -237,7 +237,7 @@ class BrainMixer(nn.Module):
             phase_mean = torch.cos(
                 phases[:, None, :] - phases[None, :, :]
             ).mean(dim=-1)
-            coherence = torch.sigmoid(self.phase_gate_raw) * (phase_mean > 0.0).float()
+            coherence = torch.sigmoid(self.phase_gate_raw) * torch.sigmoid(phase_mean * 5.0)
 
             topk = max(2, H // 4)
             _, topk_idx = coherence.topk(topk, dim=-1)
@@ -350,9 +350,10 @@ class BrainMLP(nn.Module):
 
         if hormones is not None:
             cort = hormones[:, 4:5].view(B, 1, 1)
-            threshold = 1.0 / routing.shape[-1] * (1.0 + cort)
-            routing = routing * (routing > threshold).float()
-            routing = routing / (routing.sum(dim=-1, keepdim=True) + 1e-8)
+            threshold = 0.5 / routing.shape[-1] * (1.0 + cort)
+            routing = routing * (routing >= threshold).float()
+            denom = routing.sum(dim=-1, keepdim=True)
+            routing = routing / (denom + (denom == 0).float())
 
         weight_map = routing[:, :, self.routing_idx]
         hidden = hidden * weight_map

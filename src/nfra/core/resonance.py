@@ -16,8 +16,8 @@ class ResonanceSignature:
 
     def similarity(self, other: 'ResonanceSignature') -> float:
         freq_diff = abs(self.frequency - other.frequency)
-        phase_diff = abs(self.phase - other.phase)
-        return math.exp(-freq_diff) * math.cos(phase_diff)
+        phase_diff = min(abs(self.phase - other.phase), math.pi)
+        return math.exp(-freq_diff) * (1.0 + math.cos(phase_diff)) / 2.0
 
 
 class ResonanceRouter(nn.Module):
@@ -76,7 +76,8 @@ class CausalResonanceMixer(nn.Module):
         self.dim = dim
         self.n_bands = n_bands
         self.band_dim = dim // n_bands
-        assert dim % n_bands == 0
+        if dim % n_bands != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by n_bands ({n_bands})")
 
         self.proj_in = nn.Linear(dim, dim * 2)
         self.proj_out = nn.Linear(dim, dim)
@@ -146,7 +147,8 @@ class ParallelGatedRecurrence(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
-        assert dim % n_heads == 0
+        if dim % n_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by n_heads ({n_heads})")
 
         self.proj_gate = nn.Linear(dim, dim, bias=False)
         self.proj_value = nn.Linear(dim, dim, bias=False)
@@ -182,18 +184,40 @@ class ParallelGatedRecurrence(nn.Module):
 class MultiScaleGatedRecurrence(nn.Module):
     """
     Multi-scale gated recurrence with hierarchical decay rates.
+
+    Head counts auto-computed to evenly divide dim.
     Uses preallocated buffer for torch.compile fusion.
     """
 
     def __init__(self, dim: int, n_heads: Optional[int] = 16):
         super().__init__()
-        self.head_counts = [8, 4, 2, 1]
-        self.n_heads = sum(self.head_counts) + 1
+        target = n_heads - 1 if (n_heads is not None and n_heads > 1) else 15
+        ratios = [8, 4, 2, 1]
+        ratio_sum = sum(ratios)
+        # Find head counts that divide dim and approximate target
+        best_hc, best_total = None, 0
+        for total_recur in range(max(target, 4), 0, -1):
+            hc = [max(1, total_recur * r // ratio_sum) for r in ratios]
+            total = sum(hc) + 1
+            if dim % total == 0:
+                best_hc, best_total = hc, total
+                break
+        if best_hc is None:
+            # Fallback: use largest divisor of dim ≤ target+1
+            for total in range(min(dim // 32, target + 1), 3, -1):
+                if dim % total == 0:
+                    n_rec = total - 1
+                    hc = [max(1, n_rec * r // ratio_sum) for r in ratios]
+                    diff = n_rec - sum(hc)
+                    if diff > 0:
+                        hc[0] += diff
+                    best_hc, best_total = hc, total
+                    break
+        if best_hc is None:
+            best_hc, best_total = [1, 1, 1, 0], 4
+        self.head_counts = best_hc
+        self.n_heads = best_total
         self.head_dim = dim // self.n_heads
-        assert dim == self.n_heads * self.head_dim, (
-            f"dim ({dim}) must be divisible by {self.n_heads} "
-            f"(sum(head_counts) + 1 router)"
-        )
 
         self.proj_gate = nn.Linear(dim, dim, bias=False)
         self.proj_value = nn.Linear(dim, dim, bias=False)

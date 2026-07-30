@@ -110,7 +110,7 @@ class NFRAForCausalLM(nn.Module):
             block(
                 dim=config.hidden_size,
                 n_bands=config.n_bands,
-                dropout=config.dropout
+                dropout=config.dropout,
             )
             for _ in range(config.num_layers)
         ])
@@ -124,7 +124,7 @@ class NFRAForCausalLM(nn.Module):
             
         # Static check: all layers have neuromodulator (brain mode) or none
         self._has_neuromodulator = (
-            hasattr(self.layers[0], 'neuromodulator') if self.layers else False
+            hasattr(self.layers[0], 'neuromodulator') if len(self.layers) > 0 else False
         )
             
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

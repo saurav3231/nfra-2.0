@@ -51,8 +51,6 @@ class FractalGatedMLP(nn.Module):
         up = self.up_proj(x)
         hidden = gate * up
 
-        self._n_active = 0
-
         pooled = x.mean(dim=1, keepdim=True)
 
         coarse = torch.sigmoid(self.coarse_router(pooled))
@@ -66,7 +64,8 @@ class FractalGatedMLP(nn.Module):
             threshold = (1.0 - energy_budget) * 0.5
             fine = fine * keep_mask.unsqueeze(0).unsqueeze(0)
             fine = fine * (fine > threshold).float()
-            fine = fine / (fine.sum(dim=-1, keepdim=True) + 1e-8)
+            denom = fine.sum(dim=-1, keepdim=True)
+            fine = fine / (denom + (denom == 0).float())
             coarse = coarse * energy_budget
         else:
             coarse = coarse * 1.0
@@ -74,13 +73,15 @@ class FractalGatedMLP(nn.Module):
         output = torch.zeros_like(hidden)
         coarse_w = coarse.squeeze(1).squeeze(-1)
         fine_w = fine.squeeze(1)
+        n_active = 0
         for i, expert in enumerate(self.sub_experts):
             w = coarse_w * fine_w[:, i]
             w = w.view(-1, 1, 1)
             if w.mean() > 0.01:
-                self._n_active += 1
+                n_active += 1
             output = output + w * expert(hidden)
 
+        self._n_active = n_active
         return self.down_proj(output)
 
 
@@ -158,9 +159,10 @@ class FractalResonanceBlock(nn.Module):
         return x
 
     def get_sparsity(self) -> float:
-        if self.total_count.item() == 0:
+        tc = self.total_count.item()
+        if tc == 0:
             return 0.0
-        return 1.0 - (self.activation_count.item() / max(self.total_count.item(), 1))
+        return 1.0 - (self.activation_count.item() / max(tc, 1))
 
     def reset_stats(self):
         self.activation_count.zero_()
@@ -219,21 +221,34 @@ class FractalSwiGLU(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
         self.n_groups_per_level = [8, 4, 2, 1]
-        self.group_slices = [
-            (0, 1024),
-            (1024, 1536),
-            (1536, 2048),
-            (2048, 3072),
-        ]
+        n_total_groups = sum(self.n_groups_per_level)
+
+        # Dynamic group slicing to support any hidden_dim
+        n_total = 0
+        group_slices = []
+        remaining_groups = n_total_groups
+        for lvl, n_g in enumerate(self.n_groups_per_level):
+            group_dim = max(1, (hidden_dim - n_total) // remaining_groups)
+            level_dim = group_dim * n_g
+            group_slices.append((n_total, n_total + level_dim))
+            n_total += level_dim
+            remaining_groups -= n_g
+        last_end = group_slices[-1][1]
+        if last_end < hidden_dim:
+            group_slices[-1] = (group_slices[-1][0], hidden_dim)
+        elif last_end > hidden_dim:
+            group_slices[-1] = (group_slices[-1][0], hidden_dim)
 
         routing_idx = torch.zeros(hidden_dim, dtype=torch.long)
         group_idx = 0
         for lvl, n_groups in enumerate(self.n_groups_per_level):
-            start, end = self.group_slices[lvl]
-            group_dim = (end - start) // n_groups
+            start, end = group_slices[lvl]
+            group_dim = max(1, (end - start) // n_groups)
             for g in range(n_groups):
                 g_start = start + g * group_dim
-                g_end = g_start + group_dim
+                g_end = min(g_start + group_dim, hidden_dim)
+                if g_start >= hidden_dim:
+                    break
                 routing_idx[g_start:g_end] = group_idx
                 group_idx += 1
         self.register_buffer('routing_idx', routing_idx, persistent=False)
@@ -241,7 +256,7 @@ class FractalSwiGLU(nn.Module):
         self.router = nn.Sequential(
             nn.Linear(dim, 64, bias=False),
             nn.GELU(),
-            nn.Linear(64, 15, bias=False),
+            nn.Linear(64, n_total_groups, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -308,7 +323,7 @@ class NFRA_Max_Block(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, energy_budget: Optional[float] = None, **kwargs) -> torch.Tensor:
         residual = x
         x = self.ln1(x)
         recurrence_out, router_score = self.mixer(x)
