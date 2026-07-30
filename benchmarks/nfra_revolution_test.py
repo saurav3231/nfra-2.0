@@ -22,6 +22,7 @@
 """
 
 import os, sys, time, math, json, csv
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 
@@ -91,16 +92,17 @@ if HAS_CUDA:
     else:
         print(f"  [AMP] disabled (compute capability < 7.0)")
 
-    # -- Dynamic batch size based on GPU memory
-    # T4-15GB: 32, A100-40GB: 64, A100-80GB: 96
+    # -- Conservative batch size based on GPU memory
+    # NFRA Brain (259M params, 24 layers) needs ~1.5GB/batch at S=256
+    # T4-15GB: 8, A100-40GB: 32, A100-80GB: 48
     if GPU_MEM_GB >= 70:
-        DEFAULT_BATCH = 96
+        DEFAULT_BATCH = 48
     elif GPU_MEM_GB >= 35:
-        DEFAULT_BATCH = 64
-    elif GPU_MEM_GB >= 14:
         DEFAULT_BATCH = 32
+    elif GPU_MEM_GB >= 14:
+        DEFAULT_BATCH = 8
     else:
-        DEFAULT_BATCH = 16
+        DEFAULT_BATCH = 4
 else:
     DEFAULT_BATCH = 8
     print("  WARNING: Running on CPU — results will not reflect GPU performance.")
@@ -472,12 +474,29 @@ def run_benchmark() -> Dict:
     print(f"\n  [3/7] Training both models ({STEPS} steps)...")
     print(f"  └- NFRA Brain trains FIRST, then Transformer")
 
+    # Estimate memory per batch and warn if too high
+    est_mem_per_batch = (nfra_p * 4 * 6) / (1024**3)  # ~6x params for optimizer states + grads + activations
+    est_train_mem = est_mem_per_batch * BATCH
+    if HAS_CUDA and est_train_mem > GPU_MEM_GB * 0.6:
+        print(f"  └- WARNING: estimated memory {est_train_mem:.1f}GB > 60% of GPU ({GPU_MEM_GB:.1f}GB)")
+        print(f"  └- Reducing batch size to avoid OOM")
+        while est_train_mem > GPU_MEM_GB * 0.6 and BATCH > 2:
+            BATCH = BATCH // 2
+            train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
+                                      pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
+            eval_loader  = DataLoader(eval_ds,  batch_size=BATCH, shuffle=False,
+                                      pin_memory=True, num_workers=nw, persistent_workers=nw > 0)
+            est_train_mem = est_mem_per_batch * BATCH
+
     histories = {
         'nfra_brain':  [],
         'transformer': [],
     }
 
     for label, model in [('nfra_brain', nfra_model), ('transformer', tf_model)]:
+        if HAS_CUDA:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         print(f"\n  -- {label} --")
         opt, sched = make_optimizer(model, lr=LR, warmup=STEPS // 10, total=STEPS)
         scaler = torch.amp.GradScaler(device=str(DEVICE)) if USE_AMP else None
