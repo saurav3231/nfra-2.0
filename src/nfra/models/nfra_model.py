@@ -71,8 +71,7 @@ class NFRAConfig:
             self.num_layers = 24
 
         elif self.mode == "brain":
-            self.hidden_size = 768
-            self.num_layers = 24
+            # Don't override hidden_size/num_layers — respect user values
             self.fractal_scales = [1]
             self.n_bands = 16
             self.use_mixture_of_fractals = False
