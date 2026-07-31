@@ -33,13 +33,8 @@
 +======================================================================+
 """
 
-import os, sys, time, math, json, warnings
-if hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-        sys.stderr.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
+import os, sys, time, math, json, warnings, functools
+print = functools.partial(print, flush=True)  # always stream output (Jupyter/Kaggle)
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from typing import Dict, Optional, Tuple, List
 
@@ -116,24 +111,43 @@ class HierarchicalDataset(Dataset):
         N_TOPICS = 32
         pi = np.exp(rng.randn(N_TOPICS, N_TOPICS) * 0.3)
         np.fill_diagonal(pi, pi.diagonal() * 3)
-        self._topic_trans = (pi / pi.sum(1, keepdims=True)).astype(np.float32)
+        self._topic_trans = pi / pi.sum(1, keepdims=True)
         phi = np.exp(rng.randn(N_TOPICS, self.VOCAB_SIZE) * 0.5)
-        self._topic_emit = (phi / phi.sum(1, keepdims=True)).astype(np.float32)
+        self._topic_emit = phi / phi.sum(1, keepdims=True)
         th = np.exp(rng.randn(self.VOCAB_SIZE, self.VOCAB_SIZE) * 0.4)
-        self._bigram = (th / th.sum(1, keepdims=True)).astype(np.float32)
-        data = np.zeros((num_seqs, seq_len), dtype=np.int64)
-        for s in range(num_seqs):
-            topic = rng.randint(N_TOPICS); prev = rng.randint(self.VOCAB_SIZE)
-            for t in range(seq_len):
-                if rng.rand() < 0.1:
-                    topic = rng.choice(N_TOPICS, p=self._topic_trans[topic])
-                if rng.rand() < 0.3:
-                    tok = rng.choice(self.VOCAB_SIZE, p=self._topic_emit[topic])
-                else:
-                    p = self._bigram[prev] * 0.7 + self._topic_emit[topic] * 0.3
-                    tok = rng.choice(self.VOCAB_SIZE, p=p / p.sum())
-                data[s, t] = tok; prev = tok
-        self.data = data
+        self._bigram = th / th.sum(1, keepdims=True)
+        self.data = self._generate(num_seqs, seq_len, rng)
+
+    def _generate(self, num_seqs: int, seq_len: int, rng):
+        """Vectorized generation (torch.searchsorted) — no per-token Python loop."""
+        V = self.VOCAB_SIZE
+        topic_cdf = torch.from_numpy(self._topic_trans).cumsum(1)
+        emit_cdf = torch.from_numpy(self._topic_emit).cumsum(1)
+        bigram_cdf = torch.from_numpy(self._bigram).cumsum(1)
+
+        def sample(cdf, rows):
+            return torch.searchsorted(cdf[rows], torch.rand(len(rows), 1)).squeeze(-1)
+
+        data = np.empty((num_seqs, seq_len), dtype=np.int64)
+        topics = torch.randint(32, (num_seqs,))
+        prev = torch.randint(V, (num_seqs,))
+
+        for t in range(seq_len):
+            e = torch.nonzero(torch.rand(num_seqs) < 0.1).flatten()
+            if len(e):
+                topics[e] = sample(topic_cdf, topics[e])
+            use_emit = torch.rand(num_seqs) < 0.3
+            e = torch.nonzero(use_emit).flatten()
+            b = torch.nonzero(~use_emit).flatten()
+            tok = torch.empty(num_seqs, dtype=torch.long)
+            if len(e):
+                tok[e] = sample(emit_cdf, topics[e])
+            if len(b):
+                tok[b] = sample(bigram_cdf, prev[b])
+            data[:, t] = tok.numpy()
+            prev = tok
+        return data
+
     def __len__(self): return len(self.data)
     def __getitem__(self, idx):
         x = self.data[idx, :-1]; y = self.data[idx, 1:]
@@ -326,14 +340,22 @@ def count_params(m: nn.Module) -> int:
 
 
 def tune_layers(make_fn, target, vocab):
-    """Pick n_layers landing closest to the target param budget."""
+    """Pick n_layers landing closest to the target param budget (early-stop on plateau)."""
     best = (1, float('inf'))
+    prev_p, plateau = None, 0
     for L in range(1, 64):
         p = count_params(make_fn(vocab, DIM, L))
         if abs(p - target) < abs(best[1] - target):
             best = (L, p)
         if p >= target * 1.15:
             break
+        if prev_p is not None and p == prev_p:
+            plateau += 1
+            if plateau >= 3:
+                break
+        else:
+            plateau = 0
+        prev_p = p
     return best
 
 
@@ -369,9 +391,9 @@ def evaluate(model, loader, max_batches: int = 15) -> Tuple[float, float]:
     return math.exp(avg), avg
 
 
-def measure_throughput(model, batch_size: int, n_steps: int = 20) -> float:
-    x = torch.randint(0, 4096, (batch_size, SEQ_LEN), device=DEVICE)
-    y = torch.randint(0, 4096, (batch_size, SEQ_LEN), device=DEVICE)
+def measure_throughput(model, batch_size: int, vocab: int, n_steps: int = 20) -> float:
+    x = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
+    y = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
     if HAS_CUDA:
@@ -391,12 +413,12 @@ def measure_throughput(model, batch_size: int, n_steps: int = 20) -> float:
     return batch_size * SEQ_LEN * n_steps / elapsed
 
 
-def measure_memory(model, batch_size: int = 2) -> float:
+def measure_memory(model, vocab: int, batch_size: int = 2) -> float:
     if not HAS_CUDA:
         return 0.0
     torch.cuda.reset_peak_memory_stats()
-    x = torch.randint(0, 4096, (batch_size, SEQ_LEN), device=DEVICE)
-    y = torch.randint(0, 4096, (batch_size, SEQ_LEN), device=DEVICE)
+    x = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
+    y = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
         loss = compute_loss(model, x, y)
@@ -422,12 +444,14 @@ def main():
     print("+==========================================================+")
 
     # ---- data
+    print("\n  [0/4] Generating data...", end=' ')
     if use_wiki:
         train_ds = WikiText2Dataset('train', SEQ_LEN + 1)
         eval_ds = WikiText2Dataset('validation', SEQ_LEN + 1)
     else:
         train_ds = HierarchicalDataset(max(4096, DEFAULT_BATCH * 8), SEQ_LEN + 1, seed=SEED)
         eval_ds = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED + 1)
+    print("done")
     train_loader = DataLoader(train_ds, batch_size=DEFAULT_BATCH, shuffle=True, num_workers=0)
     eval_loader = DataLoader(eval_ds, batch_size=DEFAULT_BATCH, shuffle=False, num_workers=0)
 
@@ -457,8 +481,8 @@ def main():
     perf = {}
     for name, m in models.items():
         m.train()
-        tok_s = measure_throughput(m, batch_size=DEFAULT_BATCH, n_steps=15)
-        mem = measure_memory(m)
+        tok_s = measure_throughput(m, batch_size=DEFAULT_BATCH, vocab=VOCAB, n_steps=15)
+        mem = measure_memory(m, vocab=VOCAB)
         perf[name] = {'tok_per_s': round(tok_s), 'peak_mem_gb': round(mem, 2)}
         print(f"  └- {name:<11s} {tok_s:>8,.0f} tok/s   peak {mem:.2f} GB")
 
