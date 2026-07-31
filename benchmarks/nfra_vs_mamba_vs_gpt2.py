@@ -155,8 +155,11 @@ def hillis_prefix(a, b):
 
 
 def mamba_scan(a, b, chunk=64):
-    """Chunked associative scan, each chunk gradient-checkpointed so backward
-    never holds more than one chunk's intermediates (bounded memory)."""
+    """Chunked associative scan run in fp32 (state recurrence is numerically
+    sensitive; fp16 can overflow and NaN the loss), each chunk gradient-
+    checkpointed so backward never holds more than one chunk."""
+    orig_dtype = a.dtype
+    a = a.float(); b = b.float()
     B, _, S, D = a.shape
     n = math.ceil(S / chunk)
     pad = n * chunk - S
@@ -173,7 +176,7 @@ def mamba_scan(a, b, chunk=64):
         out = a_rel * h.view(B, 1, 1, D) + b_rel
         h = out[:, :, -1, :].squeeze(1)
         outs.append(out)
-    return torch.cat(outs, dim=2)[:, :, :S, :]
+    return torch.cat(outs, dim=2)[:, :, :S, :].to(orig_dtype)
 
 
 class MambaBlock(nn.Module):
