@@ -468,6 +468,7 @@ def main():
     print("  NFRA BRAIN  vs  MAMBA-SSM  vs  GPT-2")
     print("  apples-to-apples  •  matched params  •  identical training")
     print("=" * 66)
+    print(f"  bench   : v2 (local-txt wikitext2)   — {DATA_SOURCE}")
     print(f"  data    : {'WikiText-2 (char)' if use_wiki else 'Synthetic hierarchical'}")
     print(f"  vocab   : {VOCAB}    dim: {DIM}    seq_len: {SEQ_LEN}")
     print(f"  params  : ~{TARGET_M:.0f}M    steps: {STEPS}    batch: {BATCH}")
