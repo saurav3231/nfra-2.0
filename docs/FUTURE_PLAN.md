@@ -64,7 +64,7 @@ v0 levers:
 
 **New idea — H2. Convergence-rate gradient shaping.** The band recurrence has a spectral structure; long-α bands have ill-conditioned gradients. Add per-band **gradient scaling / norm shaping** (normalize band-mixer grads by α scale) so memory-horizon information flows earlier. Expected: faster loss drop at fixed steps + better wall-clock efficiency. Cheap, no inference cost.
 
-**New idea — H3. Empirical memory-horizon probe.** Before building adaptive α, *measure* NFRA's effective recall with synthetic probes (associative recall, copy, retrieval at distance k). This decides the diagnosis: if recall collapses at distance d, the gap is **memory** (→ AFC-α); if recall is fine but loss lags, the gap is **capacity** (→ AFC-LoRA/MoE). A 30-line script that tells us which lever to bet on.
+**New idea — H3. Empirical memory-horizon probe.** Before building adaptive α, *measure* NFRA's effective recall with synthetic probes (associative recall, copy, retrieval at distance k). This decides the diagnosis: if recall collapses at distance d, the gap is **memory** (→ AFC-α); if recall is fine but loss lags, the gap is **capacity** (→ AFC-LoRA/MoE). A 30-line script that tells us which lever to bet on. **RESULT: see Part 10, experiment log 2026-07-31 — flat at floor, base case unknown; next gate = k=1 control at dim 512.**
 
 ---
 
@@ -253,3 +253,28 @@ Every idea below maps a *specific* brain mechanism to a concrete change. All are
     Practical: PyTorch QAT infra exists; benchmark-gated. **High.**
 
 **Suggested order:** Tier 1 (1→5) first — all cheap, training/inference-safe, directly attack the loss gap or speed curve → Tier 2 (9, 8, 6, 7) — attack the Mamba long-range/capacity gap → Tier 3 (11, 12, 13) only if the H3/H8 probes justify.
+
+---
+
+## Part 10 — Experiment log (recorded results)
+
+### 2026-07-31 — H3 recall probe, concurrent, dim 224 / unique 4 / 600 steps / V=16 / floor ln(16)=2.773
+
+Config: `NFRA_RECALL_KS=4,16,64,128 NFRA_RECALL_DIM=224 NFRA_RECALL_CONCURRENT=1`; 8 trainings (3 NFRA + 3 Mamba, ks 4/16/64/128), 2228.4s, 4411 tok/s aggregate.
+
+| model | k | train first→last | span_ce | span_acc | pad_ce |
+|-------|---|------------------|---------|----------|--------|
+| nfra  | 4   | 3.2200 → 2.7706 | 2.7728 | 0.0644 | 2.7713 |
+| nfra  | 16  | 3.1852 → 2.7673 | 2.7729 | 0.0660 | 2.7714 |
+| nfra  | 64  | 3.1741 → 2.7669 | 2.7726 | 0.0643 | 2.7697 |
+| nfra  | 128 | 3.1743 → 2.7661 | 2.7721 | 0.0675 | 2.7687 |
+| mamba | 4   | 2.8367 → 2.0812 | 3.0258 | 0.0637 | 3.0240 |
+| mamba | 16  | 2.8391 → 2.0737 | 3.0967 | 0.0627 | 3.0966 |
+| mamba | 64  | 2.8396 → 2.0789 | 3.1041 | 0.0619 | 3.1029 |
+| mamba | 128 | 2.8411 → 2.2537 | 3.0396 | 0.0645 | 3.0375 |
+
+**Reading:**
+- **NFRA is flat at the floor for every k** (span_ce ≈ ln16, acc ≈ 1/16 chance). k=4 `3.2200 → 2.7706` exactly reproduces the earlier sequential dim-224/600 run → also validates the concurrent harness (build/init parity + results).
+- **Mamba trains far below the floor (2.08–2.25) but evals ABOVE it (3.03–3.10, acc chance).** Eval CE > ln(16) = confidently-wrong → the signature of train-set memorization, not rule-learning. So even the model with working memory machinery does not *generalize* the `value=key+1` rule in 600 steps.
+- **Decision logic refined (NOT yet resolved):** the flat-high reading is ambiguous because NFRA fails at the base case (k=4) and k=1 is untested. Two confounds: (a) NFRA at ~5M is in a known no-learning regime (dim-192/600 sits at random loss on wikitext too), vs (b) NFRA's recurrence specifically cannot form delay lines. Mamba's overfit-no-generalize also proves this probe is a harsh *generalization* test, so "span at floor" ≠ "no capacity for the rule."
+- **Next gate (env-only, no code change):** `NFRA_RECALL_KS=1,2,4 NFRA_RECALL_DIM=512 NFRA_RECALL_CONCURRENT=1` — run at the ~20M size where NFRA demonstrably learns (dim-512 reached eval 2.13 on wikitext). k=1 is a per-token `+1` map (zero memory needed): if NFRA-512 nails k=1 but flattens at k=2/4 → **memory-formability** (→ AFC-α / memory levers); if it fails even k=1 → **scale / learning-dynamics** (→ Phase 1 convergence-parity levers, not capacity).
