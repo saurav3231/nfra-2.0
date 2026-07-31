@@ -273,8 +273,18 @@ class MambaBlock(nn.Module):
         alpha = torch.exp(A.view(1, 1, N, 1) * dt.unsqueeze(2))     # [B,S,N,E] per-step decay
         u = Bm.unsqueeze(-1) * x.unsqueeze(2)                # [B,S,N,E] = B(x) outer x
 
-        h = mamba_scan(alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E),
-                       u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E))  # [B,1,S,N*E]
+        alpha_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
+        u_f = u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
+        if self.training and torch.is_grad_enabled():
+            # Checkpoint the scan: autograd would otherwise keep every chunk's
+            # intermediates (≈3GB/block across 11 blocks → OOM). Recompute in
+            # backward instead; only alpha_f/u_f (~134MB/block) are saved.
+            h = torch.utils.checkpoint.checkpoint(
+                lambda a, v: mamba_scan(a, v, chunk=64),
+                alpha_f, u_f, use_reentrant=False,
+            )
+        else:
+            h = mamba_scan(alpha_f, u_f, chunk=64)
         h = h.view(B, S, N, E)
 
         y = (h * C.unsqueeze(-1)).sum(dim=2)                 # [B,S,E] = C·h
