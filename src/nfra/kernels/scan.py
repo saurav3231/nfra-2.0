@@ -99,6 +99,7 @@ if _HAS_TRITON:
     def _scan_fwd_kernel(
         value_ptr, gate_ptr, alpha_ptr, out_ptr,
         S,
+        HDIM: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         HAS_GATE: tl.constexpr,
         ALPHA_MIN: tl.constexpr,
@@ -106,11 +107,11 @@ if _HAS_TRITON:
     ):
         pid = tl.program_id(0).to(tl.int64)          # index over (B * H)
         hd = tl.arange(0, HEAD_DIM)
-        hd_mask = hd < HEAD_DIM
-        base = pid * S * HEAD_DIM
+        hd_mask = hd < HDIM                          # real inner dim (may be < pow2)
+        base = pid * S * HDIM                        # real row stride (NOT padded)
         h = tl.zeros([HEAD_DIM], dtype=tl.float32)
         for t in range(S):                           # dynamic loop over sequence
-            offs = base + t * HEAD_DIM + hd
+            offs = base + t * HDIM + hd
             a = tl.load(alpha_ptr + offs, mask=hd_mask, other=1.0).to(tl.float32)
             a = tl.minimum(tl.maximum(a, ALPHA_MIN), ALPHA_MAX)
             v = tl.load(value_ptr + offs, mask=hd_mask, other=0.0).to(tl.float32)
@@ -127,6 +128,7 @@ if _HAS_TRITON:
         gate_ptr = gate if gate is not None else value  # unused when HAS_GATE=0
         _scan_fwd_kernel[(B * H,)](
             value, gate_ptr, alpha, out, S,
+            HDIM=Hd,
             HEAD_DIM=head_dim,
             HAS_GATE=gate is not None,
             ALPHA_MIN=alpha_min,
