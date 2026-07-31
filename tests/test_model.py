@@ -84,13 +84,10 @@ def test_save_load_roundtrip(tmp_path):
 
 def test_brain_learns_short_recall():
     """Smoke test: NFRA Brain must LEARN a 2-step recall task (drop below the
-    ln(16) floor) on a tiny CPU config. Guards against the block wiring
-    starving the recurrence entirely. NOTE: this does NOT reproduce the H3
-    flat-at-floor failure (dim 224 / 600 steps / k>=4), so it is not a
-    regression test for that bug — that regime needs GPU (see
-    nfra.benchmark.recall_diag)."""
+    ln(16) floor) on a tiny CPU config, with OBSERVABLE keys. Guards against
+    the block wiring starving the recurrence entirely. (The old probe hid the
+    keys, so no model could learn the span — see recall_probe docstring.)"""
     import math
-    import numpy as np
 
     V, k, seq = 16, 2, 32
     torch.manual_seed(0)
@@ -99,19 +96,10 @@ def test_brain_learns_short_recall():
                      gradient_checkpointing=False)
     model = NFRAForCausalLM(cfg)
     from nfra.benchmark.compare import rescale_embed
+    from nfra.benchmark.recall_probe import make_loader
     rescale_embed(model)
 
-    rng = np.random.RandomState(0)
-    keys = rng.randint(0, V, size=(8, seq + 1))
-    toks = np.empty_like(keys)
-    for t in range(seq + 1):
-        src = t - k
-        if src >= 0:
-            toks[:, t] = (keys[:, src] + 1) % V
-        else:
-            toks[:, t] = rng.randint(0, V, size=8)
-    x = torch.from_numpy(toks[:, :-1]).long()
-    y = torch.from_numpy(toks[:, 1:]).long()
+    x, y = next(iter(make_loader(k, seq, 8, seed=42)))
 
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
     losses = []
@@ -127,6 +115,46 @@ def test_brain_learns_short_recall():
     floor = math.log(V)
     assert losses[-1] < floor - 0.03, f"stuck at floor: {losses[-1]:.3f}"
     assert losses[-1] < losses[0] - 0.1, f"no learning: {losses[0]:.3f}->{losses[-1]:.3f}"
+
+
+def test_brain_no_future_leak():
+    """NFRA Brain must be a proper autoregressive model: changing a FUTURE
+    token must not change logits at EARLIER positions. Regression guard for
+    the whole-sequence global-pool leak (NeuroModulator / GlobalBrainState /
+    astro / router pool all used x.mean(dim=1), leaking the future)."""
+    torch.manual_seed(0)
+    cfg = NFRAConfig(mode="brain", vocab_size=16, hidden_size=64,
+                     num_layers=4, unique_blocks=2, dropout=0.0,
+                     gradient_checkpointing=False)
+    model = NFRAForCausalLM(cfg)
+    model.eval()
+    x = torch.randint(0, 16, (2, 24))
+    with torch.no_grad():
+        a = model(x)["logits"]
+        xp = x.clone()
+        xp[:, 17] = (xp[:, 17] + 3) % 16          # perturb a FUTURE token
+        b = model(xp)["logits"]
+    earlier = (a[:, :8] - b[:, :8]).abs().max().item()
+    assert earlier < 1e-5, \
+        f"future token leaked into earlier logits: {earlier:.6f}"
+
+
+def test_recall_dataset_keys_observable():
+    """The recall probe must expose the keys (the old version hid them, making
+    the span unlearnable). y[t] must equal (key[t-k]+1) % V for t>=k, and the
+    key at t-k is always visible in the input prefix x = keys[:, :-1]."""
+    from nfra.benchmark.recall_probe import RecallDataset, V
+
+    k, seq = 4, 40
+    ds = RecallDataset(64, seq, k, seed=0)
+    keys, targets = ds.toks, ds.targets
+    for i in range(64):
+        for t in range(k, seq - 1):
+            assert targets[i, t] == (keys[i, t - k] + 1) % V, \
+                "span target must be the value of the key k back"
+            assert 0 <= t - k < seq - 1, "key must be visible in the prefix"
+    # padding positions (t < k) are random noise, not the key->value map
+    assert any(targets[0, t] != (keys[0, t - k] + 1) % V for t in range(k))
 
 
 def test_local_pool_matches_sliding_window():

@@ -64,7 +64,7 @@ v0 levers:
 
 **New idea — H2. Convergence-rate gradient shaping.** The band recurrence has a spectral structure; long-α bands have ill-conditioned gradients. Add per-band **gradient scaling / norm shaping** (normalize band-mixer grads by α scale) so memory-horizon information flows earlier. Expected: faster loss drop at fixed steps + better wall-clock efficiency. Cheap, no inference cost.
 
-**New idea — H3. Empirical memory-horizon probe.** Before building adaptive α, *measure* NFRA's effective recall with synthetic probes (associative recall, copy, retrieval at distance k). This decides the diagnosis: if recall collapses at distance d, the gap is **memory** (→ AFC-α); if recall is fine but loss lags, the gap is **capacity** (→ AFC-LoRA/MoE). A 30-line script that tells us which lever to bet on. **RESULT: see Part 10, experiment log 2026-07-31 — flat at floor, base case unknown; next gate = k=1 control at dim 512.**
+**New idea — H3. Empirical memory-horizon probe.** Before building adaptive α, *measure* NFRA's effective recall with synthetic probes (associative recall, copy, retrieval at distance k). This decides the diagnosis: if recall collapses at distance d, the gap is **memory** (→ AFC-α); if recall is fine but loss lags, the gap is **capacity** (→ AFC-LoRA/MoE). A 30-line script that tells us which lever to bet on. **RESULT: see Part 10 — the original probe was unlearnable by ANY causal model (keys hidden) and NFRA leaked future context; both fixed, probe redesigned with observable keys, and re-run is pending on Kaggle.**
 
 ---
 
@@ -294,3 +294,22 @@ Config: `NFRA_RECALL_KS=4,16,64,128 NFRA_RECALL_DIM=224 NFRA_RECALL_CONCURRENT=1
 - **Overnight script:** `python -m nfra.benchmark.global_arena` — 4 resumable phases (core head-to-head+scaling / 10-variant ablate / recall diag / perf battery+extrapolation), env-driven, JSON + Markdown report with verdict logic. This replaces the manual Kaggle cell sequence.
 - **Verification:** 3 new CPU-safe tests (local-pool vs manual sliding window; feature toggles fwd/bwd; toggles off by default); `tests/test_model.py` 11/11. Static import/signature audit of global_arena against arena/compare; config+forward smoke at dim 224 passed locally. NO local training runs.
 - **Pending:** run `recall_diag` (quick, decisive for the H3 root-cause question) and/or `global_arena` on Kaggle T4 overnight; the ablate phase then answers which levers actually pay.
+
+### 2026-07-31 (post-dim512-run) — TWO real defects found: probe unlearnable by design + future leak (both fixed)
+
+**1. The recall probe could NOT be learned by ANY causal model (design bug).** The stream contained only values `(keys[t-k]+1)%V`; the `keys[t-k]` needed to predict `y[t]` never appear in the observed prefix, so H(y|prefix)=ln(16) at every position. No causal model can drop below the floor — Mamba flooring proves it (a strong SSM, so not capacity). Every past "flat at floor" reading is void, including the dim-224 note that Mamba "trains 2.08–2.25" (that was memorization of the *padding* rule, not memory).
+
+**2. NFRA Brain leaked FUTURE context into every position** (whole-sequence global pools), tainting every autoregressive number:
+- `NeuroModulator`: `x.mean(dim=1)` hormones broadcast to all tokens.
+- `GlobalBrainState`: whole-sequence pool → GRU; cross-pass carry used `state[:, -1]`, whose last-position state had seen the full sequence, then broadcast to every position.
+- `BrainMixer.astro`: `x.mean(dim=1)` scaled all band decays.
+- `BrainMLP` router pool: `x.mean(dim=1)`.
+- Isolated empirically (dim 224 / 12-depth): changing token@200 moved logits at positions 1–180 by 0.0465 (causal ⇒ exactly 0.0); changing a token moves its own-position logits 44.1. Explains the old anomaly NFRA k=2/dim-64 train 1.99 < floor 2.77 (leak-based overfit) yet eval 3.24 > floor (future-peek never generalizes).
+
+**Fixes (verified, 13/13 tests pass):**
+- All global pools → causal per-token prefix means (`cumsum/cnt`): NeuroModulator (prefix mean + prefix-variance novelty), GlobalBrainState (vectorized causal prefix state, per-position cross-pass prior — GRU removed), astro (prefix mean [B,S,1] applied as [B,1,S,1]), BrainMLP router pool (prefix).
+- Probe redesigned: the stream IS the keys; `y[t] = (key[t-k]+1)%V` for t≥k, random padding otherwise — a genuinely learnable memory test (k=1 is the memory-free baseline that MUST learn).
+- New regression tests: `test_brain_no_future_leak` (perturb a future token ⇒ earlier logits unchanged <1e-5), `test_recall_dataset_keys_observable` (target = value of the key k back; key visible in the prefix), `test_brain_learns_short_recall` now trains on the corrected dataset.
+- Decision (user): fix both now, then overnight `global_arena` run on Kaggle T4.
+
+**Next:** commit+push → Kaggle: `pip install` → restart kernel → `python -m nfra.benchmark.recall_diag` (quick decisive) → `python -m nfra.benchmark.global_arena`; report back `global_arena_report.md` + JSON.

@@ -57,11 +57,18 @@ class NeuroModulator(nn.Module):
     ) -> torch.Tensor:
         B, S, D = x.shape
 
-        pooled = x.mean(dim=1)
-        delta = self.context_gland(pooled)
+        # Causal (prefix) pooling: hormone_t reads only x[0..t]. The old
+        # x.mean(dim=1) leaked FUTURE tokens into every position's hormones
+        # (an autoregressive LM may not look ahead) — with a per-token prefix
+        # mean each position gets its own honestly-causal "mood".
+        cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
+        pooled = x.cumsum(1) / cnt                          # [B, S, D]
+        delta = self.context_gland(pooled)                  # [B, S, n_hormones]
 
-        novelty = x.var(dim=1).mean(dim=-1, keepdim=True)
-        delta = delta + self.novelty_gland(novelty)
+        cum2 = (x * x).cumsum(1)
+        var = (cum2 / cnt - pooled * pooled).clamp(min=0.0) # [B, S, D]
+        novelty = var.mean(dim=-1, keepdim=True)            # [B, S, 1]
+        delta = delta + self.novelty_gland(novelty)         # [B, S, n_hormones]
 
         raw = torch.sigmoid(delta + self.baseline.unsqueeze(0))
 
@@ -108,8 +115,8 @@ class ThalamicGate(nn.Module):
 
         uncertainty = torch.sigmoid(self.uncertainty_proj(x))
 
-        ach = hormones[:, 0:1].view(B, 1, 1)
-        ne = hormones[:, 1:2].view(B, 1, 1)
+        ach = hormones[:, :, 0:1].view(B, S, 1)
+        ne = hormones[:, :, 1:2].view(B, S, 1)
 
         directness = (1.0 - uncertainty) * (1.0 - 0.5 * ach)
 
@@ -156,19 +163,19 @@ class GlobalBrainState(nn.Module):
     """
     Global brain state: a slow top-down neuromodulatory loop.
 
-    Each depth pass aggregates its whole representation into a pooled summary;
-    a GRU integrates that summary across passes into a persistent global state.
-    The state is injected top-down into every token of the NEXT pass, so the
-    network has a coherent "global context" that evolves as it processes —
-    mirroring slow neuromodulatory systems (arousal, attention, gist) that
-    broadcast a whole-brain state rather than per-token local signals.
+    Each depth pass computes a CAUSAL per-token prefix summary; the previous
+    pass's summary is carried into the next pass as a per-position slow prior,
+    so the network has a coherent "global context" that evolves as it
+    processes — mirroring slow neuromodulatory systems (arousal, attention,
+    gist) that broadcast a whole-brain state rather than per-token local
+    signals. Causal per position: token t only ever sees tokens <= t.
 
     Architecture:
-      s_t = mean over sequence of hidden pass t
-      g_t = GRU(s_t, g_{t-1})                       # global state update
-      x_{t+1} += proj(g_t) broadcast per token       # top-down injection
+      state_t  = tanh(pool_proj(mean of x[0..t]))        # causal prefix
+      state_t += 0.5 * prev_state_t                     # cross-pass prior
+      x_t     += sigmoid(gate(state_t)) * inject_proj(state_t)
 
-    Params: ~3*(state_dim*dim + state_dim^2) — tiny vs the block itself.
+    Params: ~3*state_dim*dim — tiny vs the block itself.
     """
 
     def __init__(self, dim: int, state_dim: int = 64):
@@ -177,7 +184,6 @@ class GlobalBrainState(nn.Module):
         self.state_dim = state_dim
 
         self.pool_proj = nn.Linear(dim, state_dim, bias=False)
-        self.gru_cell = nn.GRUCell(state_dim, state_dim)
         self.inject_proj = nn.Linear(state_dim, dim, bias=False)
         self.gate = nn.Linear(state_dim, 1, bias=False)
 
@@ -186,22 +192,35 @@ class GlobalBrainState(nn.Module):
         x: torch.Tensor,
         state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Aggregate `x` (the current depth pass) and update the global state."""
-        pooled = x.mean(dim=1)                      # [B, dim]
-        h = torch.tanh(self.pool_proj(pooled))      # [B, state_dim]
-        if state is None:
-            state = torch.zeros(h.size(0), self.state_dim, device=h.device)
-        return self.gru_cell(h, state)
+        """Causal global-state aggregation: a per-token prefix summary.
+
+        state_t = tanh(pool_proj(mean of x[0..t])) — so state_t depends only on
+        tokens <= t (honest for an autoregressive LM; the old whole-sequence
+        mean leaked future tokens into every position). The previous pass's
+        state (if given) is carried in as a per-position slow top-down prior
+        (state_t from the prev pass only saw tokens <= t), preserving the
+        cross-pass neuromodulatory loop without leaking the future."""
+        B, S, D = x.shape
+        cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
+        pooled = x.cumsum(1) / cnt                           # [B, S, D]
+        h = torch.tanh(self.pool_proj(pooled))               # [B, S, state_dim]
+        if state is not None and state.ndim == 3:
+            # Per-position slow prior: state_t from the previous pass only saw
+            # tokens <= t, so summing keeps the whole forward causal. (The old
+            # state[:, -1] last-token carry broadcast a whole-sequence view
+            # into every position — a FUTURE leak.)
+            h = torch.tanh(h + 0.5 * state)
+        return h
 
     def inject(
         self,
-        state: torch.Tensor,
+        states: torch.Tensor,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        """Inject the global state top-down into all tokens of the next pass."""
-        proj = self.inject_proj(state)              # [B, dim]
-        gain = torch.sigmoid(self.gate(state))      # [B, 1] how strongly to inject
-        return x + gain.view(-1, 1, 1) * proj.unsqueeze(1)
+        """Inject the causal global state top-down into every token (per token)."""
+        proj = self.inject_proj(states)                      # [B, S, dim]
+        gain = torch.sigmoid(self.gate(states))              # [B, S, 1]
+        return x + gain * proj
 
 
 class BrainMixer(nn.Module):
@@ -309,16 +328,18 @@ class BrainMixer(nn.Module):
 
         dt = torch.sigmoid(self.dt_proj(x_grid)) * 2.0               # [B, S, H]
         if hormones is not None:
-            ach = hormones[:, 0:1].view(B, 1, 1)                     # high ACh → forget
+            ach = hormones[:, :, 0:1]                            # high ACh → forget
             dt = dt * (1.0 + 0.5 * ach)
         alpha = torch.exp(base_log.view(1, H, 1, Hd)
                           * dt.permute(0, 2, 1).view(B, H, S, 1))    # [B, H, S, Hd]
 
-        # Astrocytic homeostat: a slow per-sequence signal scales ALL band
-        # decays together (global memory-horizon shift), then the scan clamps.
+        # Astrocytic homeostat: a slow per-token causal signal (prefix mean of
+        # x) scales ALL band decays together (global memory-horizon shift).
+        # Causal so position t never sees future tokens. The scan then clamps.
         if self.astro_proj is not None:
-            astro = torch.tanh(self.astro_proj(x.mean(dim=1, keepdim=True)))
-            alpha = alpha * (1.0 + 0.2 * astro.view(B, 1, 1, 1))
+            cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
+            astro = torch.tanh(self.astro_proj(x.cumsum(1) / cnt))   # [B, S, 1]
+            alpha = alpha * (1.0 + 0.2 * astro.view(B, 1, S, 1))
 
         # Parallel closed-form time-varying scan —
         # h_t = alpha_t*h_{t-1} + gate_t*value_t (one vectorized cumsum pair)
@@ -463,22 +484,24 @@ class BrainMLP(nn.Module):
         center = hidden.mean(dim=-1, keepdim=True)
         hidden = hidden * torch.sigmoid(hidden - center)
 
-        # Routing context: global pool + (optionally) per-token local pool.
-        # Local + global keeps the stable coarse prior while adding input-
-        # dependent per-token capacity.
-        pooled = x.mean(dim=1, keepdim=True)
+        # Routing context: causal prefix pool + (optionally) per-token local
+        # pool. Both are per-token causal (the router at t must not see future
+        # tokens); local + global keeps the stable coarse prior while adding
+        # input-dependent per-token capacity.
+        cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
+        pooled = x.cumsum(1) / cnt                             # [B, S, D]
         if self.local_route:
             pooled = pooled + self._local_pool(x)
         routing = self.router(pooled)
 
         if hormones is not None:
-            da_temp = hormones[:, 2:3].view(B, 1, 1)
+            da_temp = hormones[:, :, 2:3]
             routing = routing / (da_temp + 0.1)
 
         routing = torch.softmax(routing, dim=-1)
 
         if hormones is not None:
-            cort = hormones[:, 4:5].view(B, 1, 1)
+            cort = hormones[:, :, 4:5]
             threshold = 0.5 / routing.shape[-1] * (1.0 + cort)
             routing = routing * (routing >= threshold).float()
             denom = routing.sum(dim=-1, keepdim=True)
@@ -488,7 +511,7 @@ class BrainMLP(nn.Module):
         hidden = hidden * weight_map
 
         if hormones is not None:
-            ne = hormones[:, 1:2].view(B, 1, 1)
+            ne = hormones[:, :, 1:2]
             hidden = hidden * (1.0 + 0.5 * ne)
 
         # Lateral inhibition (k-WTA): keep only the top-k fraction of units

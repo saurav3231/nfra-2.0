@@ -467,15 +467,15 @@ class NFRA_Brain_Block(nn.Module):
 
         if energy_budget is not None:
             budget_factor = 1.0 - energy_budget
-            cort = hormones[:, 4:5]
+            cort = hormones[:, :, 4:5]
             hormones = torch.cat([
-                hormones[:, :4],
+                hormones[:, :, :4],
                 cort + budget_factor * (1.0 - cort),
-                hormones[:, 5:],
+                hormones[:, :, 5:],
             ], dim=-1)
 
-        # Tensorized thinking depth: dopamine → per-batch depth factor [B,1,1]
-        da = hormones[:, 2:3].mean(dim=-1, keepdim=True).view(-1, 1, 1)
+        # Per-token thinking depth: dopamine → per-token depth factor [B,S,1]
+        da = hormones[:, :, 2:3]
         depth_f = 1.0 + da * (self.max_thinking_depth - 1)
         depth_f = depth_f.clamp(1.0, self.max_thinking_depth)
 

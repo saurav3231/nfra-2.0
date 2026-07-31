@@ -7,10 +7,12 @@ Diagnostic that tells us WHICH lever to bet on:
   * If recall is flat across distance but loss lags anyway, the gap is a
     CAPACITY problem             -> bet on AFC-LoRA / MoE / band-drop.
 
-Method: associative-recall sequences. Token at position t is the value of the
-key that appeared k steps earlier (value = key+1 mod V). Predicting position t
-therefore requires (a) retrieving the key from t-k and (b) applying the
-key->value map. The first k positions are unlearnable padding (floor = ln V).
+Method: associative-recall sequences with OBSERVABLE keys. The observed
+stream IS the keys; the target at position t is the value (key+1 mod V) of
+the key that appeared k positions earlier. Predicting position t therefore
+requires (a) retrieving the key from t-k (always visible in the prefix) and
+(b) applying the key->value map. The first k positions are unlearnable
+padding (floor = ln V). k=1 is a memory-free per-token map (baseline).
 
 We train NFRA Brain and Mamba on fixed-k datasets and report per-k loss and
 accuracy on the span positions (t >= k). A rising curve in k = collapsing
@@ -56,30 +58,50 @@ V = 16  # symbol vocab
 
 
 class RecallDataset(Dataset):
-    """Token at t = value(key_{t-k}); span positions require k-step recall."""
+    """Associative recall with OBSERVABLE keys — a real memory test.
+
+    The observed stream IS the key stream (every key is visible in the input),
+    and the target at output position t is the VALUE (key+1 mod V) of the key
+    k positions back:
+
+        x[t]  = keys[t]                       (visible)
+        y[t]  = (keys[t-k] + 1) % V   for t>=k      else random (padding)
+
+    Predicting y[t] therefore requires recalling keys[t-k] from the visible
+    prefix. k=1 is a memory-free per-token map (trivial baseline); k=4 is a
+    4-step recall. A model that learns the rule generalizes to the eval loader
+    (different keys); one that can't do k-step recall floors on the span.
+
+    NOTE: the earlier version placed only VALUES (keys+1) in the stream, so
+    the keys were never observable — H(y|prefix) = ln(V) for every position
+    and NO model (causal or not) could learn the span. Both NFRA and Mamba
+    "floored" for that reason (dim-224 and dim-512 runs). The keys must be
+    in the stream for the probe to measure memory at all."""
 
     def __init__(self, num_seqs, seq_len, k, seed=0):
         super().__init__()
         self.seq_len = seq_len
+        self.k = k
         rng = np.random.RandomState(seed)
         keys = rng.randint(0, V, size=(num_seqs, seq_len))
-        values = (keys + 1) % V
-        toks = np.empty((num_seqs, seq_len), dtype=np.int64)
-        for t in range(seq_len):
+        vals = (keys + 1) % V
+        self.toks = keys.copy()
+        targets = np.empty((num_seqs, seq_len - 1), dtype=np.int64)
+        for t in range(seq_len - 1):
             src = t - k
             if src >= 0:
-                toks[:, t] = values[:, src]
+                targets[:, t] = vals[:, src]
             else:
-                toks[:, t] = rng.randint(0, V, size=num_seqs)
-        self.toks = toks
+                targets[:, t] = rng.randint(0, V, size=num_seqs)
+        self.targets = targets
 
     def __len__(self):
-        return self.toks.shape[0]
+        return self.targets.shape[0]
 
     def __getitem__(self, idx):
-        x = self.toks[idx, :-1]
-        y = self.toks[idx, 1:]
-        return (torch.from_numpy(x), torch.from_numpy(y))
+        x = torch.from_numpy(self.toks[idx, :-1])
+        y = torch.from_numpy(self.targets[idx])
+        return x, y
 
 
 def make_loader(k, seq_len, batch, seed=0, num_seqs=512):

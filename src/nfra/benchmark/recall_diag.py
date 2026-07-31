@@ -1,10 +1,14 @@
 """
 Recall-probe root-cause diagnostic (H3 follow-up).
 
-The H3 probe found NFRA Brain FLAT at the floor (ln 16) for every k — it did
-not even fit the training set (dim 224, 600 steps). This script reproduces
-that exact regime across three NFRA variants, run CONCURRENTLY on separate
-CUDA streams (wall time ~= one model's), so ONE run pins the mechanism:
+The earlier H3 probe found NFRA Brain FLAT at the floor (ln 16) for every k.
+Two defects were behind it: (1) the probe never showed the keys, so the span
+was unlearnable by ANY model, and (2) NFRA Brain leaked future context into
+every position (whole-sequence global pools). Both are now fixed: the probe
+has observable keys, and all global pools are causal prefix means. This
+script re-runs the exact failing regime (dim 224 / 600 steps) across three
+NFRA variants, concurrently on separate CUDA streams (wall ~= one model's),
+so ONE run pins the mechanism:
 
   fix     : current Brain block (residual = x, not the self-prediction)
             at k=4  — the H3 failing case, post-audit-fix.
@@ -15,11 +19,14 @@ CUDA streams (wall time ~= one model's), so ONE run pins the mechanism:
 Reports per-variant train first->last, held-out span CE, and the block
 predictor's deviation from identity (mean |W_p - I|) — watching the collapse.
 
-Reading the verdict:
+Reading the verdict (probe now has OBSERVABLE keys; k=1 is a memory-free
+per-token map baseline that any working model must learn):
   - `fix` k=4 LEARNS (drops well below floor)     -> self-prediction residual
     was the root cause; the fix is confirmed.
   - `fix` k=4 still floors but `noshare` learns    -> depth weight-sharing is
     the problem (12 distinct blocks needed), not the predictor.
+  - `fix` k=4 floors while `k1` learns            -> the k=4 memory is the
+    failure -> memory formability -> bet on memory levers (AFC-alpha).
   - `k1` ALSO floors                              -> cannot learn even a per-token
     map at dim 224 -> capacity/optimization -> run the dim-512 probe instead.
   - `fix` k=4 floors AND pred|W-I| near 0         -> the collapse developed
