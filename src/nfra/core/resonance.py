@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 import math
+import os
 
 
 def parallel_gated_scan(
@@ -70,7 +71,14 @@ def parallel_scan_time_varying(
     Returns:
         [B, H, S, Hd] hidden states for every timestep (parallel)
     """
-    from ..kernels.scan import selective_scan
+    from ..kernels.scan import selective_scan, _scan_torch
+
+    if os.environ.get('NFRA_SCAN_KERNEL', '1') == '0':
+        # Plain torch closed-form, NO custom autograd.Function wrapper. This
+        # keeps the scan traceable by torch.compile so it fuses into the rest
+        # of the graph instead of forcing a per-layer graph break. Training
+        # seq len is 256 (safe for the closed form; it overflows ~S=300).
+        return _scan_torch(gate, value, alpha, alpha_min, alpha_max)
 
     return selective_scan(gate, value, alpha, alpha_min, alpha_max)
 

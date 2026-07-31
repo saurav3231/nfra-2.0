@@ -137,6 +137,47 @@ if _HAS_TRITON:
         )
         return out
 
+    @triton.jit
+    def _scan_bwd_kernel(
+        dh_ptr, alpha_ptr, du_ptr,
+        S,
+        HDIM: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        ALPHA_MIN: tl.constexpr,
+        ALPHA_MAX: tl.constexpr,
+    ):
+        pid = tl.program_id(0).to(tl.int64)
+        hd = tl.arange(0, HEAD_DIM)
+        hd_mask = hd < HDIM
+        base = pid * S * HDIM
+        du = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        a_next = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        # du_t = dh_t + a_{t+1} * du_{t+1}, computed as a reverse recurrence.
+        # a_next holds a_t (the alpha of the NEXT higher index), which at step
+        # t is exactly a_{t+1}. No exp/cumsum -> finite for any S.
+        for t in range(S - 1, -1, -1):
+            dh = tl.load(dh_ptr + base + t * HDIM + hd,
+                         mask=hd_mask, other=0.0).to(tl.float32)
+            du = dh + a_next * du
+            tl.store(du_ptr + base + t * HDIM + hd, du, mask=hd_mask)
+            a = tl.load(alpha_ptr + base + t * HDIM + hd,
+                        mask=hd_mask, other=1.0).to(tl.float32)
+            a_next = tl.minimum(tl.maximum(a, ALPHA_MIN), ALPHA_MAX)
+
+    def _scan_bwd_triton(dh, alpha, alpha_min, alpha_max):
+        B, H, S, Hd = dh.shape
+        du = torch.empty((B, H, S, Hd), dtype=torch.float32, device=dh.device)
+        head_dim = triton.next_power_of_2(Hd)
+        _scan_bwd_kernel[(B * H,)](
+            dh, alpha, du, S,
+            HDIM=Hd,
+            HEAD_DIM=head_dim,
+            ALPHA_MIN=alpha_min,
+            ALPHA_MAX=alpha_max,
+            num_warps=1,
+        )
+        return du
+
 
 class ScanFunction(torch.autograd.Function):
     """Fused forward (Triton) + closed-form backward (torch, exact)."""
@@ -161,14 +202,19 @@ class ScanFunction(torch.autograd.Function):
         gate, value, alpha, h = ctx.saved_tensors
         alpha_min, alpha_max = ctx.alpha_min, ctx.alpha_max
         a = alpha.clamp(min=alpha_min, max=alpha_max)
-        C = torch.cumsum(a.clamp(min=1e-6).log(), dim=2)
-        eC = torch.exp(C)
         dh = dh.contiguous().to(torch.float32)
 
-        # du_t = sum_{k>=t} dh_k * prod_{j=t+1..k} a_j  (reverse scan)
-        #      = exp(-C_t) * reverse_cumsum(dh * exp(C))_t
-        R = _reverse_cumsum(dh * eC, dim=2)
-        du = torch.exp(-C) * R
+        if _use_triton() and dh.is_cuda:
+            # Fused reverse-scan kernel (one pass, finite at any S).
+            du = _scan_bwd_triton(dh, a, alpha_min, alpha_max)
+        else:
+            # Closed form via cumulative log-decay (exact, but its exp(-C)
+            # intermediate overflows fp32 around S ~= 300; the kernel above
+            # never forms it). du_t = sum_{k>=t} dh_k * prod_{j=t+1..k} a_j.
+            C = torch.cumsum(a.clamp(min=1e-6).log(), dim=2)
+            eC = torch.exp(C)
+            R = _reverse_cumsum(dh * eC, dim=2)
+            du = torch.exp(-C) * R
 
         dvalue = du * gate if gate is not None else du
         dgate = du * value if gate is not None else None

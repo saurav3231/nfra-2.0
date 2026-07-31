@@ -71,6 +71,12 @@ BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation kno
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
 # model the recompute is pure overhead -> set 0 to raise tok/s.
 CHECKPOINT = os.environ.get('NFRA_CHECKPOINT', '1') == '1'
+# torch.compile(mode='reduce-overhead'): fuses the per-step kernel stream and
+# captures it as CUDA graphs, killing Python/launch overhead (the main reason
+# a small model idles the GPU). Auto-disables checkpointing (recompute conflicts
+# with graph capture). Best combined with NFRA_SCAN_KERNEL=0 so the scan is
+# plain torch and fuses into the same graph instead of forcing a graph break.
+COMPILE = os.environ.get('NFRA_COMPILE', '0') == '1'
 EVAL_GAP = max(50, STEPS // 6)
 EXT_FACTOR = 2                      # extrapolation test: eval at SEQ_LEN * EXT_FACTOR
 GEN_LEN = 16
@@ -172,6 +178,18 @@ def build_family_spec(family, size, vocab):
 def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
               ema_decay=0.0, surprise=False):
     model.train()
+    if COMPILE and HAS_CUDA:
+        # Keep the caller's reference uncompiled (fine for later evals); train
+        # the compiled copy here. Dropout is handled correctly by Dynamo (it
+        # advances RNG between replays), so no loss of stochasticity.
+        try:
+            cfg = getattr(model, 'config', None)
+            if cfg is not None:
+                cfg.gradient_checkpointing = False
+            model = torch.compile(model, mode='reduce-overhead', dynamic=False)
+            print('  [compile] torch.compile(reduce-overhead) active')
+        except Exception as e:  # pragma: no cover - depends on torch version
+            print('  [warn] torch.compile failed (%s) - eager fallback' % e)
     opt, sched = make_optimizer(model, lr=3e-4,
                                 warmup=min(50, max(steps // 10, 1)), total=steps)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
@@ -189,7 +207,10 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
         except StopIteration:
             it = iter(train_loader)
             x, y = next(it)
-        x, y = x.to(DEVICE), y.to(DEVICE)
+        # Async H2D copies (non_blocking) overlap with the previous step's
+        # kernels; they only actually run async if the loader uses pin_memory.
+        x = x.to(DEVICE, non_blocking=HAS_CUDA)
+        y = y.to(DEVICE, non_blocking=HAS_CUDA)
         opt.zero_grad()
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
             loss = compute_loss(model, x, y, surprise=surprise)
