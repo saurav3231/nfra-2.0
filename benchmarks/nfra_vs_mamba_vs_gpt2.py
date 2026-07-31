@@ -102,21 +102,25 @@ torch.manual_seed(SEED); np.random.seed(SEED)
 
 # ─────────────────────────── data ───────────────────────────
 class HierarchicalDataset(Dataset):
-    """Synthetic data with topics + bigram structure (deterministic, seed-based)."""
+    """Synthetic data with topics + bigram structure (deterministic, seed-based).
+    Distribution (bigram/topic matrices) is fixed by `seed`; `seq_seed`
+    controls only the sampled sequences, so train and eval share the SAME
+    underlying distribution (otherwise eval is unlearnable out-of-distribution)."""
     VOCAB_SIZE = 4096
-    def __init__(self, num_seqs, seq_len, seed=0):
+    def __init__(self, num_seqs, seq_len, seed=0, seq_seed=None):
         super().__init__()
         self.seq_len = seq_len
-        rng = np.random.RandomState(seed)
+        dist_rng = np.random.RandomState(seed)
         N_TOPICS = 32
-        pi = np.exp(rng.randn(N_TOPICS, N_TOPICS) * 0.3)
+        pi = np.exp(dist_rng.randn(N_TOPICS, N_TOPICS) * 0.5)
         np.fill_diagonal(pi, pi.diagonal() * 3)
         self._topic_trans = pi / pi.sum(1, keepdims=True)
-        phi = np.exp(rng.randn(N_TOPICS, self.VOCAB_SIZE) * 0.5)
+        phi = np.exp(dist_rng.randn(N_TOPICS, self.VOCAB_SIZE) * 1.0)
         self._topic_emit = phi / phi.sum(1, keepdims=True)
-        th = np.exp(rng.randn(self.VOCAB_SIZE, self.VOCAB_SIZE) * 0.4)
+        th = np.exp(dist_rng.randn(self.VOCAB_SIZE, self.VOCAB_SIZE) * 1.0)
         self._bigram = th / th.sum(1, keepdims=True)
-        self.data = self._generate(num_seqs, seq_len, rng)
+        seq_rng = np.random.RandomState(seed if seq_seed is None else seq_seed)
+        self.data = self._generate(num_seqs, seq_len, seq_rng)
 
     def _generate(self, num_seqs, seq_len, rng):
         V = self.VOCAB_SIZE
@@ -427,8 +431,10 @@ def main():
         train_ds = WikiText2Dataset('train', SEQ_LEN + 1)
         eval_ds = WikiText2Dataset('validation', SEQ_LEN + 1)
     else:
-        train_ds = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1, seed=SEED)
-        eval_ds = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED + 1)
+        train_ds = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1,
+                                       seed=SEED, seq_seed=SEED)
+        eval_ds = HierarchicalDataset(512, SEQ_LEN + 1,
+                                      seed=SEED, seq_seed=SEED + 1)
     train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=0)
     eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False, num_workers=0)
     print("done")
@@ -541,8 +547,8 @@ def main():
 
     print("\n  — how to read this —")
     print("  • eval loss ~8.3 = random guessing; lower = better language model.")
-    print("  • Loss starts ~100-150 because random-init logits scale with dim,")
-    print("    then falls as the model learns — judge by the FINAL value.")
+    print("  • All losses start near 8.3 (fair init) and fall as the model")
+    print("    learns the bigram/topic structure — judge by the FINAL value.")
     print("  • tok/s here is pure-PyTorch (no fused kernels). Production fused")
     print("    kernels would make Mamba and NFRA dramatically faster.")
     print("  • All three trained on identical data with identical optimizer,")
