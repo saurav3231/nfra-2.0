@@ -48,6 +48,23 @@ def test_brainmixer_default_is_16_head_hierarchy():
     assert m16.n_heads == 16
 
 
+def test_brainmixer_fused_gate_value_is_exact():
+    """Fusing gate/value into one GEMM must be elementwise-identical to two
+    separate GEMMs (concat of weights -> concat of outputs). No loss drift."""
+    import torch.nn.functional as F
+    from nfra.core.neuro import BrainMixer
+
+    torch.manual_seed(0)
+    m = BrainMixer(192)
+    D = 192
+    W_f = m.proj_gate_value.weight.data                  # [2D, D]
+    x = torch.randn(2, 16, 192)
+    fused = F.linear(x, W_f)
+    ref = torch.cat([F.linear(x, W_f[:D]), F.linear(x, W_f[D:])], dim=-1)
+    assert torch.equal(fused, ref)
+    assert not hasattr(m, "proj_gate") and not hasattr(m, "proj_value")
+
+
 def test_k_wta_is_applied_in_mlp():
     mlp = BrainMLP(64, k_wta_frac=0.5)
     captured = {}

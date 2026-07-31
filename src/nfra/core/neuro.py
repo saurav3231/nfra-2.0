@@ -240,8 +240,7 @@ class BrainMixer(nn.Module):
         if dim != self.n_heads * self.head_dim:
             raise ValueError(f"dim ({dim}) must be divisible by {self.n_heads}")
 
-        self.proj_gate = nn.Linear(dim, dim, bias=False)
-        self.proj_value = nn.Linear(dim, dim, bias=False)
+        self.proj_gate_value = nn.Linear(dim, 2 * dim, bias=False)
         self.proj_out = nn.Linear(dim, dim, bias=False)
 
         # Input-dependent (selective) decay: per-token, per-head log-rate.
@@ -280,8 +279,12 @@ class BrainMixer(nn.Module):
         grid_code = self.grid_encoder(S, x.device)
         x_grid = x + grid_code.unsqueeze(0)
 
-        gate = torch.sigmoid(self.proj_gate(x_grid))
-        value = self.proj_value(x_grid)
+        # gate/value share the same input -> fused into ONE linear (concat of
+        # weights). gate_value = [x@W_gate^T, x@W_value^T] elementwise-identical
+        # to two separate GEMMs, but one launch + one intermediate tensor.
+        gate_value = self.proj_gate_value(x_grid)      # [B, S, 2D]
+        gate = torch.sigmoid(gate_value[..., :D])
+        value = gate_value[..., D:]
 
         gate = gate.view(B, S, H, Hd).permute(0, 2, 1, 3)
         value = value.view(B, S, H, Hd).permute(0, 2, 1, 3)

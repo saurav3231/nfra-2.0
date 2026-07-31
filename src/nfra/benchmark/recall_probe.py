@@ -20,13 +20,14 @@ Usage:
   python -m nfra.benchmark.recall_probe
 
 Env:
-  NFRA_RECALL_KS      comma list of spans      (default 4,16,64,128)
-  NFRA_RECALL_STEPS   train steps per (k, model) (default 400)
-  NFRA_RECALL_DIM     model width              (default 128)
-  NFRA_RECALL_DEPTH   NFRA depth               (default 12)
-  NFRA_RECALL_UNIQUE  unique fractal blocks    (default 2)
-  NFRA_RECALL_BATCH   batch size               (default 8)
-  NFRA_RECALL_SEQ     sequence length          (default 256)
+  NFRA_RECALL_KS         comma list of spans      (default 4,16,64,128)
+  NFRA_RECALL_STEPS      train steps per (k, model) (default 600)
+  NFRA_RECALL_DIM        model width              (default 224)
+  NFRA_RECALL_DEPTH      NFRA depth               (default 12)
+  NFRA_RECALL_UNIQUE     unique fractal blocks    (default 4)
+  NFRA_RECALL_BATCH      batch size               (default 8)
+  NFRA_RECALL_SEQ        sequence length          (default 256)
+  NFRA_RECALL_CONCURRENT 1 = train all configs on separate CUDA streams
 """
 
 import os

@@ -563,8 +563,10 @@ def main():
                                        seed=SEED, seq_seed=SEED)
         eval_ds = HierarchicalDataset(512, SEQ_LEN + 1,
                                       seed=SEED, seq_seed=SEED + 1)
-    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=0)
-    eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
+                              num_workers=0, pin_memory=HAS_CUDA)
+    eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False,
+                             num_workers=0, pin_memory=HAS_CUDA)
     print("done")
 
     # ── build models, matched on params

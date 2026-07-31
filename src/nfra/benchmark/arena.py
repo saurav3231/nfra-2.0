@@ -382,7 +382,8 @@ def make_loaders(size_idx):
             ds = HierarchicalDataset(max(512, BATCH * 12), SEQ_LEN + 1,
                                      seed=100 + size_idx, seq_seed=200 + size_idx * 10 + si)
         train_loaders[seed] = DataLoader(ds, batch_size=BATCH, shuffle=True,
-                                         generator=gen, num_workers=0)
+                                         generator=gen, num_workers=0,
+                                         pin_memory=HAS_CUDA)
     if use_wiki:
         eval_ds = WikiText2Dataset('validation', SEQ_LEN + 1)
         ext_ds = WikiText2Dataset('validation', SEQ_LEN * EXT_FACTOR + 1)
@@ -391,8 +392,10 @@ def make_loaders(size_idx):
                                       seed=100 + size_idx, seq_seed=300 + size_idx)
         ext_ds = HierarchicalDataset(max(256, BATCH * 6), SEQ_LEN * EXT_FACTOR + 1,
                                      seed=100 + size_idx, seq_seed=400 + size_idx)
-    eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False, num_workers=0)
-    ext_loader = DataLoader(ext_ds, batch_size=BATCH, shuffle=False, num_workers=0)
+    eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False,
+                             num_workers=0, pin_memory=HAS_CUDA)
+    ext_loader = DataLoader(ext_ds, batch_size=BATCH, shuffle=False,
+                            num_workers=0, pin_memory=HAS_CUDA)
     return train_loaders, eval_loader, ext_loader
 
 

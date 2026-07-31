@@ -179,8 +179,10 @@ The credible one. Answers **"who wins on which aspect"** and **"is NFRA really r
 | `NFRA_SCAN_KERNEL` | `1` | Selective-scan backend: `0` = torch closed-form, `1` = auto (Triton CUDA kernel when available), `2` = force Triton |
 | `NFRA_BANDS` | `16` | Recurrence band/head count for NFRA Brain (H8 ablation: `2,4,8,16`; `16` = hierarchical `[8,4,2,1]+router`) |
 | `NFRA_CHECKPOINT` | `1` | Gradient checkpointing; set `0` on a big GPU with small models to raise `tok/s` (recompute is overhead when memory is free) |
+| `NFRA_COMPILE` | `0` | `1` = `torch.compile(mode='reduce-overhead')` (CUDA-graph capture; kills launch overhead on small models). Auto-disables checkpointing; pair with `NFRA_SCAN_KERNEL=0` so the scan fuses instead of graph-breaking |
 | `NFRA_RECALL_KS` | `4,16,64,128` | Spans for the H3 memory-horizon probe (`python -m nfra.benchmark.recall_probe`) |
-| `NFRA_RECALL_STEPS` | `400` | Train steps per (span, model) in the recall probe |
+| `NFRA_RECALL_STEPS` | `600` | Train steps per (span, model) in the recall probe |
+| `NFRA_RECALL_CONCURRENT` | `0` | `1` = train all probe (span, model) configs concurrently on separate CUDA streams (near-100% GPU util, ~one model's wall time for the whole probe) |
 
 #### Outputs
 
