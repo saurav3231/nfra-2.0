@@ -39,7 +39,7 @@ from .arena import (
     build_nfra, train_one, make_loaders, NFRA_DEPTH,
     SEED_LIST, DATA_SOURCE,
 )
-from .compare import evaluate, count_params
+from .compare import evaluate, count_params, DEVICE
 
 OUT_JSON = os.environ.get('NFRA_OUT', 'nfra_31_vs_32.json')
 
@@ -77,7 +77,7 @@ def main():
         train_loader = train_loaders[SEED_LIST[0]]
 
         model = build_nfra(VOCAB, dim, unique, depth=NFRA_DEPTH,
-                           k_wta=cfg['k_wta'])
+                           k_wta=cfg['k_wta']).to(DEVICE)
         params = count_params(model)
         res = train_one(model, VOCAB, steps, train_loader, eval_loader,
                         eval_gap, ema_decay=cfg['ema_decay'],
