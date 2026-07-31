@@ -15,17 +15,19 @@ pass: fully parallel over (B*H) heads, each thread-block walks S sequentially
 with fp32 accumulation (safe for the clamped decays in [alpha_min, alpha_max]).
 
 Fallback: if Triton or CUDA is unavailable (CPU, dev box) the pure-torch
-closed form is used, so behavior is identical everywhere. Note: at long
-sequences with decays near the 0.75 floor the closed form's exp(-cumlog)
-intermediate overflows fp32 (~1e63 > 3.4e38 -> inf); the kernel never forms
-that intermediate and stays finite. Use the kernel (default on CUDA) for
-extrapolation-length sequences.
+closed form is used, so behavior is identical everywhere. The naive closed
+form's exp(-cumlog) intermediate overflows fp32 (~e^147 > 3.4e38) once
+S * -ln(alpha_min) > ~85, so beyond that threshold _scan_torch switches to a
+chunk-normalized closed form (and the backward to a reverse-chunked form)
+that never forms the huge intermediate — the torch path stays finite for any
+sequence length. The kernel (default on CUDA) is the single-pass version.
 
 Toggles:
   NFRA_SCAN_KERNEL   0 = always torch, 1 = auto (default), 2 = force triton
 """
 
 import os
+import math
 import torch
 
 try:
@@ -58,12 +60,74 @@ def scan_reference(gate, value, alpha, alpha_min=0.75, alpha_max=0.9995):
     return torch.cat(outs, dim=2)
 
 
+def _stable_threshold(alpha_min):
+    """Max sequence length the naive two-cumsum closed form survives in fp32.
+
+    The naive form materializes exp(-cumsum(log alpha)); with alphas pinned at
+    the floor that intermediate reaches ~exp(S * -ln(alpha_min)) and overflows
+    fp32 (> 3.4e38) once the exponent exceeds ~85. Below this S the naive form
+    is used so existing short-sequence behavior is bit-identical.
+    """
+    return int(85.0 / max(-math.log(max(alpha_min, 1e-6)), 1e-9))
+
+
 def _scan_torch(gate, value, alpha, alpha_min, alpha_max):
-    """Closed-form via cumulative log-decay (two cumsums), fp32 in the scan."""
+    """Closed-form via cumulative log-decay (two cumsums), fp32 in the scan.
+
+    At long sequences the naive exp(C)/exp(-C) intermediate overflows fp32
+    (~S > 300 at the 0.75 floor). Falls back to a chunked closed form that
+    normalizes exp() against each chunk's own decay prefix, so the huge
+    intermediate is never formed and the result stays finite for any S.
+    """
     u = value if gate is None else gate * value
     w = torch.log(alpha.clamp(min=alpha_min, max=alpha_max))
-    cumlog = torch.cumsum(w, dim=2)
-    return torch.exp(cumlog) * torch.cumsum(torch.exp(-cumlog) * u, dim=2)
+    S = u.shape[2]
+    if S <= _stable_threshold(alpha_min):
+        cumlog = torch.cumsum(w, dim=2)
+        return torch.exp(cumlog) * torch.cumsum(torch.exp(-cumlog) * u, dim=2)
+
+    u = u.to(torch.float32)
+    chunk = 64
+    n = (S + chunk - 1) // chunk
+    outs = []
+    h = torch.zeros_like(u[:, :, :1, :])
+    for c in range(n):
+        sl = slice(c * chunk, min((c + 1) * chunk, S))
+        Cc = torch.cumsum(w[:, :, sl], dim=2)          # chunk-local log-decay
+        hc = torch.exp(Cc) * (torch.cumsum(torch.exp(-Cc) * u[:, :, sl], dim=2)
+                              + h)
+        outs.append(hc)
+        h = hc[:, :, -1:, :]                            # carry state to next chunk
+    return torch.cat(outs, dim=2)
+
+
+def _du_torch_chunked(dh, a, chunk=64):
+    """Numerically stable du_t = sum_{k>=t} dh_k * prod_{j=t+1..k} a_j.
+
+    Reverse-chunked closed form: each chunk is normalized against its own last
+    log-decay, so exp() intermediates stay <= exp(-ln(alpha_min)*chunk) instead
+    of exp(S * -ln(alpha_min)) (which overflows fp32 around S~300).
+    """
+    w = a.clamp(min=1e-6).log()
+    C = torch.cumsum(w, dim=2)
+    B, H, S, Hd = dh.shape
+    dh = dh.float()
+    n = (S + chunk - 1) // chunk
+    chunks = []
+    carry = torch.zeros(B, H, Hd, dtype=torch.float32, device=dh.device)
+    for c in reversed(range(n)):
+        t0 = c * chunk
+        t1 = min(t0 + chunk, S)
+        sl = slice(t0, t1)
+        E = C[:, :, sl] - C[:, :, t1 - 1:t1]            # >= 0, <= -ln(a_min)*chunk
+        rsum = _reverse_cumsum(dh[:, :, sl] * torch.exp(E), dim=2)
+        du = torch.exp(-E) * rsum
+        if t1 < S:                                      # tail term across chunks
+            wnext = w[:, :, t1:t1 + 1]
+            du = du + torch.exp(wnext - E) * carry.unsqueeze(2)
+        chunks.append(du)
+        carry = du[:, :, 0, :]                          # du at this chunk's start
+    return torch.cat(chunks[::-1], dim=2)
 
 
 def _reverse_cumsum(x, dim=2):
@@ -211,10 +275,14 @@ class ScanFunction(torch.autograd.Function):
             # Closed form via cumulative log-decay (exact, but its exp(-C)
             # intermediate overflows fp32 around S ~= 300; the kernel above
             # never forms it). du_t = sum_{k>=t} dh_k * prod_{j=t+1..k} a_j.
-            C = torch.cumsum(a.clamp(min=1e-6).log(), dim=2)
-            eC = torch.exp(C)
-            R = _reverse_cumsum(dh * eC, dim=2)
-            du = torch.exp(-C) * R
+            # Long sequences use the chunk-stable version (same result, finite).
+            if dh.shape[2] > _stable_threshold(alpha_min):
+                du = _du_torch_chunked(dh, a)
+            else:
+                C = torch.cumsum(a.clamp(min=1e-6).log(), dim=2)
+                eC = torch.exp(C)
+                R = _reverse_cumsum(dh * eC, dim=2)
+                du = torch.exp(-C) * R
 
         dvalue = du * gate if gate is not None else du
         dgate = du * value if gate is not None else None

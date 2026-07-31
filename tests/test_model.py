@@ -40,6 +40,25 @@ def test_unique_blocks_scale_params():
     assert counts[2] > counts[1]
 
 
+def test_brain_config_respects_band_knob():
+    # The NFRA_BANDS ablation knob must reach the config: an explicit n_bands
+    # is respected (was silently force-overridden to 16); only the dataclass
+    # default (4) is promoted to the legacy 16-head hierarchy.
+    assert NFRAConfig(mode="brain", n_bands=8).n_bands == 8
+    assert NFRAConfig(mode="brain", n_bands=2).n_bands == 2
+    assert NFRAConfig(mode="brain").n_bands == 16
+
+
+def test_band_knob_reaches_brainmixer():
+    cfg = NFRAConfig(mode="brain", vocab_size=96, hidden_size=128,
+                     num_layers=2, n_bands=8)
+    model = NFRAForCausalLM(cfg)
+    assert model.layers[0].mixer.n_heads == 8
+    default = NFRAForCausalLM(NFRAConfig(mode="brain", vocab_size=96,
+                                         hidden_size=128, num_layers=2))
+    assert default.layers[0].mixer.n_heads == 16
+
+
 def test_lite_build_and_forward():
     torch.manual_seed(0)
     cfg = NFRAConfig(mode="lite", vocab_size=96)

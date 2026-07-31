@@ -90,6 +90,43 @@ def test_kernel_backward_matches_autograd():
     assert torch.allclose(da_t, da_r, atol=2e-3, rtol=2e-3)
 
 
+def test_torch_forward_stable_at_long_seq():
+    # Alpha pinned at the 0.75 floor: the naive two-cumsum closed form
+    # overflows fp32 (exp(-cumlog) ~ e^147 at S=512). The chunk-stable path
+    # must stay finite and match the exact sequential reference.
+    torch.manual_seed(0)
+    B, H, S, Hd = 2, 4, 512, 7
+    value = torch.randn(B, H, S, Hd)
+    gate = torch.sigmoid(torch.randn(B, H, S, Hd))
+    alpha = torch.full((B, H, S, Hd), 0.75)
+    out = selective_scan(gate, value, alpha, 0.75, 0.9995)
+    ref = scan_reference(gate, value, alpha, 0.75, 0.9995)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_torch_backward_stable_at_long_seq():
+    # Same floor-alpha regime for the backward closed form (du_t via exp(-C)):
+    # the chunk-stable reverse scan must be finite and match autograd of the
+    # exact sequential reference.
+    torch.manual_seed(0)
+    B, H, S, Hd = 1, 2, 512, 4
+    value = torch.randn(B, H, S, Hd)
+    gate = torch.sigmoid(torch.randn(B, H, S, Hd))
+    alpha = torch.full((B, H, S, Hd), 0.75)
+    for v in (gate, value, alpha):
+        v.requires_grad_(True)
+
+    tri = ScanFunction.apply(gate, value, alpha, 0.75, 0.9995)
+    ref = scan_reference(gate, value, alpha, 0.75, 0.9995)
+    w = torch.randn_like(tri)
+    grads_t = torch.autograd.grad((tri * w).sum(), (gate, value, alpha))
+    grads_r = torch.autograd.grad((ref * w).sum(), (gate, value, alpha))
+    for gt, gr in zip(grads_t, grads_r):
+        assert torch.isfinite(gt).all()
+        assert torch.allclose(gt, gr, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.skipif(not HAS_CUDA, reason='CUDA required')
 def test_env_force_torch():
     os.environ['NFRA_SCAN_KERNEL'] = '0'

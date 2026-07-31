@@ -85,8 +85,12 @@ class NFRAConfig:
         elif self.mode == "brain":
             # Don't override hidden_size/num_layers/unique_blocks — respect
             # user values (unique_blocks default is 4 in the dataclass).
+            # n_bands: promote the dataclass default (4) to the legacy 16-head
+            # hierarchy, but RESPECT an explicit value so the NFRA_BANDS
+            # band-count ablation knob actually reaches BrainMixer.
             self.fractal_scales = [1]
-            self.n_bands = 16
+            if self.n_bands == 4:
+                self.n_bands = 16
             self.use_mixture_of_fractals = False
             self.use_selective_scanning = False
             self.use_dynamic_precision = False

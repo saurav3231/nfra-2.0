@@ -61,3 +61,30 @@ def test_tune_nfra_matches_target():
     U, dim, params = arena.tune_nfra_size(5_000_000, 96, 12, [256, 192, 128])
     assert 12 % U == 0
     assert abs(params - 5e6) / 5e6 < 0.3
+
+
+def test_recall_probe_sequential_builds_all_then_trains(monkeypatch):
+    """recall_probe sequential mode must build every model under one RNG
+    stream before training any (init parity with concurrent mode), and return
+    the right per-(family, k) structure."""
+    from nfra.benchmark import recall_probe
+
+    calls = []
+
+    def fake_train_one(model, vocab, steps, train_loader, eval_loader,
+                       eval_gap, **kw):
+        calls.append(id(model))
+        return {"loss_hist": [1.0], "nan_steps": 0, "wall_s": 1.0,
+                "ms_per_step": 1.0, "tok_s": 1.0, "eval_hist": []}
+
+    def fake_metric(model, loader, k, V=16):
+        return (0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(recall_probe, "train_one", fake_train_one)
+    monkeypatch.setattr(recall_probe, "metric_by_span", fake_metric)
+    rows = recall_probe._run_all([4, 16], steps=1, dim=128, seq_len=32,
+                                 batch=2, unique=2, depth=4, concurrent=False)
+    assert set(rows) == {"nfra", "mamba"}
+    assert set(rows["nfra"]) == {4, 16}
+    assert set(rows["mamba"]) == {4, 16}
+    assert len(calls) == 4

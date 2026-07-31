@@ -21,6 +21,24 @@ def _brain(vocab=96, dim=128, layers=4, unique=2, kwta=0.0):
     return NFRAForCausalLM(cfg)
 
 
+def test_fractal_mlp_no_per_expert_sync():
+    """FractalGatedMLP must record expert activity as deferred flag tensors
+    (no implicit .item() GPU->CPU sync in the forward loop) and still report
+    a sane sparsity via get_sparsity."""
+    from nfra.core.fractal_block import FractalResonanceBlock
+
+    blk = FractalResonanceBlock(64)
+    x = torch.randn(2, 16, 64)
+    out = blk(x)
+    assert out.shape == (2, 16, 64)
+    flags = blk.mlp._n_active_flags
+    assert flags is not None
+    assert flags.shape == (len(blk.mlp.scales),)
+    assert flags.dtype == torch.bool
+    sp = blk.get_sparsity()
+    assert 0.0 <= sp <= 1.0
+
+
 def test_brainmixer_band_count_knob():
     """H8: BrainMixer must accept explicit band counts and train smoothly."""
     from nfra.core.neuro import BrainMixer

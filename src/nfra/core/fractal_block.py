@@ -74,15 +74,19 @@ class FractalGatedMLP(nn.Module):
         output = torch.zeros_like(hidden)
         coarse_w = coarse.squeeze(1).squeeze(-1)
         fine_w = fine.squeeze(1)
-        n_active = 0
+        # Record which experts are meaningfully active as a tensor of flags
+        # instead of a Python int: `if w.mean() > 0.01` on a CUDA tensor is an
+        # implicit .item() sync (one GPU->CPU stall per expert per forward).
+        # The flags are summed lazily in get_sparsity, keeping the forward loop
+        # free of device syncs.
+        active = []
         for i, expert in enumerate(self.sub_experts):
             w = coarse_w * fine_w[:, i]
             w = w.view(-1, 1, 1)
-            if w.mean() > 0.01:
-                n_active += 1
+            active.append((w.mean() > 0.01).reshape(-1))
             output = output + w * expert(hidden)
 
-        self._n_active = n_active
+        self._n_active_flags = torch.cat(active) if active else None
         return self.down_proj(output)
 
 
@@ -146,9 +150,10 @@ class FractalResonanceBlock(nn.Module):
         x = self.dropout(x)
         x = residual + x
 
-        n_active = getattr(self.mlp, '_n_active', 0)
+        flags = getattr(self.mlp, '_n_active_flags', None)
+        if flags is not None:
+            self.activation_count += flags.float().sum()
         total_experts = len(self.mlp.scales)
-        self.activation_count += n_active
         self.total_count += total_experts
 
         if return_stats:
