@@ -23,6 +23,7 @@ from .neuro import (
     BrainMixer,
     BrainMLP,
     TemporalGridEncoder,
+    GlobalBrainState,
 )
 from .predictive import PredictiveGenerator, MultiScalePredictor
 from .energy import DynamicEnergyBudgetAllocator
@@ -46,6 +47,7 @@ __all__ = [
     "BrainMixer",
     "BrainMLP",
     "TemporalGridEncoder",
+    "GlobalBrainState",
     "PredictiveGenerator",
     "MultiScalePredictor",
     "DynamicEnergyBudgetAllocator",

@@ -78,7 +78,8 @@ class NFRAConfig:
             self.depth_shared = False
 
         elif self.mode == "brain":
-            # Don't override hidden_size/num_layers — respect user values
+            # Don't override hidden_size/num_layers/unique_blocks — respect
+            # user values (unique_blocks default is 4 in the dataclass).
             self.fractal_scales = [1]
             self.n_bands = 16
             self.use_mixture_of_fractals = False
@@ -88,7 +89,6 @@ class NFRAConfig:
             self.num_fractal_experts = 0
             self.top_k_experts = 0
             self.depth_shared = True
-            self.unique_blocks = 4
 
 
 class NFRAForCausalLM(nn.Module):
@@ -131,6 +131,19 @@ class NFRAForCausalLM(nn.Module):
             )
             for _ in range(self.n_unique)
         ])
+
+        # Per-pass adapters (FiLM): tiny per-pass scale/shift applied at the
+        # start of each depth pass. Breaks depth-sharing symmetry so the SAME
+        # weights don't compute identically at every depth — each pass learns
+        # a cheap "depth position" specialization (~2*depth_passes*dim params).
+        if config.depth_shared and self.depth_passes > 1:
+            self.pass_scale = nn.Parameter(
+                torch.ones(self.depth_passes, config.hidden_size))
+            self.pass_bias = nn.Parameter(
+                torch.zeros(self.depth_passes, config.hidden_size))
+        else:
+            self.register_parameter('pass_scale', None)
+            self.register_parameter('pass_bias', None)
         
         if config.energy_aware:
             self.energy_allocator = DynamicEnergyBudgetAllocator(
@@ -146,6 +159,16 @@ class NFRAForCausalLM(nn.Module):
             
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
+
+        # Global brain state: a GRU that aggregates a whole-depth summary and
+        # injects it top-down into subsequent passes. Gives the network a
+        # persistent "global state" (like slow neuromodulatory loops) instead of
+        # only local per-token signals. Threaded at the model level.
+        self.global_brain = None
+        if self._has_neuromodulator:
+            from ..core.neuro import GlobalBrainState
+            self.global_brain = GlobalBrainState(
+                config.hidden_size, state_dim=max(32, config.hidden_size // 8))
 
     def forward(self, input_ids, energy_budget=None, return_dict=True):
         if input_ids.dim() != 2:
@@ -166,6 +189,7 @@ class NFRAForCausalLM(nn.Module):
             budgets = [1.0] * self.n_unique
         
         hormones = None
+        global_state = None
         use_ckpt = (
             self.config.gradient_checkpointing
             and self.training
@@ -175,7 +199,12 @@ class NFRAForCausalLM(nn.Module):
             checkpoint = torch.utils.checkpoint.checkpoint
 
         if self._has_neuromodulator:
-            for _ in range(self.depth_passes):
+            for p in range(self.depth_passes):
+                # Per-pass adapter: depth-shared blocks compute a DIFFERENT
+                # function at each pass (breaks symmetry → more capacity).
+                if self.pass_scale is not None:
+                    hidden_states = (hidden_states * self.pass_scale[p].view(1, 1, -1)
+                                     + self.pass_bias[p].view(1, 1, -1))
                 for i, layer in enumerate(self.layers):
                     if use_ckpt:
                         hidden_states, hormones = checkpoint(
@@ -186,8 +215,16 @@ class NFRAForCausalLM(nn.Module):
                         hidden_states, hormones = layer(
                             hidden_states, hormones=hormones, energy_budget=budgets[i]
                         )
+                # Top-down global brain state: aggregate the current pass, then
+                # feed it back into the NEXT pass (slow neuromodulatory loop).
+                if self.global_brain is not None:
+                    global_state = self.global_brain(hidden_states, global_state)
+                    hidden_states = self.global_brain.inject(global_state, hidden_states)
         else:
-            for _ in range(self.depth_passes):
+            for p in range(self.depth_passes):
+                if self.pass_scale is not None:
+                    hidden_states = (hidden_states * self.pass_scale[p].view(1, 1, -1)
+                                     + self.pass_bias[p].view(1, 1, -1))
                 for i, layer in enumerate(self.layers):
                     if use_ckpt:
                         hidden_states = checkpoint(

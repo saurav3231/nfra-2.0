@@ -409,6 +409,7 @@ class NFRA_Brain_Block(nn.Module):
         self.max_thinking_depth = max_thinking_depth
 
         from .neuro import NeuroModulator, ThalamicGate, BrainMixer, BrainMLP
+        from .resonance import ResonanceGuidedLocalAttention
 
         self.neuromodulator = NeuroModulator(dim)
 
@@ -417,6 +418,13 @@ class NFRA_Brain_Block(nn.Module):
         self.ln1 = nn.LayerNorm(dim)
         self.mixer = BrainMixer(dim)
         self.thalamus = ThalamicGate(dim)
+
+        # Lightweight sliding-window attention for content-addressable retrieval
+        # (exact recall of recent tokens — spelling/character context that pure
+        # recurrence handles poorly). Gated by the mixer's router score.
+        self.local_attn = ResonanceGuidedLocalAttention(
+            dim, n_heads=2, head_dim=dim // 8, window=64)
+        self.attn_gate = nn.Linear(dim, 1, bias=False)
 
         self.gist_proj = nn.Linear(dim, dim, bias=False)
         self.gist_gate = nn.Linear(dim, 1, bias=False)
@@ -477,6 +485,12 @@ class NFRA_Brain_Block(nn.Module):
         # Deep stream: single parallel-scan mixer pass (no sequential loop)
         recurrence_out, router_score = self.mixer(n, hormones=hormones)
         deep = self.thalamus(n, hormones, recurrence_out)
+
+        # Content retrieval: sliding-window attention on the same stream, gated
+        # per-token by the recurrence router (familiar tokens skip it).
+        attn_out = self.local_attn(n, router_score)
+        attn_gate = torch.sigmoid(self.attn_gate(n)).clamp(0.0, 0.5)
+        deep = deep + attn_gate * attn_out
 
         # Tensorized depth refinement applied ONCE (dopamine scales its strength)
         deep = deep + depth_f * self.depth_refine(deep)

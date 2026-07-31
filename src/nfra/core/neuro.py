@@ -16,7 +16,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 import math
 
-from .resonance import parallel_gated_scan
+from .resonance import parallel_gated_scan, parallel_scan_time_varying
 
 
 class NeuroModulator(nn.Module):
@@ -152,6 +152,58 @@ class TemporalGridEncoder(nn.Module):
         return self.proj(code.reshape(S, 2 * self.n_osc))
 
 
+class GlobalBrainState(nn.Module):
+    """
+    Global brain state: a slow top-down neuromodulatory loop.
+
+    Each depth pass aggregates its whole representation into a pooled summary;
+    a GRU integrates that summary across passes into a persistent global state.
+    The state is injected top-down into every token of the NEXT pass, so the
+    network has a coherent "global context" that evolves as it processes —
+    mirroring slow neuromodulatory systems (arousal, attention, gist) that
+    broadcast a whole-brain state rather than per-token local signals.
+
+    Architecture:
+      s_t = mean over sequence of hidden pass t
+      g_t = GRU(s_t, g_{t-1})                       # global state update
+      x_{t+1} += proj(g_t) broadcast per token       # top-down injection
+
+    Params: ~3*(state_dim*dim + state_dim^2) — tiny vs the block itself.
+    """
+
+    def __init__(self, dim: int, state_dim: int = 64):
+        super().__init__()
+        self.dim = dim
+        self.state_dim = state_dim
+
+        self.pool_proj = nn.Linear(dim, state_dim, bias=False)
+        self.gru_cell = nn.GRUCell(state_dim, state_dim)
+        self.inject_proj = nn.Linear(state_dim, dim, bias=False)
+        self.gate = nn.Linear(state_dim, 1, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Aggregate `x` (the current depth pass) and update the global state."""
+        pooled = x.mean(dim=1)                      # [B, dim]
+        h = torch.tanh(self.pool_proj(pooled))      # [B, state_dim]
+        if state is None:
+            state = torch.zeros(h.size(0), self.state_dim, device=h.device)
+        return self.gru_cell(h, state)
+
+    def inject(
+        self,
+        state: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inject the global state top-down into all tokens of the next pass."""
+        proj = self.inject_proj(state)              # [B, dim]
+        gain = torch.sigmoid(self.gate(state))      # [B, 1] how strongly to inject
+        return x + gain.view(-1, 1, 1) * proj.unsqueeze(1)
+
+
 class BrainMixer(nn.Module):
     """
     Emotionally-modulated multi-scale recurrence with efficient cross-head mixing.
@@ -180,6 +232,14 @@ class BrainMixer(nn.Module):
         self.proj_gate = nn.Linear(dim, dim, bias=False)
         self.proj_value = nn.Linear(dim, dim, bias=False)
         self.proj_out = nn.Linear(dim, dim, bias=False)
+
+        # Input-dependent (selective) decay: per-token, per-head log-rate.
+        # dt_t = softplus(dt_proj(x_t)); alpha_t = exp(A * dt_t) with A < 0.
+        # Like Mamba's selectivity — the network learns WHEN to remember
+        # (small dt) vs when to forget (large dt) for each token/head.
+        self.dt_proj = nn.Linear(dim, self.n_heads, bias=True)
+        nn.init.zeros_(self.dt_proj.bias)
+        self.dt_norm = nn.Parameter(torch.ones(1))
 
         log_alphas = []
         target_decays = [0.90, 0.95, 0.98, 0.995]
@@ -217,18 +277,25 @@ class BrainMixer(nn.Module):
         gate = gate.view(B, S, H, Hd).permute(0, 2, 1, 3)
         value = value.view(B, S, H, Hd).permute(0, 2, 1, 3)
 
-        # alpha bounded to (0.85, 0.9995) by construction → the scan's clamp
-        # never clips, so log_alpha always keeps a live gradient.
-        alpha = 0.85 + 0.15 * torch.sigmoid(self.log_alpha)
-        alpha = alpha.view(1, H, 1, Hd)
+        # Input-dependent (selective) decay: per-token, per-head dt.
+        # alpha_t = exp(log(base_alpha) * dt_t); dt_t in (0, 2) from sigmoid.
+        # The network learns WHEN to remember (small dt) vs forget (large dt),
+        # per head — Mamba-style selectivity within a bounded (numerically safe)
+        # range so the parallel closed-form scan never overflows.
+        base_alpha = 0.85 + 0.15 * torch.sigmoid(self.log_alpha)     # [H, Hd]
+        base_log = torch.log(base_alpha.clamp(min=1e-4))             # [H, Hd] (<0)
 
+        dt = torch.sigmoid(self.dt_proj(x_grid)) * 2.0               # [B, S, H]
         if hormones is not None:
-            ach = hormones[:, 0:1].view(B, 1, 1, 1)
-            alpha = alpha * (1.0 - 0.1 * ach)   # high ACh → slightly faster decay
+            ach = hormones[:, 0:1].view(B, 1, 1)                     # high ACh → forget
+            dt = dt * (1.0 + 0.5 * ach)
+        alpha = torch.exp(base_log.view(1, H, 1, Hd)
+                          * dt.permute(0, 2, 1).view(B, H, S, 1))    # [B, H, S, Hd]
 
-        # Parallel closed-form scan — h_t = alpha*h_{t-1} + gate_t*value_t
-        # (replaces the O(S) sequential loop with one vectorized cumsum)
-        h = parallel_gated_scan(gate, value, alpha)
+        # Parallel closed-form time-varying scan —
+        # h_t = alpha_t*h_{t-1} + gate_t*value_t (one vectorized cumsum pair)
+        h = parallel_scan_time_varying(gate, value, alpha,
+                                       alpha_min=0.75, alpha_max=0.9995)
 
         # Cross-head coherence via CLOSED-FORM oscillatory similarity (O(H²)).
         # Coherence of two oscillators over S steps = |(1/S) sum_t e^{i 2π Δf t/S}|
