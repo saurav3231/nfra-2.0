@@ -149,3 +149,102 @@ Each phase = A/B in `compare.py`/`arena.py`; keep only Pareto winners.
 
 - Eval loss & ppl (≥3 seeds, mean ± std), tok/s, ms/token (prefill + AR gen), peak train & infer memory GB, NaN/stability events, sample-efficiency AUC, scaling slope, extrap_delta.
 - Plus the fairness record: HP budget per family, token budget, seeds, wall-clock — so every number is reproducible and no family is handicapped.
+
+---
+
+## Part 9 — Brain-inspired ideas (neuroscience → NFRA)
+
+Every idea below maps a *specific* brain mechanism to a concrete change. All are checked against the motive (low latency/memory, modest hardware) and the anti-goals in Part 7.
+
+### Tier 1 — cheap, high-impact, fully aligned
+
+1. **Dopamine reward-prediction-error → surprise-weighted gradients.**
+   Brain: learning driven by the gap between predicted and actual outcome (RPE).
+   NFRA: weight each token's gradient by |confidence − outcome| ("RPE").
+   Impact: capacity spent on hard/ambiguous tokens; loss ↓ with zero added params.
+   Practical: one scalar/token, training-only, no inference cost. **High.**
+
+2. **Cortical lateral inhibition → k-WTA sparsity in fractal MLP.**
+   Brain: neighboring neurons suppress each other; sparsity is input-dependent, not fixed.
+   NFRA: replace uniform fractal masks with data-driven top-k activation per feature group.
+   Impact: capacity lands where input needs it — most of MoE's benefit, none of its routing overhead.
+   Practical: one k-select op, O(L), hardware-friendly. **High.**
+
+3. **Acetylcholine novelty signal → band-drop gating.**
+   Brain: ACh marks novelty/uncertainty and steers top-down vs bottom-up attention.
+   NFRA: predicted novelty/entropy gates whole bands off for easy tokens (biologically grounded H4).
+   Impact: compute-on-demand — same speed curve, better loss on hard tokens.
+   Practical: one novelty head + boolean gate. **High.**
+
+4. **Norepinephrine arousal → global gain modulation.**
+   Brain: NE sets global responsiveness — a single gain over the whole system.
+   NFRA: predicted arousal scalar (from recent error rate) scales activations via the existing global-brain-state modulation.
+   Impact: robustness to distribution shift and bursty text; stabilized dynamics.
+   Practical: one scalar/segment, reuses existing modulation layers. **Very high.**
+
+5. **NREM sharp-wave replay → offline replay of hard sequences.**
+   Brain: during sleep the hippocampus replays salient sequences to the cortex for consolidation.
+   NFRA: between epochs, re-train on the highest-loss sequences (prioritized replay).
+   Impact: sample efficiency on exactly the data that hurts the loss.
+   Practical: training-only, reuses forward pass. **Very high.**
+
+### Tier 2 — medium effort, strong alignment
+
+6. **Hippocampal episodic memory → bounded associative context cache.**
+   Brain: hippocampus stores episodes separately from slow cortical weights (Complementary Learning Systems).
+   NFRA: small, fast-learning key-value memory of recent context the model attends to (compressed episodic buffer) layered over slow shared weights.
+   Impact: long-range recall — the exact axis where Mamba beats NFRA.
+   Practical: bounded KV buffer + one attention op; needs a memory-budget guard. **Medium.**
+
+7. **Cerebellar forward model → fast low-rank corrector.**
+   Brain: cerebellum learns to predict and cancel systematic errors quickly.
+   NFRA: low-rank module updated rapidly, correcting the block's systematic output error (learned residual prediction).
+   Impact: faster convergence (synergy with H2); fewer steps to same loss.
+   Practical: one LoRA-like module + fast update rule. **Medium.**
+
+8. **Mirror-simulation / world model → latent future prediction loss.**
+   Brain: predicts its own future internal states, not only external outputs.
+   NFRA: auxiliary loss predicting the *next hidden state* in addition to next token.
+   Impact: forces a better internal model → better token loss at zero inference cost.
+   Practical: extra head + MSE on internals, training-only. **Medium-high.**
+
+9. **Grid cells → multi-scale positional encoding.**
+   Brain: hippocampal grid cells encode space at nested scales (hexagonal hierarchies).
+   NFRA: give each band a matching-resolution positional embedding — slow bands see coarse positions, fast bands fine ones.
+   Impact: sharper position info per temporal scale → better band mixing.
+   Practical: additive embeddings, trivial to add. **High.**
+
+10. **DMN task/rest alternation → interleaved consolidation phases.**
+    Brain: alternates task mode with internally-focused rest.
+    NFRA: schedule training as "predict next token" phases alternating with "predict your own hidden representations" phases.
+    Impact: better representations, less overfit to surface statistics.
+    Practical: a training-schedule switch. **Medium.**
+
+### Tier 3 — bold, experimental
+
+11. **Burst coding → skip + burst compute.**
+    Brain: neurons stay silent, then burst when input is surprising (event-driven computation).
+    NFRA: confidence-gated early-exit; on high surprise allow an extra refinement pass (burst) over the block.
+    Impact: both speed up (skips) *and* quality up (bursts) — the rare dual win.
+    Practical: **Low-medium** — exit/burst policies are hard to stabilize.
+
+12. **Neural synchrony → per-band oscillatory gating.**
+    Brain: gamma (fast) and theta (slow) oscillations bind information within their timescale.
+    NFRA: multiply each band's gate by a fixed-frequency sinusoidal phase matching band scale.
+    Impact: possible better temporal binding/mixing; speculative.
+    Practical: **Low** — cheap to add but may not help; needs an H8-style ablation first.
+
+13. **Belief-state inference → latent generative state.**
+    Brain: perception is inference of hidden causes, not just prediction.
+    NFRA: make the recurrence's hidden state an explicit latent belief (normalized/regularized, optionally variational).
+    Impact: better sample efficiency, cleaner long-range state.
+    Practical: **Low-medium** — adds training complexity; keep deterministic first.
+
+### Cross-cutting — efficiency (the brain's real lesson)
+
+14. **Cortex runs at ~4.7 bits/weight → QAT + 4-bit NFRA.**
+    NFRA: quantization-aware training to 4-bit weights → halve memory per param → ~2× bigger `hidden_size` in the same envelope (realizes E / memory-matched scaling).
+    Impact: the most motive-aligned idea of all — the brain's efficiency *is* its memory economy.
+    Practical: PyTorch QAT infra exists; benchmark-gated. **High.**
+
+**Suggested order:** Tier 1 (1→5) first — all cheap, training/inference-safe, directly attack the loss gap or speed curve → Tier 2 (9, 8, 6, 7) — attack the Mamba long-range/capacity gap → Tier 3 (11, 12, 13) only if the H3/H8 probes justify.
