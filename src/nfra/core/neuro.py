@@ -184,9 +184,12 @@ class BrainMixer(nn.Module):
         log_alphas = []
         target_decays = [0.90, 0.95, 0.98, 0.995]
         for lvl, (n, d) in enumerate(zip(self.head_counts, target_decays)):
-            log_a = torch.full((n, self.head_dim), math.log(d / (1.0 - d)))
+            # alpha = 0.85 + 0.15*sigmoid(log_alpha); invert for the target
+            s = (d - 0.85) / 0.15
+            log_a = torch.full((n, self.head_dim), math.log(s / (1.0 - s)))
             log_alphas.append(log_a)
-        log_alphas.append(torch.full((1, self.head_dim), math.log(0.9 / 0.1)))
+        s_router = (0.9 - 0.85) / 0.15
+        log_alphas.append(torch.full((1, self.head_dim), math.log(s_router / (1.0 - s_router))))
         self.log_alpha = nn.Parameter(torch.cat(log_alphas, dim=0))
 
         self.frequencies = nn.Parameter(torch.randn(self.n_heads) * 0.5 + 2.0)
@@ -214,12 +217,14 @@ class BrainMixer(nn.Module):
         gate = gate.view(B, S, H, Hd).permute(0, 2, 1, 3)
         value = value.view(B, S, H, Hd).permute(0, 2, 1, 3)
 
-        alpha = torch.sigmoid(self.log_alpha)
+        # alpha bounded to (0.85, 0.9995) by construction → the scan's clamp
+        # never clips, so log_alpha always keeps a live gradient.
+        alpha = 0.85 + 0.15 * torch.sigmoid(self.log_alpha)
         alpha = alpha.view(1, H, 1, Hd)
 
         if hormones is not None:
             ach = hormones[:, 0:1].view(B, 1, 1, 1)
-            alpha = 0.8 + 0.19 * alpha + 0.1 * ach * alpha
+            alpha = alpha * (1.0 - 0.1 * ach)   # high ACh → slightly faster decay
 
         # Parallel closed-form scan — h_t = alpha*h_{t-1} + gate_t*value_t
         # (replaces the O(S) sequential loop with one vectorized cumsum)

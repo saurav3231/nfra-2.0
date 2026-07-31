@@ -31,12 +31,46 @@ def parallel_gated_scan(
         [B, H, S, Hd] hidden states for every timestep (parallel, O(S) memory)
     """
     u = value if gate is None else gate * value
-    w = torch.log(alpha.clamp(min=0.85, max=0.99))   # w <= -0.01 for numerical safety
+    # Max clamp at 0.9995 (not 0.99) so decays like 0.995 keep a live gradient;
+    # min clamp 0.85 bounds the parallel-form magnitude at long sequences.
+    w = torch.log(alpha.clamp(min=0.85, max=0.9995))
     S = u.shape[2]
     pos = torch.arange(1, S + 1, device=u.device).float().view(1, 1, S, 1)
     decay_inv = torch.exp(-w * pos)                   # alpha^{-t}  (<= 1e18 at S=256)
     decay_fwd = torch.exp(w * pos)                    # alpha^{t}
     return decay_fwd * torch.cumsum(decay_inv * u, dim=2)
+
+
+def parallel_scan_time_varying(
+    gate: Optional[torch.Tensor],
+    value: torch.Tensor,
+    alpha: torch.Tensor,
+    alpha_min: float = 0.85,
+    alpha_max: float = 0.99,
+) -> torch.Tensor:
+    """
+    Parallel scan for h_t = alpha_t * h_{t-1} + gate_t * value_t
+    with a PER-STEP decay alpha_t (unlike parallel_gated_scan's fixed alpha).
+
+    Closed form using cumulative log-decay:
+
+        h_t = exp(C_t) * sum_{k<=t} exp(-C_k) * gate_k * value_k,
+        C_t = sum_{i<=t} log(alpha_i)
+
+    Vectorized with two cumsums — no Python loop, O(S) memory.
+
+    Args:
+        gate:   [B, H, S, Hd] input gates in (0, 1), or None for no gating
+        value:  [B, H, S, Hd] values
+        alpha:  [B, H, S, Hd] per-timestep decays in (0, 1)
+
+    Returns:
+        [B, H, S, Hd] hidden states for every timestep (parallel)
+    """
+    u = value if gate is None else gate * value
+    w = torch.log(alpha.clamp(min=alpha_min, max=alpha_max))
+    cumlog = torch.cumsum(w, dim=2)
+    return torch.exp(cumlog) * torch.cumsum(torch.exp(-cumlog) * u, dim=2)
 
 
 class ResonanceSignature:

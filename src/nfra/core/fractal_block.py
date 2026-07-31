@@ -327,8 +327,14 @@ class NFRA_Max_Block(nn.Module):
         residual = x
         x = self.ln1(x)
         recurrence_out, router_score = self.mixer(x)
-        attn_out = self.local_attn(x, router_score)
-        x = recurrence_out + attn_out
+        # Energy-gated attention bypass: at low budgets skip the local attention
+        # entirely (pure recurrence path) to save compute on low-end GPUs.
+        if energy_budget is not None and energy_budget < 0.4:
+            attn_out = torch.zeros_like(recurrence_out)
+        else:
+            attn_out = self.local_attn(x, router_score)
+        attn_scale = energy_budget if energy_budget is not None else 1.0
+        x = recurrence_out + attn_out * min(attn_scale, 1.0)
         x = self.dropout(x)
         x = residual + x
 

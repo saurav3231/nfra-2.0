@@ -23,6 +23,7 @@ class NFRAConfig:
     hidden_size: int = 768
     num_layers: int = 12
     dropout: float = 0.1
+    gradient_checkpointing: bool = False
     
     # Fractal settings
     fractal_scales: List[int] = field(default_factory=lambda: [1, 2, 4])
@@ -72,8 +73,9 @@ class NFRAConfig:
             self.top_k_experts = 2
 
         elif self.mode == "max":
-            self.hidden_size = 768
-            self.num_layers = 24
+            # Respect user num_layers/hidden_size — defaults (768/12) already
+            # come from the dataclass fields. Pass num_layers=24 for full Max.
+            self.depth_shared = False
 
         elif self.mode == "brain":
             # Don't override hidden_size/num_layers — respect user values
@@ -164,22 +166,52 @@ class NFRAForCausalLM(nn.Module):
             budgets = [1.0] * self.n_unique
         
         hormones = None
+        use_ckpt = (
+            self.config.gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        if use_ckpt:
+            checkpoint = torch.utils.checkpoint.checkpoint
+
         if self._has_neuromodulator:
             for _ in range(self.depth_passes):
                 for i, layer in enumerate(self.layers):
-                    hidden_states, hormones = layer(
-                        hidden_states, hormones=hormones, energy_budget=budgets[i]
-                    )
+                    if use_ckpt:
+                        hidden_states, hormones = checkpoint(
+                            self._run_layer, layer, hidden_states,
+                            budgets[i], hormones, use_reentrant=False,
+                        )
+                    else:
+                        hidden_states, hormones = layer(
+                            hidden_states, hormones=hormones, energy_budget=budgets[i]
+                        )
         else:
             for _ in range(self.depth_passes):
                 for i, layer in enumerate(self.layers):
-                    hidden_states = layer(hidden_states, energy_budget=budgets[i])
+                    if use_ckpt:
+                        hidden_states = checkpoint(
+                            self._run_layer, layer, hidden_states,
+                            budgets[i], None, use_reentrant=False,
+                        )
+                    else:
+                        hidden_states = layer(hidden_states, energy_budget=budgets[i])
         
         logits = self.lm_head(hidden_states)
         
         if return_dict:
             return {"logits": logits}
         return logits
+
+    @staticmethod
+    def _run_layer(layer, hidden_states, budget, hormones):
+        """Single layer pass used by gradient checkpointing (recomputed in backward)."""
+        if hasattr(layer, 'neuromodulator'):
+            hidden_states, hormones = layer(
+                hidden_states, hormones=hormones, energy_budget=budget
+            )
+            return hidden_states, hormones
+        return layer(hidden_states, energy_budget=budget)
 
 
 class NFRAForSequenceClassification(nn.Module):

@@ -28,6 +28,8 @@ class SelectiveResonanceScanner(nn.Module):
         # Projection layers
         self.in_proj = nn.Linear(dim, dim * 2)
         self.out_proj = nn.Linear(dim, dim)
+        self.state_proj = nn.Linear(dim, state_dim)
+        self.state_out = nn.Linear(state_dim, dim, bias=False)
         
         # State space parameters
         self.A_log = nn.Parameter(torch.randn(state_dim))
@@ -42,7 +44,7 @@ class SelectiveResonanceScanner(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with selective scanning.
+        Forward pass with selective scanning (parallel closed-form scan).
         """
         batch, seq_len, dim = x.shape
         
@@ -53,19 +55,25 @@ class SelectiveResonanceScanner(nn.Module):
         # Compute delta (discretization step)
         delta = torch.sigmoid(self.dt_proj2(F.silu(self.dt_proj(x))))
         
-        # State space scan (simplified but stable)
-        A = -torch.exp(self.A_log)  # Negative for stability
+        # Stable state-space decay: alpha_t = exp(-exp(A_log) * delta_t) in (0,1)
+        A = -torch.exp(self.A_log.clamp(max=4.0))                    # [state_dim]
+        alpha = torch.exp(A.view(1, 1, 1, self.state_dim)
+                          * delta.view(batch, 1, seq_len, 1))        # [B, 1, S, state_dim]
         
-        h = torch.zeros(batch, self.state_dim, device=x.device)
-        outputs = []
+        # Selection gates (sigmoid so gates stay in (0,1))
+        gate = torch.sigmoid(self.selection(x))                      # [B, S, state_dim]
+        value = self.state_proj(x)                                   # [B, S, state_dim]
         
-        for t in range(seq_len):
-            # Selective update
-            h = h * torch.exp(A * delta[:, t]) + x[:, t].unsqueeze(-1) * self.selection(x[:, t])
-            y = (h @ self.out_proj.weight.T[:, :self.state_dim].T) + self.D * x[:, t]
-            outputs.append(y)
-            
-        y = torch.stack(outputs, dim=1)
+        # Parallel scan h_t = alpha_t * h_{t-1} + gate_t * value_t
+        from .resonance import parallel_scan_time_varying
+        h = parallel_scan_time_varying(
+            gate.view(batch, 1, seq_len, self.state_dim),
+            value.view(batch, 1, seq_len, self.state_dim),
+            alpha,
+        )                                                            # [B, 1, S, state_dim]
+        h = h.view(batch, seq_len, self.state_dim)
+        
+        y = self.state_out(h) + self.D.unsqueeze(0).unsqueeze(0) * x
         
         # Gating with z
         y = y * F.silu(z)
@@ -104,20 +112,25 @@ class MixtureOfFractals(nn.Module):
         topk_scores, topk_indices = torch.topk(scores, self.top_k, dim=-1)
         topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)
         
+        # Batched top-k routing: run each expert once on the samples routed to it,
+        # instead of a per-batch Python loop.
         output = torch.zeros_like(x)
+        flat_idx = torch.arange(batch * seq, device=x.device).view(batch, seq)
         
         for i in range(self.top_k):
-            expert_idx = topk_indices[:, i]
-            weight = topk_scores[:, i].unsqueeze(-1).unsqueeze(-1)
+            expert_idx = topk_indices[:, i]                 # [B]
+            weight = topk_scores[:, i]                      # [B]
             
-            expert_outputs = []
-            for b in range(batch):
-                expert_out = self.experts[expert_idx[b]](x[b:b+1])
-                expert_outputs.append(expert_out)
-            
-            expert_stack = torch.cat(expert_outputs, dim=0)
-            output = output + weight * expert_stack
-                
+            for e in range(self.num_experts):
+                mask = (expert_idx == e)                    # [B]
+                if not mask.any():
+                    continue
+                rows = flat_idx[mask].reshape(-1)           # all tokens of routed samples
+                expert_out = self.experts[e](x[mask]).view(-1, dim)   # [Bsel*S, D]
+                w_flat = (weight[mask].view(-1, 1, 1, 1)
+                          .expand(-1, seq, -1, -1).reshape(-1, 1))   # [Bsel*S, 1]
+                output.view(-1, dim)[rows] += w_flat * expert_out
+        
         return output
 
 
