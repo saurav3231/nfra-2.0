@@ -17,9 +17,11 @@
 ║       so NFRA gets several DISTINCT blocks within budget. A pure        ║
 ║       1-block x depth-passes 'recurrent' config is also a valid NFRA    ║
 ║       setting but is intentionally NOT used for the head-to-head.       ║
-║     • NFRA uses per-layer gradient checkpointing; Mamba's scan is       ║
-║       checkpointed per chunk and the whole block runs in fp32 (its      ║
-║       unfused recurrence overflows fp16 under AMP → NaN).              ║
+║     • NFRA uses per-layer gradient checkpointing; Mamba runs in fp32      ║
+║       with pre-LayerNorm (bounded activations) — required for stable     ║
+║       training without the official CUDA kernel (fp16 overflow → NaN).  ║
+║     • A NaN/Inf guard skips optimizer updates rather than letting a      ║
+║       bad gradient permanently poison the model.                        ║
 ║                                                                        ║
 ║   READING THE NUMBERS                                                   ║
 ║     • All heads use GPT-2-style init (embed std 0.02), so loss starts     ║
@@ -192,11 +194,14 @@ def mamba_scan(a, b, chunk=256):
 
 
 class MambaBlock(nn.Module):
-    """Mamba v1: conv1d + input-dependent selective SSM (pure PyTorch)."""
+    """Mamba v1: conv1d + input-dependent selective SSM (pure PyTorch),
+    with pre-LayerNorm so activations stay bounded without the official
+    CUDA kernel (required for stable fp32/AMP training)."""
     def __init__(self, dim, d_state=8, d_conv=4, expand=2):
         super().__init__()
         d_inner = expand * dim
         self.d_inner, self.d_state = d_inner, d_state
+        self.norm = nn.LayerNorm(dim)
         self.in_proj = nn.Linear(dim, d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, groups=d_inner,
                                 padding=d_conv - 1, bias=True)
@@ -214,6 +219,7 @@ class MambaBlock(nn.Module):
         with torch.autocast(device_type=DEVICE.type, enabled=False):
             B, S, D = x.shape
             N, E = self.d_state, self.d_inner
+            x = self.norm(x)
             x, z = self.in_proj(x).chunk(2, dim=-1)
             x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :S, :]
             x = F.silu(x)
@@ -481,12 +487,17 @@ def main():
             if scalers[name]:
                 scalers[name].scale(loss).backward()
                 scalers[name].unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                gnorm = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                if not math.isfinite(gnorm):
+                    opt.zero_grad(set_to_none=True)
                 scalers[name].step(opt); scalers[name].update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-                opt.step()
+                gnorm = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                if math.isfinite(gnorm):
+                    opt.step()
+                else:
+                    opt.zero_grad(set_to_none=True)
             if HAS_CUDA:
                 torch.cuda.synchronize()
             step_ms[name].append((time.perf_counter() - t0) * 1000)
