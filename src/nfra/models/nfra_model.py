@@ -49,6 +49,22 @@ class NFRAConfig:
     # of hidden units per token (0.0 = off). Input-dependent sparsity, no
     # extra params or skipped compute.
     k_wta_frac: float = 0.0
+
+    # "Small but powerful" brain-inspired levers (all near-zero cost; see
+    # neuro.py / fractal_block.py for the mechanisms). Off by default so
+    # baselines stay untouched; each is A/B-testable via env toggles.
+    #
+    # local_route : cortical-microcircuit routing — the BrainMLP router reads
+    #               a per-token LOCAL context (sliding causal window) blended
+    #               with the global pool, instead of one decision per sequence.
+    #               Gives a small model input-dependent capacity for free.
+    # div_norm    : divisive (contrast) normalization of MLP hidden units by
+    #               pooled intensity — the cortex's gain-control mechanism.
+    # astro       : astrocytic timescale homeostat — a slow per-sequence signal
+    #               that shifts the recurrence's overall memory horizon.
+    local_route: bool = False
+    div_norm: bool = False
+    astro: bool = False
     
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
@@ -136,6 +152,9 @@ class NFRAForCausalLM(nn.Module):
                             dropout=config.dropout)
         if config.mode == "brain":
             block_kwargs['k_wta_frac'] = config.k_wta_frac
+            block_kwargs['local_route'] = config.local_route
+            block_kwargs['div_norm'] = config.div_norm
+            block_kwargs['astro'] = config.astro
         self.layers = nn.ModuleList([
             block(**block_kwargs)
             for _ in range(self.n_unique)

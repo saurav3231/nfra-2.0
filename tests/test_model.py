@@ -129,6 +129,52 @@ def test_brain_learns_short_recall():
     assert losses[-1] < losses[0] - 0.1, f"no learning: {losses[0]:.3f}->{losses[-1]:.3f}"
 
 
+def test_local_pool_matches_sliding_window():
+    """Causal local pooling (cortical microcircuit routing context) must equal
+    a manual sliding-window mean, including the sequence-start correction and
+    the window edge (seq > local_win=64)."""
+    from nfra.core.neuro import BrainMLP
+    mlp = BrainMLP(dim=8, hidden_mult=2.0)
+    torch.manual_seed(0)
+    x = torch.randn(2, 70, 8)
+    got = mlp._local_pool(x)
+    w = 64
+    ref = torch.zeros_like(x)
+    for t in range(70):
+        lo = max(0, t - w + 1)
+        ref[:, t] = x[:, lo:t + 1].mean(1)
+    assert torch.allclose(got, ref, atol=1e-6)
+
+
+def test_brain_feature_toggles_forward_backward():
+    """Each 'small-but-powerful' brain lever must build, forward, and produce
+    finite gradients (CPU smoke)."""
+    cfg = NFRAConfig(mode="brain", vocab_size=16, hidden_size=64,
+                     num_layers=4, unique_blocks=2, dropout=0.0,
+                     local_route=True, div_norm=True, astro=True)
+    model = NFRAForCausalLM(cfg)
+    assert model.layers[0].mlp.local_route is True
+    assert model.layers[0].mlp.div_norm is True
+    assert model.layers[0].mixer.astro_proj is not None
+    torch.manual_seed(0)
+    x = torch.randint(0, 16, (2, 32))
+    out = model(x)
+    assert out["logits"].shape == (2, 32, 16)
+    out["logits"].float().mean().backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_brain_feature_toggles_off_by_default():
+    cfg = NFRAConfig(mode="brain", vocab_size=16, hidden_size=64,
+                     num_layers=2, unique_blocks=2)
+    model = NFRAForCausalLM(cfg)
+    assert model.layers[0].mlp.local_route is False
+    assert model.layers[0].mlp.div_norm is False
+    assert model.layers[0].mixer.astro_proj is None
+
+
 def test_energy_allocator_no_graph_leak():
     a = DynamicEnergyBudgetAllocator(4)
     b1 = a()

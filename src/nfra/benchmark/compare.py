@@ -86,6 +86,9 @@ DIM = int(os.environ.get('NFRA_DIM', '512'))
 EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
 SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
 KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
+LOCAL_ROUTE = os.environ.get('NFRA_LOCALROUTE', '0') == '1'
+DIV_NORM = os.environ.get('NFRA_DIVNORM', '0') == '1'
+ASTRO = os.environ.get('NFRA_ASTRO', '0') == '1'
 D_STATE = 8
 NFRA_DEPTH = 12                      # effective NFRA depth (unique × passes)
 EVAL_GAP = max(50, STEPS // 6)
@@ -212,7 +215,8 @@ def make_nfra(vocab, dim, unique_blocks, k_wta=None):
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=NFRA_DEPTH, n_bands=16, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
-                     gradient_checkpointing=True, k_wta_frac=k_wta)
+                     gradient_checkpointing=True, k_wta_frac=k_wta,
+                     local_route=LOCAL_ROUTE, div_norm=DIV_NORM, astro=ASTRO)
     return NFRAForCausalLM(cfg)
 
 

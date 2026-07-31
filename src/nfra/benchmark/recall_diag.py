@@ -3,7 +3,8 @@ Recall-probe root-cause diagnostic (H3 follow-up).
 
 The H3 probe found NFRA Brain FLAT at the floor (ln 16) for every k — it did
 not even fit the training set (dim 224, 600 steps). This script reproduces
-that exact regime across a few variants so ONE Kaggle run pins the mechanism:
+that exact regime across three NFRA variants, run CONCURRENTLY on separate
+CUDA streams (wall time ~= one model's), so ONE run pins the mechanism:
 
   fix     : current Brain block (residual = x, not the self-prediction)
             at k=4  — the H3 failing case, post-audit-fix.
@@ -11,8 +12,8 @@ that exact regime across a few variants so ONE Kaggle run pins the mechanism:
   noshare : 12 distinct blocks in a single pass (no depth weight-sharing)
             at k=4 — isolates "shared-depth gradient" as the culprit.
 
-Every 50 steps it prints train loss + held-out span CE + the block predictor's
-deviation from identity (mean |W_p - I|), to watch the collapse develop.
+Reports per-variant train first->last, held-out span CE, and the block
+predictor's deviation from identity (mean |W_p - I|) — watching the collapse.
 
 Reading the verdict:
   - `fix` k=4 LEARNS (drops well below floor)     -> self-prediction residual
@@ -21,8 +22,8 @@ Reading the verdict:
     the problem (12 distinct blocks needed), not the predictor.
   - `k1` ALSO floors                              -> cannot learn even a per-token
     map at dim 224 -> capacity/optimization -> run the dim-512 probe instead.
-  - `fix` k=4 floors AND pred|W-I| grows toward 0 over steps -> the collapse
-    develops with training length; residual=x fix wasn't enough on its own.
+  - `fix` k=4 floors AND pred|W-I| near 0         -> the collapse developed
+    during training; residual=x fix wasn't enough on its own.
 
 Env (all optional):
   NFRA_DIAG_DIM     dim        (default 224)
@@ -47,9 +48,11 @@ import torch
 
 from nfra import NFRAConfig, NFRAForCausalLM
 from nfra.benchmark.compare import (
-    rescale_embed, compute_loss, make_optimizer, count_params, DEVICE,
+    rescale_embed, count_params, DEVICE,
 )
-from nfra.benchmark.recall_probe import make_loader, metric_by_span, V
+from nfra.benchmark.recall_probe import (
+    make_loader, metric_by_span, _train_concurrent, V,
+)
 
 
 def build(dim, unique, depth, seed=0):
@@ -72,48 +75,42 @@ def predictor_identity_dev(model):
     return sum(devs) / max(len(devs), 1)
 
 
-def train(model, k, steps, seq, batch, gap):
-    train_loader = make_loader(k, seq, batch, seed=42)
-    eval_loader = make_loader(k, seq, batch, seed=7)
-    opt, sched = make_optimizer(model, lr=3e-4,
-                                warmup=min(50, max(steps // 10, 1)), total=steps)
-    it = iter(train_loader)
-    t0 = time.perf_counter()
-    first = last = None
-    rows = []
-    for step in range(1, steps + 1):
-        try:
-            x, y = next(it)
-        except StopIteration:
-            it = iter(train_loader)
-            x, y = next(it)
-        x = x.to(DEVICE)
-        y = y.to(DEVICE)
-        opt.zero_grad()
-        loss = compute_loss(model, x, y, surprise=False)
-        loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if math.isfinite(gnorm):
-            opt.step()
-        else:
-            opt.zero_grad(set_to_none=True)
-        sched.step()
-        if step == 1:
-            first = loss.item()
-        last = loss.item()
-        if step % gap == 0 or step == steps:
-            ce_span, acc_span, ce_pad = metric_by_span(model, eval_loader, k)
-            rows.append((step, round(last, 4), round(ce_span, 4),
-                         round(acc_span, 4), round(predictor_identity_dev(model), 4)))
-            print('  step %4d/%d  train %.3f  span_ce %.3f  span_acc %.3f  '
-                  'pred|W-I| %.3f'
-                  % (step, steps, last, ce_span, acc_span,
-                     predictor_identity_dev(model)))
-    return {
-        'train_first': round(first, 4), 'train_last': round(last, 4),
-        'rows': rows, 'params': count_params(model),
-        'wall_s': round(time.perf_counter() - t0, 1),
-    }
+def run(dim, steps, seq, batch):
+    """Build + concurrently train the 3 diagnostic variants, return results."""
+    floor = math.log(V)
+    torch.manual_seed(0)
+    variants = [
+        ('fix',     'k=4  residual=x (current)', dict(k=4, unique=4, depth=12)),
+        ('k1',      'k=1  no memory needed',      dict(k=1, unique=4, depth=12)),
+        ('noshare', 'k=4  12 distinct blocks',    dict(k=4, unique=12, depth=12)),
+    ]
+    tasks = []
+    for sid, label, kw in variants:
+        m = build(dim, kw['unique'], kw['depth'])
+        train_loader = make_loader(kw['k'], seq, batch, seed=42)
+        eval_loader = make_loader(kw['k'], seq, batch, seed=7)
+        tasks.append((sid, label, kw['k'], m, train_loader, eval_loader))
+    recs, wall = _train_concurrent([t[3] for t in tasks], steps,
+                                   [t[4] for t in tasks])
+    results = {}
+    for (sid, label, k, m, _tr, ev), rec in zip(tasks, recs):
+        ce_span, acc_span, ce_pad = metric_by_span(m, ev, k)
+        results[sid] = {
+            'label': label, 'k': k, 'params': count_params(m),
+            'train_first': round(rec['loss_hist'][0], 4),
+            'train_last': round(rec['loss_hist'][-1], 4),
+            'span_ce': round(ce_span, 4),
+            'span_acc': round(acc_span, 4),
+            'pad_ce': round(ce_pad, 4),
+            'pred_identity_dev': round(predictor_identity_dev(m), 4),
+        }
+        print('[%-8s] %s train %.4f -> %.4f | span_ce %.4f span_acc %.4f '
+              'pad_ce %.4f | pred|W-I| %.4f'
+              % (sid, label, results[sid]['train_first'],
+                 results[sid]['train_last'], ce_span, acc_span, ce_pad,
+                 results[sid]['pred_identity_dev']))
+    print('[concurrent] 3 diagnostic trainings in %.1fs' % wall)
+    return results, wall, floor
 
 
 def main():
@@ -121,7 +118,6 @@ def main():
     steps = int(os.environ.get('NFRA_DIAG_STEPS', '600'))
     batch = int(os.environ.get('NFRA_DIAG_BATCH', '8'))
     seq = int(os.environ.get('NFRA_DIAG_SEQ', '256'))
-    gap = max(50, steps // 6)
     floor = math.log(V)
 
     print('=' * 78)
@@ -131,29 +127,14 @@ def main():
           % (V, floor))
     print('=' * 78)
 
-    variants = [
-        ('fix      k=4  residual=x (current)', dict(k=4, unique=4, depth=12)),
-        ('k1       k=1  no memory needed',      dict(k=1, unique=4, depth=12)),
-        ('noshare  k=4  12 distinct blocks',    dict(k=4, unique=12, depth=12)),
-    ]
-
-    results = {}
-    for label, kw in variants:
-        print('\n== %s' % label)
-        m = build(dim, kw['unique'], kw['depth'])
-        rec = train(m, kw['k'], steps, seq, batch, gap)
-        results[label] = rec
-        print('   train %.3f -> %.3f | %.1fM params | %.0fs'
-              % (rec['train_first'], rec['train_last'],
-                 rec['params'] / 1e6, rec['wall_s']))
+    results, wall, floor = run(dim, steps, seq, batch)
 
     print('\n' + '=' * 78)
     print('summary  (train last | span_ce | floor %.3f)' % floor)
-    for label, rec in results.items():
+    for label, r in results.items():
         print('  %-32s train %s -> %s   span_ce %s'
-              % (label, rec['train_first'], rec['train_last'],
-                 '? (see rows)' if not rec['rows'] else
-                 '%.3f' % rec['rows'][-1][2]))
+              % (label, r['train_first'], r['train_last'], r['span_ce']))
+    return results
 
 
 if __name__ == '__main__':

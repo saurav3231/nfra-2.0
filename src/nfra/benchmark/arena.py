@@ -67,6 +67,10 @@ FAMILIES = [f.strip().lower() for f in
 EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
 SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
 KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
+# "Small but powerful" brain levers (off by default; A/B-able overnight).
+LOCAL_ROUTE = os.environ.get('NFRA_LOCALROUTE', '0') == '1'
+DIV_NORM = os.environ.get('NFRA_DIVNORM', '0') == '1'
+ASTRO = os.environ.get('NFRA_ASTRO', '0') == '1'
 BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation knob
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
 # model the recompute is pure overhead -> set 0 to raise tok/s.
@@ -104,13 +108,21 @@ METRIC_SPEC = [
 
 
 # ─────────────────────────── builders ───────────────────────────
-def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None):
+def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
+               local_route=None, div_norm=None, astro=None):
     if k_wta is None:
         k_wta = KWTA
+    if local_route is None:
+        local_route = LOCAL_ROUTE
+    if div_norm is None:
+        div_norm = DIV_NORM
+    if astro is None:
+        astro = ASTRO
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=depth, n_bands=BANDS, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
-                     gradient_checkpointing=CHECKPOINT, k_wta_frac=k_wta)
+                     gradient_checkpointing=CHECKPOINT, k_wta_frac=k_wta,
+                     local_route=local_route, div_norm=div_norm, astro=astro)
     return NFRAForCausalLM(cfg)
 
 
@@ -459,6 +471,12 @@ def main():
         feats.append("surprise-weighted loss")
     if KWTA > 0:
         feats.append(f"k-WTA={KWTA}")
+    if LOCAL_ROUTE:
+        feats.append("local cortical routing")
+    if DIV_NORM:
+        feats.append("divisive normalization")
+    if ASTRO:
+        feats.append("astrocytic homeostat")
     if feats:
         print(f"  features : {', '.join(feats)}")
     print("=" * 72)

@@ -220,9 +220,11 @@ class BrainMixer(nn.Module):
     coherent heads gate each other, computed once before the scan.
     """
 
-    def __init__(self, dim: int, n_heads: Optional[int] = None):
+    def __init__(self, dim: int, n_heads: Optional[int] = None,
+                 astro: bool = False):
         super().__init__()
         self.dim = dim
+        self.astro = astro
         # Default (16) keeps the hierarchical [8,4,2,1]+router structure used
         # by all shipped Brain configs. An explicit n_heads builds that many
         # uniform recurrence groups (+1 router head) — this is the H8
@@ -266,6 +268,14 @@ class BrainMixer(nn.Module):
 
         self.grid_encoder = TemporalGridEncoder(dim)
 
+        # Astrocytic timescale homeostat (glial slow modulation): one linear
+        # that reads the sequence-level pool and shifts the recurrence's
+        # overall memory horizon. Glia regulate synaptic strength on seconds
+        # timescales — here it lets the network set "how much memory do I need
+        # right now" as a slow global signal, independent of per-token
+        # selectivity (dt).
+        self.astro_proj = nn.Linear(dim, 1, bias=False) if astro else None
+
         self._dim = dim
 
     def forward(
@@ -303,6 +313,12 @@ class BrainMixer(nn.Module):
             dt = dt * (1.0 + 0.5 * ach)
         alpha = torch.exp(base_log.view(1, H, 1, Hd)
                           * dt.permute(0, 2, 1).view(B, H, S, 1))    # [B, H, S, Hd]
+
+        # Astrocytic homeostat: a slow per-sequence signal scales ALL band
+        # decays together (global memory-horizon shift), then the scan clamps.
+        if self.astro_proj is not None:
+            astro = torch.tanh(self.astro_proj(x.mean(dim=1, keepdim=True)))
+            alpha = alpha * (1.0 + 0.2 * astro.view(B, 1, 1, 1))
 
         # Parallel closed-form time-varying scan —
         # h_t = alpha_t*h_{t-1} + gate_t*value_t (one vectorized cumsum pair)
@@ -367,10 +383,14 @@ class BrainMLP(nn.Module):
     """
 
     def __init__(self, dim: int, hidden_mult: float = 4.0,
-                 k_wta_frac: float = 0.0):
+                 k_wta_frac: float = 0.0, local_route: bool = False,
+                 div_norm: bool = False):
         super().__init__()
         self.dim = dim
         self.k_wta_frac = k_wta_frac
+        self.local_route = local_route
+        self.div_norm = div_norm
+        self.local_win = 64
         hidden_dim = int(dim * hidden_mult)
 
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -407,6 +427,22 @@ class BrainMLP(nn.Module):
             nn.Linear(64, n_total_groups, bias=False),
         )
 
+    def _local_pool(self, x: torch.Tensor) -> torch.Tensor:
+        """Causal sliding-window mean over the last `local_win` tokens.
+
+        Cortical columns route on LOCAL context, not the whole sequence. A
+        cheap O(S·D) cumsum pair replaces the sequence-global pool so each
+        token's routing reflects its immediate neighborhood. `cnt` corrects
+        the window at sequence start (fewer than `local_win` tokens seen)."""
+        B, S, D = x.shape
+        w = min(self.local_win, S)
+        cum = x.cumsum(1)                                        # [B, S, D]
+        left = torch.cat([torch.zeros(B, w, D, device=x.device, dtype=x.dtype),
+                          cum[:, :-w]], dim=1)                   # [B, S, D]
+        wsum = cum - left                                        # sum [t-w+1 .. t]
+        cnt = torch.arange(1, S + 1, device=x.device).clamp(max=w).float()
+        return wsum / cnt.view(1, S, 1)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -418,10 +454,21 @@ class BrainMLP(nn.Module):
         up = self.up_proj(x)
         hidden = gate * up
 
+        # Cortical divisive normalization: gain-control by pooled activity
+        # (Heeger 1992). Rescales each unit by its local contrast — no params.
+        if self.div_norm:
+            pooled_act = hidden.square().mean(dim=-1, keepdim=True)
+            hidden = hidden / (1.0 + pooled_act)
+
         center = hidden.mean(dim=-1, keepdim=True)
         hidden = hidden * torch.sigmoid(hidden - center)
 
+        # Routing context: global pool + (optionally) per-token local pool.
+        # Local + global keeps the stable coarse prior while adding input-
+        # dependent per-token capacity.
         pooled = x.mean(dim=1, keepdim=True)
+        if self.local_route:
+            pooled = pooled + self._local_pool(x)
         routing = self.router(pooled)
 
         if hormones is not None:
