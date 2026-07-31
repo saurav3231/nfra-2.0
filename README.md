@@ -230,6 +230,8 @@ ruff check src
 black --check src
 
 # Tests
+# CPU smoke tests: model construction, forward/backward, save/load IO,
+# param-scaling with unique_blocks, and the benchmark scoring math.
 pytest
 ```
 
