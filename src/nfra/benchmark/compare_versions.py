@@ -10,14 +10,18 @@ toggles, so the delta isolates the new features:
   nfra32  KWTA    EMA      SURPRISE    3.2 full features (all toggles on)
 
 Env (all optional):
-  NFRA_STEPS      train steps per config        (default 200)
+  NFRA_STEPS      train steps per config        (default 1000)
   NFRA_DATA       synthetic | wikitext2         (default synthetic)
-  NFRA_DIM        model width                   (default 192)
-  NFRA_UNIQUE     unique fractal blocks         (default 2)
+  NFRA_DIM        model width                   (default 224)
+  NFRA_UNIQUE     unique fractal blocks         (default 4)
   NFRA_KWTA       k-WTA fraction for config B   (default 0.5)
   NFRA_EMA        EMA decay for config B        (default 0.99)
   NFRA_SURPRISE   1 = RPE-weighted loss for B   (default 1)
   NFRA_OUT        JSON output path              (default nfra_31_vs_32.json)
+
+Default dim/unique match the arena's 5M NFRA config, which is proven to
+learn (dim 192 / 600 steps stays at random loss ~ ln(vocab), so any A/B
+there is meaningless).
 
 Writes JSON (utf-8) and prints an ASCII table.
 Run locally for a smoke check; run on Kaggle T4 for the real comparison.
@@ -39,7 +43,7 @@ from .arena import (
     build_nfra, train_one, make_loaders, NFRA_DEPTH,
     SEED_LIST, DATA_SOURCE,
 )
-from .compare import evaluate, count_params, DEVICE
+from .compare import evaluate, count_params, DEVICE, rescale_embed
 
 OUT_JSON = os.environ.get('NFRA_OUT', 'nfra_31_vs_32.json')
 
@@ -47,9 +51,9 @@ VOCAB = 96 if DATA_SOURCE == 'wikitext2' else 4096
 
 
 def main():
-    steps = int(os.environ.get('NFRA_STEPS', '200'))
-    dim = int(os.environ.get('NFRA_DIM', '192'))
-    unique = int(os.environ.get('NFRA_UNIQUE', '2'))
+    steps = int(os.environ.get('NFRA_STEPS', '1000'))
+    dim = int(os.environ.get('NFRA_DIM', '224'))
+    unique = int(os.environ.get('NFRA_UNIQUE', '4'))
     k_wta = float(os.environ.get('NFRA_KWTA', '0.5'))
     ema_decay = float(os.environ.get('NFRA_EMA', '0.99'))
     surprise = os.environ.get('NFRA_SURPRISE', '1') == '1'
@@ -78,6 +82,7 @@ def main():
 
         model = build_nfra(VOCAB, dim, unique, depth=NFRA_DEPTH,
                            k_wta=cfg['k_wta']).to(DEVICE)
+        rescale_embed(model)
         params = count_params(model)
         res = train_one(model, VOCAB, steps, train_loader, eval_loader,
                         eval_gap, ema_decay=cfg['ema_decay'],
@@ -88,6 +93,8 @@ def main():
         run = {
             'k_wta': cfg['k_wta'], 'ema_decay': cfg['ema_decay'],
             'surprise': cfg['surprise'], 'params': params,
+            'train_loss_first': round(res['loss_hist'][0], 4),
+            'train_loss_last': round(res['loss_hist'][-1], 4),
             'final_eval_loss': round(float(final_eval), 4),
             'wall_s': round(res['wall_s'], 2),
             'tok_s': round(res['tok_s'], 1),
@@ -97,10 +104,12 @@ def main():
             'eval_trajectory': traj,
         }
         out['runs'][name] = run
-        print('[%s] params=%.3fM final_eval=%.4f wall=%.1fs tok_s=%.0f '
-              'ms/step=%.1f nan=%d'
-              % (name, params / 1e6, run['final_eval_loss'], run['wall_s'],
-                 run['tok_s'], run['ms_per_step'], run['nan_steps']))
+        print('[%s] params=%.3fM train %.4f -> %.4f  eval=%.4f wall=%.1fs '
+              'tok_s=%.0f ms/step=%.1f nan=%d'
+              % (name, params / 1e6, run['train_loss_first'],
+                 run['train_loss_last'], run['final_eval_loss'],
+                 run['wall_s'], run['tok_s'], run['ms_per_step'],
+                 run['nan_steps']))
 
     a = out['runs']['nfra31']
     b = out['runs']['nfra32']
