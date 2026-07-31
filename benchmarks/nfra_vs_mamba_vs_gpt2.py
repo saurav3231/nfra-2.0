@@ -1,42 +1,36 @@
 """
-+======================================================================+
-|   NFRA BRAIN vs MAMBA-SSM vs GPT-2  —  APPLES-TO-APPLES BENCHMARK   |
-|                                                                      |
-|  The honest, rigorous version: same params, same data, same         |
-|  optimizer, same steps. Three pure-PyTorch reference implementations |
-|  compared on quality, speed, and memory.                            |
-|                                                                      |
-|  Models:                                                             |
-|   1. NFRA Brain  (recurrence + surprise gating + neuromodulation,   |
-|                   depth-shared: 4 unique blocks reused 3x)          |
-|   2. Mamba-SSM   (faithful selective state-space model: conv1d +    |
-|                   discretized per-step SSM scan via Hillis-Steele    |
-|                   associative scan — exact, parallel)               |
-|   3. GPT-2       (classical causal transformer: attention + MLP)    |
-|                                                                      |
-|  Fairness: all three use matched parameter budgets, identical data,  |
-|  optimizer, and step count. All are pure PyTorch (no fused kernels), |
-|  so this is a software-level comparison. Real fused kernels would    |
-|  accelerate BOTH the SSM and NFRA.                                  |
-|                                                                      |
-|  Metrics: final train loss, eval perplexity, ppl per million params,|
-|  tokens/sec (train step), ms/step, peak GPU memory.                 |
-|                                                                      |
-|  Env:                                                                |
-|   NFRA_DATA  = synthetic (default) | wikitext2                       |
-|   NFRA_MODE  = quick (150) | standard (600) | rigorous (1500)        |
-|   NFRA_TARGET_PARAMS = 20 (million)                                  |
-|   NFRA_DIM   = 512                                                   |
-|                                                                      |
-|  Usage: python nfra_vs_mamba_vs_gpt2.py                              |
-|         Recommended: Kaggle T4 GPU.                                  |
-+======================================================================+
+╔══════════════════════════════════════════════════════════════════════╗
+║   NFRA BRAIN  vs  MAMBA-SSM  vs  GPT-2   —  apples-to-apples          ║
+║                                                                        ║
+║   Three pure-PyTorch reference implementations, matched on params,     ║
+║   trained on identical data with the identical optimizer.             ║
+║                                                                        ║
+║   WHAT IS MEASURED                                                      ║
+║     eval loss  : log-perplexity (lower = better; ~8.3 = random guess) ║
+║     throughput : training tok/s (pure-PyTorch; no fused kernels)       ║
+║     peak memory: GB during one train step                              ║
+║                                                                        ║
+║   READING THE NUMBERS                                                   ║
+║     • Loss starts ~100–150 because random-init logits scale with dim.  ║
+║       It falls as the model learns — judge it by the FINAL value.      ║
+║     • Mamba/NFRA use unfused scans here; production fused kernels      ║
+║       would make them dramatically faster than shown.                 ║
+║                                                                        ║
+║   ENV                                                                    ║
+║     NFRA_MODE           quick(150) | standard(600) | rigorous(1500)    ║
+║     NFRA_DATA           synthetic | wikitext2                          ║
+║     NFRA_TARGET_PARAMS  target params in millions (default 20)        ║
+║     NFRA_DIM            hidden size (default 512)                      ║
+║                                                                        ║
+║   Usage: python nfra_vs_mamba_vs_gpt2.py   (Kaggle T4 recommended)     ║
+╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import os, sys, time, math, json, warnings, functools
-print = functools.partial(print, flush=True)  # always stream output (Jupyter/Kaggle)
+print = functools.partial(print, flush=True)
+warnings.filterwarnings('ignore', message='Detected call of .*lr_scheduler.*')
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,9 +41,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 from nfra import NFRAConfig, NFRAForCausalLM
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
+# ─────────────────────────── config ───────────────────────────
 DATA_SOURCE = os.environ.get('NFRA_DATA', 'synthetic').lower()
 HAS_DATASETS = False
 if DATA_SOURCE == 'wikitext2':
@@ -57,15 +49,16 @@ if DATA_SOURCE == 'wikitext2':
         from datasets import load_dataset
         HAS_DATASETS = True
     except ImportError:
-        print("  WARNING: 'datasets' not installed — using synthetic data")
+        print("  [warn] 'datasets' missing — falling back to synthetic")
         DATA_SOURCE = 'synthetic'
 
-MODE = os.environ.get('NFRA_MODE', 'standard')
 STEP_CFG = {'quick': 150, 'standard': 600, 'rigorous': 1500}
+MODE = os.environ.get('NFRA_MODE', 'standard')
 STEPS = int(os.environ.get('NFRA_STEPS', STEP_CFG[MODE]))
-TARGET_PARAMS_M = float(os.environ.get('NFRA_TARGET_PARAMS', '20'))
+TARGET_M = float(os.environ.get('NFRA_TARGET_PARAMS', '20'))
 DIM = int(os.environ.get('NFRA_DIM', '512'))
-D_STATE = 16
+D_STATE = 8
+NFRA_DEPTH = 12                      # effective NFRA depth (3 unique × 4 passes)
 EVAL_GAP = max(50, STEPS // 6)
 SEQ_LEN = 256
 SEED = 42
@@ -73,38 +66,31 @@ SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 HAS_CUDA = DEVICE.type == 'cuda'
 USE_AMP = False
-DEFAULT_BATCH = 8
-
+BATCH = 8
 if HAS_CUDA:
-    print(f"  GPU: {torch.cuda.get_device_name(0)}  "
-          f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)")
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision('medium')
     cc = torch.cuda.get_device_capability(0)
     if cc >= (8, 0):
-        USE_AMP = True; amp_dtype = torch.bfloat16
+        USE_AMP = True; AMP_DTYPE = torch.bfloat16
     elif cc >= (7, 0):
-        USE_AMP = True; amp_dtype = torch.float16
-    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-    DEFAULT_BATCH = 48 if gpu_mem >= 70 else 32 if gpu_mem >= 35 else 8 if gpu_mem >= 14 else 4
-    if USE_AMP:
-        print(f"  [AMP] {amp_dtype} enabled")
+        USE_AMP = True; AMP_DTYPE = torch.float16
+    gmem = torch.cuda.get_device_properties(0).total_memory / 1e9
+    BATCH = 48 if gmem >= 70 else 32 if gmem >= 35 else 8 if gmem >= 14 else 4
 else:
-    DEFAULT_BATCH = 4
-    STEPS = min(STEPS, 80)
-    EVAL_GAP = max(20, STEPS // 4)
-    print("  WARNING: CPU mode — small steps, results not representative of GPU speed")
+    BATCH = 4
+    STEPS = min(STEPS, 80); EVAL_GAP = max(20, STEPS // 4)
+    print("  [warn] CPU mode — few steps, speed numbers are not representative")
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 
 
-# ---------------------------------------------------------------------
-# Data  (synthetic hierarchical — same generator as nfra_revolution_test)
-# ---------------------------------------------------------------------
+# ─────────────────────────── data ───────────────────────────
 class HierarchicalDataset(Dataset):
+    """Synthetic data with topics + bigram structure (deterministic, seed-based)."""
     VOCAB_SIZE = 4096
-    def __init__(self, num_seqs: int, seq_len: int, seed: int = 0):
+    def __init__(self, num_seqs, seq_len, seed=0):
         super().__init__()
         self.seq_len = seq_len
         rng = np.random.RandomState(seed)
@@ -118,135 +104,82 @@ class HierarchicalDataset(Dataset):
         self._bigram = th / th.sum(1, keepdims=True)
         self.data = self._generate(num_seqs, seq_len, rng)
 
-    def _generate(self, num_seqs: int, seq_len: int, rng):
-        """Vectorized generation (torch.searchsorted) — no per-token Python loop."""
+    def _generate(self, num_seqs, seq_len, rng):
         V = self.VOCAB_SIZE
-        topic_cdf = torch.from_numpy(self._topic_trans).cumsum(1)
-        emit_cdf = torch.from_numpy(self._topic_emit).cumsum(1)
-        bigram_cdf = torch.from_numpy(self._bigram).cumsum(1)
-
+        tc = torch.from_numpy(self._topic_trans).cumsum(1)
+        ec = torch.from_numpy(self._topic_emit).cumsum(1)
+        bc = torch.from_numpy(self._bigram).cumsum(1)
         def sample(cdf, rows):
             return torch.searchsorted(cdf[rows], torch.rand(len(rows), 1)).squeeze(-1)
-
         data = np.empty((num_seqs, seq_len), dtype=np.int64)
-        topics = torch.randint(32, (num_seqs,))
-        prev = torch.randint(V, (num_seqs,))
-
+        topics = torch.randint(32, (num_seqs,)); prev = torch.randint(V, (num_seqs,))
         for t in range(seq_len):
             e = torch.nonzero(torch.rand(num_seqs) < 0.1).flatten()
-            if len(e):
-                topics[e] = sample(topic_cdf, topics[e])
-            use_emit = torch.rand(num_seqs) < 0.3
-            e = torch.nonzero(use_emit).flatten()
-            b = torch.nonzero(~use_emit).flatten()
+            if len(e): topics[e] = sample(tc, topics[e])
+            emit = torch.rand(num_seqs) < 0.3
+            e = torch.nonzero(emit).flatten(); b = torch.nonzero(~emit).flatten()
             tok = torch.empty(num_seqs, dtype=torch.long)
-            if len(e):
-                tok[e] = sample(emit_cdf, topics[e])
-            if len(b):
-                tok[b] = sample(bigram_cdf, prev[b])
-            data[:, t] = tok.numpy()
-            prev = tok
+            if len(e): tok[e] = sample(ec, topics[e])
+            if len(b): tok[b] = sample(bc, prev[b])
+            data[:, t] = tok.numpy(); prev = tok
         return data
-
     def __len__(self): return len(self.data)
     def __getitem__(self, idx):
-        x = self.data[idx, :-1]; y = self.data[idx, 1:]
-        return torch.from_numpy(x), torch.from_numpy(y)
+        return (torch.from_numpy(self.data[idx, :-1]),
+                torch.from_numpy(self.data[idx, 1:]))
 
 
-CHAR_VOCAB = ['\n', ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',',
-              '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':',
-              ';', '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-              'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V',
-              'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', 'a', 'b', 'c', 'd', 'e',
-              'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
-              't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~']
-CHAR2IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
-
-
-class WikiText2Dataset(Dataset):
-    def __init__(self, split: str = 'train', seq_len: int = 256):
-        super().__init__()
-        self.seq_len = seq_len
-        text = load_dataset("wikitext", "wikitext-2-raw-v1", split=split, trust_remote_code=True)
-        full_text = '\n'.join(text['text'])
-        ids = [CHAR2IDX.get(c, 0) for c in full_text]
-        data = torch.tensor(ids, dtype=torch.long)
-        n = len(data) // seq_len
-        self.data = data[:n * seq_len + 1]
-    def __len__(self): return len(self.data) // self.seq_len
-    def __getitem__(self, idx):
-        s = idx * self.seq_len
-        return self.data[s:s + self.seq_len], self.data[s + 1:s + self.seq_len + 1]
-
-
-# ---------------------------------------------------------------------
-# Model 1: NFRA Brain
-# ---------------------------------------------------------------------
-def make_nfra(vocab: int, dim: int, layers: int) -> NFRAForCausalLM:
+# ─────────────────────────── models ───────────────────────────
+def make_nfra(vocab, dim, unique_blocks):
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
-                     num_layers=layers, n_bands=16, dropout=0.1)
+                     num_layers=NFRA_DEPTH, n_bands=16, dropout=0.1,
+                     depth_shared=True, unique_blocks=unique_blocks)
     return NFRAForCausalLM(cfg)
 
 
-# ---------------------------------------------------------------------
-# Model 2: Mamba-style SSM (faithful block, pure PyTorch)
-# ---------------------------------------------------------------------
-def hillis_prefix(a: torch.Tensor, b: torch.Tensor):
-    """
-    Hillis-Steele associative prefix scan. Returns (A, B) such that
-    h_t = A_t * h_0 + B_t for the recurrence h_t = a_t*h_{t-1} + b_t.
-    Exact, parallel: O(log S) steps of vectorized O(S) ops.
-    """
+def hillis_prefix(a, b):
+    """Associative prefix scan (exact, O(log S) parallel steps). Returns (A, B)
+    with h_t = A_t*h_0 + B_t for h_t = a_t*h_{t-1} + b_t."""
     S = a.shape[-2]
     a_cur, b_cur = a, b
-    offset = 1
-    while offset < S:
+    off = 1
+    while off < S:
         a_prev, b_prev = a_cur, b_cur
-        a_shift = F.pad(a_prev, (0, 0, offset, 0), value=1.0)[..., :S, :]
-        b_shift = F.pad(b_prev, (0, 0, offset, 0), value=0.0)[..., :S, :]
-        a_cur = a_prev * a_shift          # A_right * A_left
-        b_cur = a_prev * b_shift + b_prev # A_right * B_left + B_right
-        offset *= 2
+        a_shift = F.pad(a_prev, (0, 0, off, 0), value=1.0)[..., :S, :]
+        b_shift = F.pad(b_prev, (0, 0, off, 0), value=0.0)[..., :S, :]
+        a_cur = a_prev * a_shift
+        b_cur = a_prev * b_shift + b_prev
+        off *= 2
     return a_cur, b_cur
 
 
-def mamba_scan(a: torch.Tensor, b: torch.Tensor, chunk: int = 64) -> torch.Tensor:
-    """
-    Exact chunked associative scan for h_t = a_t*h_{t-1} + b_t.
-
-    Chunking caps peak memory at O(chunk * N*E) per block (the full-sequence
-    Hillis-Steele scan OOMs at long S because autograd keeps every iteration's
-    temporaries). State is carried across chunks, so the result is identical.
-    Verified numerically equal to the sequential recurrence.
-    """
+def mamba_scan(a, b, chunk=64):
+    """Chunked associative scan (state carried across chunks → bounded memory)."""
     B, _, S, D = a.shape
-    n_chunks = math.ceil(S / chunk)
-    pad = n_chunks * chunk - S
+    n = math.ceil(S / chunk)
+    pad = n * chunk - S
     if pad:
         a = F.pad(a, (0, 0, 0, pad), value=1.0)
         b = F.pad(b, (0, 0, 0, pad), value=0.0)
-    a = a.reshape(B, 1, n_chunks, chunk, D)
-    b = b.reshape(B, 1, n_chunks, chunk, D)
+    a = a.reshape(B, 1, n, chunk, D); b = b.reshape(B, 1, n, chunk, D)
     h = torch.zeros(B, D, device=a.device)
     outs = []
-    for c in range(n_chunks):
-        a_rel, b_rel = hillis_prefix(a[:, :, c], b[:, :, c])   # [B,1,chunk,D]
-        out = a_rel * h.view(B, 1, 1, D) + b_rel               # apply carried state
-        h = out[:, :, -1, :].squeeze(1)                        # next chunk's state
+    for c in range(n):
+        a_rel, b_rel = hillis_prefix(a[:, :, c], b[:, :, c])
+        out = a_rel * h.view(B, 1, 1, D) + b_rel
+        h = out[:, :, -1, :].squeeze(1)
         outs.append(out)
     return torch.cat(outs, dim=2)[:, :, :S, :]
 
 
 class MambaBlock(nn.Module):
-    """Mamba v1 block: conv1d + input-dependent selective SSM scan."""
-    def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    """Mamba v1: conv1d + input-dependent selective SSM (pure PyTorch)."""
+    def __init__(self, dim, d_state=8, d_conv=4, expand=2):
         super().__init__()
-        d_inner = int(expand * dim)
-        self.d_inner = d_inner
-        self.d_state = d_state
+        d_inner = expand * dim
+        self.d_inner, self.d_state = d_inner, d_state
         self.in_proj = nn.Linear(dim, d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(d_inner, d_inner, kernel_size=d_conv, groups=d_inner,
+        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, groups=d_inner,
                                 padding=d_conv - 1, bias=True)
         self.x_proj = nn.Linear(d_inner, 3 * d_state, bias=False)
         self.dt_proj = nn.Linear(d_state, d_inner, bias=True)
@@ -256,71 +189,54 @@ class MambaBlock(nn.Module):
         self.D = nn.Parameter(torch.randn(d_inner))
         self.out_proj = nn.Linear(d_inner, dim, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, S, D = x.shape
         N, E = self.d_state, self.d_inner
-
-        xz = self.in_proj(x)
-        x, z = xz.chunk(2, dim=-1)
-
-        x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :S, :]  # causal conv
+        x, z = self.in_proj(x).chunk(2, dim=-1)
+        x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :S, :]
         x = F.silu(x)
-
-        dt, Bm, C = self.x_proj(x).chunk(3, dim=-1)          # [B,S,N] each
-        dt = F.softplus(self.dt_proj(dt))                    # [B,S,E]
-
-        A = -torch.exp(self.A_log)                           # [N]
-        alpha = torch.exp(A.view(1, 1, N, 1) * dt.unsqueeze(2))     # [B,S,N,E] per-step decay
-        u = Bm.unsqueeze(-1) * x.unsqueeze(2)                # [B,S,N,E] = B(x) outer x
-
-        alpha_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
+        dt, Bm, C = self.x_proj(x).chunk(3, dim=-1)
+        dt = F.softplus(self.dt_proj(dt))
+        A = -torch.exp(self.A_log)
+        alpha = torch.exp(A.view(1, 1, N, 1) * dt.unsqueeze(2))
+        u = Bm.unsqueeze(-1) * x.unsqueeze(2)
+        a_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
         u_f = u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
         if self.training and torch.is_grad_enabled():
-            # Checkpoint the scan: autograd would otherwise keep every chunk's
-            # intermediates (≈3GB/block across 11 blocks → OOM). Recompute in
-            # backward instead; only alpha_f/u_f (~134MB/block) are saved.
+            # checkpoint: recompute scan in backward instead of storing ~GB of
+            # intermediates (would otherwise OOM at 11+ blocks)
             h = torch.utils.checkpoint.checkpoint(
-                lambda a, v: mamba_scan(a, v, chunk=64),
-                alpha_f, u_f, use_reentrant=False,
-            )
+                lambda a, v: mamba_scan(a, v, chunk=64), a_f, u_f,
+                use_reentrant=False)
         else:
-            h = mamba_scan(alpha_f, u_f, chunk=64)
+            h = mamba_scan(a_f, u_f, chunk=64)
         h = h.view(B, S, N, E)
-
-        y = (h * C.unsqueeze(-1)).sum(dim=2)                 # [B,S,E] = C·h
-        y = y + self.D.unsqueeze(0).unsqueeze(0) * x
-        y = y * F.silu(z)
-        return self.out_proj(y)
+        y = (h * C.unsqueeze(-1)).sum(dim=2) + self.D.unsqueeze(0).unsqueeze(0) * x
+        return self.out_proj(y * F.silu(z))
 
 
 class MambaLM(nn.Module):
-    def __init__(self, vocab_size: int, dim: int = 512, n_layers: int = 8, d_state: int = 16):
+    def __init__(self, vocab_size, dim, n_layers, d_state=8):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList([MambaBlock(dim, d_state) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
-
-    def forward(self, input_ids: torch.Tensor, **kw) -> Dict:
+    def forward(self, input_ids, **kw):
         x = self.embed(input_ids)
         for blk in self.blocks:
             x = x + blk(x)
         return {'logits': self.lm_head(self.norm(x))}
 
 
-# ---------------------------------------------------------------------
-# Model 3: GPT-2 Transformer (identical to nfra_revolution_test)
-# ---------------------------------------------------------------------
 class GPT2Attention(nn.Module):
-    def __init__(self, dim: int, n_heads: int):
+    def __init__(self, dim, n_heads):
         super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.n_heads, self.head_dim = n_heads, dim // n_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
         qkv = self.qkv(x).view(B, S, 3, H, Hd).permute(2, 0, 3, 1, 4)
@@ -328,114 +244,106 @@ class GPT2Attention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd ** 0.5)
         causal = torch.triu(torch.full((S, S), float('-inf'), device=x.device), 1)
         attn = F.softmax(scores + causal, dim=-1)
-        out = torch.matmul(attn, v).permute(0, 2, 1, 3).reshape(B, S, D)
-        return self.out(out)
+        return self.out(torch.matmul(attn, v).permute(0, 2, 1, 3).reshape(B, S, D))
 
 
 class GPT2Block(nn.Module):
-    def __init__(self, dim: int, n_heads: int, dropout: float = 0.1):
+    def __init__(self, dim, n_heads, dropout=0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = GPT2Attention(dim, n_heads)
         self.ln2 = nn.LayerNorm(dim)
-        hidden = int(dim * 4)
-        self.fc1 = nn.Linear(dim, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, dim, bias=False)
+        h = int(dim * 4)
+        self.fc1 = nn.Linear(dim, h, bias=False)
+        self.fc2 = nn.Linear(h, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = x + self.dropout(self.attn(self.ln1(x)))
         x = x + self.dropout(self.fc2(F.gelu(self.fc1(self.ln2(x)))))
         return x
 
 
 class GPT2ForCausalLM(nn.Module):
-    def __init__(self, vocab_size: int, dim: int = 512, n_layers: int = 6,
-                 n_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, vocab_size, dim=512, n_layers=6, n_heads=8, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(8192, dim)
-        self.blocks = nn.ModuleList([GPT2Block(dim, n_heads, dropout) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([GPT2Block(dim, n_heads, dropout)
+                                     for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
-
-    def forward(self, input_ids: torch.Tensor, **kw) -> Dict:
+    def forward(self, input_ids, **kw):
         B, S = input_ids.shape
-        pos = torch.arange(S, device=input_ids.device)
-        x = self.embed(input_ids) + self.pos_embed(pos)
+        x = self.embed(input_ids) + self.pos_embed(torch.arange(S, device=input_ids.device))
         for blk in self.blocks:
             x = blk(x)
         return {'logits': self.lm_head(self.ln_f(x))}
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def count_params(m: nn.Module) -> int:
-    return sum(p.numel() for p in m.parameters())
-
+# ─────────────────────────── helpers ───────────────────────────
+def count_params(m): return sum(p.numel() for p in m.parameters())
 
 def tune_layers(make_fn, target, vocab):
-    """Pick n_layers landing closest to the target param budget (early-stop on plateau)."""
+    """Pick layer count landing closest to the target param budget."""
     best = (1, float('inf'))
-    prev_p, plateau = None, 0
+    prev, plateau = None, 0
     for L in range(1, 64):
         p = count_params(make_fn(vocab, DIM, L))
         if abs(p - target) < abs(best[1] - target):
             best = (L, p)
         if p >= target * 1.15:
             break
-        if prev_p is not None and p == prev_p:
+        if prev is not None and p == prev:
             plateau += 1
             if plateau >= 3:
                 break
         else:
             plateau = 0
-        prev_p = p
+        prev = p
     return best
 
+def tune_unique(make_fn, target, vocab, depth):
+    """Pick NFRA unique-block count (depth-shared, effective depth fixed)."""
+    best = (1, float('inf'))
+    for U in range(1, depth + 1):
+        p = count_params(make_fn(vocab, DIM, U))
+        if abs(p - target) < abs(best[1] - target):
+            best = (U, p)
+    return best
 
-def compute_loss(model, x, y) -> torch.Tensor:
-    logits = model(x)['logits']
-    return F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-
-
-def make_optimizer(model, lr: float = 3e-4, warmup: int = 50, total: int = STEPS):
+def make_optimizer(model, lr=3e-4, warmup=50, total=STEPS):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95))
-    def schedule(step):
+    def sched(step):
         if step < warmup:
             return step / max(warmup, 1)
-        progress = (step - warmup) / max(total - warmup, 1)
-        return 0.5 * (1 + math.cos(math.pi * progress))
-    return opt, torch.optim.lr_scheduler.LambdaLR(opt, schedule)
+        return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))
+    return opt, torch.optim.lr_scheduler.LambdaLR(opt, sched)
 
+def compute_loss(model, x, y):
+    return F.cross_entropy(model(x)['logits'].view(-1, model(x)['logits'].size(-1)), y.view(-1))
 
 @torch.no_grad()
-def evaluate(model, loader, max_batches: int = 15) -> Tuple[float, float]:
+def evaluate(model, loader, max_batches=15):
     model.eval()
-    total_loss, n = 0.0, 0
+    total, n = 0.0, 0
     for i, (x, y) in enumerate(loader):
-        if i >= max_batches:
-            break
+        if i >= max_batches: break
         x, y = x.to(DEVICE), y.to(DEVICE)
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
             loss = compute_loss(model, x, y)
-        total_loss += loss.item() * x.size(0)
-        n += x.size(0)
+        total += loss.item() * x.size(0); n += x.size(0)
     model.train()
-    avg = total_loss / max(n, 1)
-    return math.exp(avg), avg
+    return total / max(n, 1)
 
-
-def measure_throughput(model, batch_size: int, vocab: int, n_steps: int = 20) -> float:
-    x = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
-    y = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
+def measure_speed_memory(model, vocab, n_steps=10):
+    x = torch.randint(0, vocab, (BATCH, SEQ_LEN), device=DEVICE)
+    y = torch.randint(0, vocab, (BATCH, SEQ_LEN), device=DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
     if HAS_CUDA:
-        torch.cuda.synchronize()
-    start = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+    t0 = time.perf_counter()
     for _ in range(n_steps):
         opt.zero_grad()
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
@@ -446,167 +354,155 @@ def measure_throughput(model, batch_size: int, vocab: int, n_steps: int = 20) ->
             loss.backward(); opt.step()
     if HAS_CUDA:
         torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    return batch_size * SEQ_LEN * n_steps / elapsed
+    tok_s = BATCH * SEQ_LEN * n_steps / (time.perf_counter() - t0)
+    mem = torch.cuda.max_memory_allocated() / 1e9 if HAS_CUDA else 0.0
+    return tok_s, mem
 
 
-def measure_memory(model, vocab: int, batch_size: int = 2) -> float:
-    if not HAS_CUDA:
-        return 0.0
-    torch.cuda.reset_peak_memory_stats()
-    x = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
-    y = torch.randint(0, vocab, (batch_size, SEQ_LEN), device=DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
-    with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
-        loss = compute_loss(model, x, y)
-    loss.backward(); opt.step()
-    return torch.cuda.max_memory_allocated() / 1e9
+# ─────────────────────────── main ───────────────────────────
+def fmt_loss(v):
+    return f"{v:7.2f}"
 
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
 def main():
     use_wiki = DATA_SOURCE == 'wikitext2' and HAS_DATASETS
     VOCAB = 96 if use_wiki else 4096
-    target = int(TARGET_PARAMS_M * 1e6)
+    target = int(TARGET_M * 1e6)
 
-    print("+==========================================================+")
-    print("|   NFRA BRAIN vs MAMBA-SSM vs GPT-2  (apples-to-apples)  |")
-    print("+==========================================================+")
-    print(f"|  Data:      {'WikiText-2 (char)' if use_wiki else 'Synthetic hierarchical':<48s}|")
-    print(f"|  Vocab:     {VOCAB:<6d}    Dim: {DIM:<6d}    SeqLen: {SEQ_LEN:<6d}        |")
-    print(f"|  Param target: ~{TARGET_PARAMS_M:.0f}M    Steps: {STEPS:<6d}    Batch: {DEFAULT_BATCH}   |")
-    print(f"|  Device:    {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU':<48s}|")
-    print("+==========================================================+")
+    print("=" * 66)
+    print("  NFRA BRAIN  vs  MAMBA-SSM  vs  GPT-2")
+    print("  apples-to-apples  •  matched params  •  identical training")
+    print("=" * 66)
+    print(f"  data    : {'WikiText-2 (char)' if use_wiki else 'Synthetic hierarchical'}")
+    print(f"  vocab   : {VOCAB}    dim: {DIM}    seq_len: {SEQ_LEN}")
+    print(f"  params  : ~{TARGET_M:.0f}M    steps: {STEPS}    batch: {BATCH}")
+    print(f"  device  : {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'}"
+          + ("   (fp16 AMP)" if USE_AMP else ""))
+    print("=" * 66)
 
-    # ---- data
-    print("\n  [0/4] Generating data...", end=' ')
+    # ── data
+    print("\n[1/5] Generating data ... ", end='')
     if use_wiki:
         train_ds = WikiText2Dataset('train', SEQ_LEN + 1)
         eval_ds = WikiText2Dataset('validation', SEQ_LEN + 1)
     else:
-        train_ds = HierarchicalDataset(max(4096, DEFAULT_BATCH * 8), SEQ_LEN + 1, seed=SEED)
+        train_ds = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1, seed=SEED)
         eval_ds = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED + 1)
+    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=0)
+    eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False, num_workers=0)
     print("done")
-    train_loader = DataLoader(train_ds, batch_size=DEFAULT_BATCH, shuffle=True, num_workers=0)
-    eval_loader = DataLoader(eval_ds, batch_size=DEFAULT_BATCH, shuffle=False, num_workers=0)
 
-    # ---- build models, tuned to the same param budget
-    models = {}
-    print("\n  [1/4] Building models (param-matched)...")
+    # ── build models, matched on params
+    print("\n[2/5] Building models (param-matched to ~%.0fM) ..." % TARGET_M)
 
-    L_nfra, p_nfra = tune_layers(make_nfra, target, VOCAB)
-    models['nfra_brain'] = make_nfra(VOCAB, DIM, L_nfra).to(DEVICE)
-    print(f"  └- NFRA Brain : effective {L_nfra} layers (4 unique blocks x3 passes) "
-          f"-> {p_nfra/1e6:.1f}M")
+    U, p_n = tune_unique(make_nfra, target, VOCAB, NFRA_DEPTH)
+    nfra = make_nfra(VOCAB, DIM, U).to(DEVICE)
+    n_passes = NFRA_DEPTH // U
+    print(f"    ✓ NFRA Brain   {p_n/1e6:6.1f}M   {U} unique blocks x {n_passes} passes "
+          f"= {NFRA_DEPTH} effective layers")
 
-    def make_mamba(vocab, dim, L):
-        return MambaLM(vocab, dim, L, d_state=D_STATE)
-    L_mam, p_mam = tune_layers(make_mamba, target, VOCAB)
-    models['mamba_ssm'] = make_mamba(VOCAB, DIM, L_mam).to(DEVICE)
-    print(f"  └- Mamba SSM  : {L_mam} layers (d_state={D_STATE}) -> {p_mam/1e6:.1f}M")
+    L_m, p_m = tune_layers(lambda v, d, L: MambaLM(v, d, L, d_state=D_STATE), target, VOCAB)
+    mamba = MambaLM(VOCAB, DIM, L_m, d_state=D_STATE).to(DEVICE)
+    print(f"    ✓ Mamba SSM    {p_m/1e6:6.1f}M   {L_m} layers (d_state={D_STATE})")
 
-    def make_gpt2(vocab, dim, L):
-        return GPT2ForCausalLM(vocab, dim, L, n_heads=8)
-    L_gpt, p_gpt = tune_layers(make_gpt2, target, VOCAB)
-    models['gpt2'] = make_gpt2(VOCAB, DIM, L_gpt).to(DEVICE)
-    print(f"  └- GPT-2      : {L_gpt} layers -> {p_gpt/1e6:.1f}M")
+    L_g, p_g = tune_layers(GPT2ForCausalLM, target, VOCAB)
+    gpt2 = GPT2ForCausalLM(VOCAB, DIM, L_g, n_heads=8).to(DEVICE)
+    print(f"    ✓ GPT-2        {p_g/1e6:6.1f}M   {L_g} layers")
 
-    # ---- throughput + memory (before training)
-    print("\n  [2/4] Measuring throughput + peak memory...")
+    models = {'NFRA Brain': nfra, 'Mamba SSM': mamba, 'GPT-2': gpt2}
+
+    # ── throughput + memory
+    print("\n[3/5] Measuring throughput + peak memory ...")
     perf = {}
     for name, m in models.items():
         m.train()
-        tok_s = measure_throughput(m, batch_size=DEFAULT_BATCH, vocab=VOCAB, n_steps=15)
-        mem = measure_memory(m, vocab=VOCAB)
-        perf[name] = {'tok_per_s': round(tok_s), 'peak_mem_gb': round(mem, 2)}
-        print(f"  └- {name:<11s} {tok_s:>8,.0f} tok/s   peak {mem:.2f} GB")
+        tok_s, mem = measure_speed_memory(m, VOCAB)
+        perf[name] = {'tok_s': int(tok_s), 'mem': mem}
+        print(f"    {name:<11s} {int(tok_s):>9,d} tok/s    peak {mem:.2f} GB")
 
-    # ---- training loop (fair: same optimizer, same data order reset)
-    print(f"\n  [3/4] Training {STEPS} steps (AdamW 3e-4 + warmup + cosine)...")
-    history = {n: {'train_loss': [], 'eval_ppl': [], 'step': []} for n in models}
-    optimizers = {n: make_optimizer(m) for n, m in models.items()}
+    # ── training
+    print(f"\n[4/5] Training {STEPS} steps (AdamW 3e-4, warmup + cosine)...")
+    history = {n: {'loss': [], 'eval': []} for n in models}
+    opts = {n: make_optimizer(m) for n, m in models.items()}
     loaders = {n: iter(train_loader) for n in models}
-    step_times = {n: [] for n in models}
-    scaler = {n: (torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None) for n in models}
+    scalers = {n: (torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None) for n in models}
+    step_ms = {n: [] for n in models}
 
     for step in range(1, STEPS + 1):
         for name, m in models.items():
             try:
                 x, y = next(loaders[name])
             except StopIteration:
-                loaders[name] = iter(train_loader)
-                x, y = next(loaders[name])
+                loaders[name] = iter(train_loader); x, y = next(loaders[name])
             x, y = x.to(DEVICE), y.to(DEVICE)
-            opt, sched = optimizers[name]
+            opt, sched = opts[name]
             opt.zero_grad()
             t0 = time.perf_counter()
             with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
                 loss = compute_loss(m, x, y)
-            if scaler[name]:
-                scaler[name].scale(loss).backward()
-                scaler[name].step(opt); scaler[name].update()
+            if scalers[name]:
+                scalers[name].scale(loss).backward()
+                scalers[name].step(opt); scalers[name].update()
             else:
                 loss.backward(); opt.step()
             if HAS_CUDA:
                 torch.cuda.synchronize()
-            step_times[name].append(time.perf_counter() - t0)
+            step_ms[name].append((time.perf_counter() - t0) * 1000)
             sched.step()
+            history[name]['loss'].append(loss.item())
 
-        if step == 1 or step % 20 == 0 or step == STEPS:
-            line = f"  step {step:>5d}/{STEPS}"
-            for name in models:
-                hist = history[name]
-                hist['train_loss'].append(loss.item())
-                if step % EVAL_GAP == 0 or step == STEPS or step == 1:
-                    ppl, avg = evaluate(models[name], eval_loader)
-                    hist['eval_ppl'].append(ppl)
-                    hist['step'].append(step)
-                    line += f" | {name} ppl={ppl:6.1f}"
-                else:
-                    line += f" | {name} loss={loss.item():5.3f}"
+        if step % EVAL_GAP == 0 or step == 1 or step == STEPS:
+            evals = {n: evaluate(m, eval_loader) for n, m in models.items()}
+            for n in models:
+                history[n]['eval'].append((step, evals[n]))
+            line = f"    step {step:>5d}/{STEPS}   eval loss:  " + \
+                   "  |  ".join(f"{n} {evals[n]:7.2f}" for n in models)
             print(line)
 
-    # ---- summary
-    print("\n  [4/4] Summary")
-    print("+=============================================================================+")
-    print(f"| {'model':<11s} {'params':>7s} {'eval_ppl':>9s} {'ppl/M':>7s} "
-          f"{'tok/s':>9s} {'ms/step':>8s} {'mem(GB)':>8s} {'final_loss':>10s} |")
-    print("+=============================================================================+")
+    # ── summary
+    print("\n[5/5] Summary  (eval loss = log-perplexity, lower is better)")
+    print("-" * 66)
+    hdr = f"  {'model':<11s} {'params':>7s} {'depth':>5s} {'eval_loss':>9s} {'tok/s':>9s} {'ms/step':>8s} {'mem':>6s}"
+    print(hdr)
+    print("-" * 66)
     results = {}
     for name, m in models.items():
         params = count_params(m)
-        ppl = history[name]['eval_ppl'][-1] if history[name]['eval_ppl'] else float('nan')
-        avg_ms = 1000 * np.mean(step_times[name]) if step_times[name] else 0
-        results[name] = {
-            'params': params,
-            'effective_layers': L_nfra if name == 'nfra_brain' else
-                                (L_mam if name == 'mamba_ssm' else L_gpt),
-            'eval_ppl': round(ppl, 3),
-            'ppl_per_million_params': round(ppl / (params / 1e6), 3),
-            'tok_per_s': perf[name]['tok_per_s'],
-            'ms_per_step': round(avg_ms, 2),
-            'peak_mem_gb': perf[name]['peak_mem_gb'],
-            'final_train_loss': round(history[name]['train_loss'][-1], 4),
-        }
-        print(f"| {name:<11s} {params/1e6:6.1f}M {ppl:8.1f} {ppl/(params/1e6):6.2f} "
-              f"{perf[name]['tok_per_s']:>8,} {avg_ms:7.1f} "
-              f"{perf[name]['peak_mem_gb']:>7.2f} "
-              f"{history[name]['train_loss'][-1]:9.4f} |")
-    print("+=============================================================================+")
-    print("  NOTE: all three are pure-PyTorch references (no fused kernels). Real fused")
-    print("  kernels would speed up both Mamba and NFRA. This measures software-level")
-    print("  quality/speed/memory at matched parameter count on identical data.")
+        depth = NFRA_DEPTH if name == 'NFRA Brain' else (L_m if name == 'Mamba SSM' else L_g)
+        final = history[name]['eval'][-1][1] if history[name]['eval'] else float('nan')
+        results[name] = {'params': params, 'depth': depth, 'eval_loss': round(final, 3),
+                         'ppl': round(math.exp(min(final, 30)), 2),
+                         'tok_s': perf[name]['tok_s'], 'mem_gb': round(perf[name]['mem'], 2),
+                         'ms_per_step': round(sum(step_ms[name]) / len(step_ms[name]), 1)
+                         if step_ms[name] else 0.0}
+        ppl = f"{math.exp(min(final, 30)):8.2f}" if final < 25 else "   >e^25 "
+        print(f"  {name:<11s} {params/1e6:6.1f}M {depth:5d} {final:9.2f} "
+              f"{perf[name]['tok_s']:>8,d} "
+              f"{results[name]['ms_per_step']:7.1f} {perf[name]['mem']:5.2f}G"
+              + (f"   ppl≈{math.exp(min(final,30)):.0f}" if final < 25 else "   ppl: huge"))
+    print("-" * 66)
+    best_q = min(results, key=lambda k: results[k]['eval_loss'])
+    best_s = max(results, key=lambda k: results[k]['tok_s'])
+    print(f"\n  ✓ best quality (lowest eval loss): {best_q}")
+    print(f"  ✓ best throughput:                 {best_s}")
+
+    print("\n  — how to read this —")
+    print("  • eval loss ~8.3 = random guessing; lower = better language model.")
+    print("  • Loss starts ~100-150 because random-init logits scale with dim,")
+    print("    then falls as the model learns — judge by the FINAL value.")
+    print("  • tok/s here is pure-PyTorch (no fused kernels). Production fused")
+    print("    kernels would make Mamba and NFRA dramatically faster.")
+    print("  • All three trained on identical data with identical optimizer,")
+    print("    matched to ~%.0fM params." % TARGET_M)
 
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f"nfra_vs_mamba_vs_gpt2_results.json")
+                            'nfra_vs_mamba_vs_gpt2_results.json')
     with open(out_path, 'w') as f:
-        json.dump({'config': {'steps': STEPS, 'dim': DIM, 'target_params': TARGET_PARAMS_M,
-                              'data': DATA_SOURCE, 'vocab': VOCAB,
-                              'device': DEVICE.type, 'batch': DEFAULT_BATCH},
-                   'results': results, 'perf': perf, 'history': history}, f, indent=2)
-    print(f"  Results saved to {out_path}")
+        json.dump({'config': {'steps': STEPS, 'dim': DIM, 'target_params': TARGET_M,
+                              'data': DATA_SOURCE, 'vocab': VOCAB, 'batch': BATCH},
+                   'results': results, 'perf': perf,
+                   'history': {k: {'loss': v['loss'], 'eval': v['eval']}
+                               for k, v in history.items()}}, f, indent=2)
+    print(f"\n  results saved → {out_path}")
 
 
 if __name__ == '__main__':
