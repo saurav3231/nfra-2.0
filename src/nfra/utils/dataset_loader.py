@@ -5,8 +5,6 @@ Supports multiple public datasets.
 Created by Saurav Bhandari
 """
 
-from datasets import load_dataset
-from transformers import AutoTokenizer
 import torch
 
 
@@ -19,6 +17,8 @@ def load_and_tokenize(
     max_samples: int = None
 ):
     """Load and tokenize a public dataset."""
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
     
     print(f"Loading dataset: {dataset_name} ({config})")
     raw_dataset = load_dataset(dataset_name, config, split=split)

@@ -6,7 +6,7 @@
 ║   trained on identical data with the identical optimizer.             ║
 ║                                                                        ║
 ║   WHAT IS MEASURED                                                      ║
-║     eval loss  : log-perplexity (lower = better; ~8.3 = random guess) ║
+║     eval loss  : log-perplexity (lower = better; ≈ln(vocab) = random guess) ║
 ║     throughput : training tok/s (pure-PyTorch; no fused kernels)       ║
 ║     peak memory: GB during one train step                              ║
 ║                                                                        ║
@@ -25,7 +25,7 @@
 ║                                                                        ║
 ║   READING THE NUMBERS                                                   ║
 ║     • All heads use GPT-2-style init (embed std 0.02), so loss starts     ║
-║       near ln(vocab) ≈ 8.3 (random guess) for every model.               ║
+║       near ln(vocab) (random guess) for every model.                       ║
 ║       Judge quality by the FINAL eval loss.                              ║
 ║     • Mamba/NFRA use unfused scans here; production fused kernels        ║
 ║       would make them dramatically faster than shown.                    ║
@@ -364,7 +364,7 @@ def count_params(m): return sum(p.numel() for p in m.parameters())
 
 def rescale_embed(model, std=0.02):
     """Scale the tied embedding/lm_head to GPT-2-style init so every model
-    starts near ln(vocab) ≈ 8.3 instead of exploding logits at random init."""
+    starts near ln(vocab) (random guess) instead of exploding logits at random init."""
     with torch.no_grad():
         for m in model.modules():
             if isinstance(m, nn.Embedding):
@@ -398,6 +398,8 @@ def tune_nfra(make_fn, target, vocab, depth, min_dim=224):
     dims = [512, 448, 384, 352, 320, 288, 256, 224, 192, 160, 128]
     best = None
     for U in range(2, min(depth, 8) + 1):
+        if depth % U:
+            continue
         for d in dims:
             if d < min_dim:
                 continue
@@ -418,7 +420,8 @@ def make_optimizer(model, lr=3e-4, warmup=50, total=STEPS):
     return opt, torch.optim.lr_scheduler.LambdaLR(opt, sched)
 
 def compute_loss(model, x, y):
-    return F.cross_entropy(model(x)['logits'].view(-1, model(x)['logits'].size(-1)), y.view(-1))
+    logits = model(x)['logits']
+    return F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
 
 @torch.no_grad()
 def evaluate(model, loader, max_batches=15):
@@ -464,6 +467,7 @@ def fmt_loss(v):
 def main():
     use_wiki = DATA_SOURCE == 'wikitext2'
     VOCAB = 96 if use_wiki else 4096
+    RANDOM_LOSS = math.log(VOCAB)
     target = int(TARGET_M * 1e6)
 
     print("=" * 66)
@@ -599,9 +603,9 @@ def main():
     print(f"  ✓ best throughput:                 {best_s}")
 
     print("\n  — how to read this —")
-    print("  • eval loss ~8.3 = random guessing; lower = better language model.")
-    print("  • All losses start near 8.3 (fair init) and fall as the model")
-    print("    learns the bigram/topic structure — judge by the FINAL value.")
+    print(f"  • eval loss ~{RANDOM_LOSS:.2f} = random guessing; lower = better language model.")
+    print(f"  • All losses start near {RANDOM_LOSS:.2f} (fair init) and fall as the model")
+    print("    learns the structure — judge by the FINAL value.")
     print("  • tok/s here is pure-PyTorch (no fused kernels). Production fused")
     print("    kernels would make Mamba and NFRA dramatically faster.")
     print("  • All three trained on identical data with identical optimizer,")

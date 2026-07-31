@@ -46,7 +46,7 @@ def parallel_scan_time_varying(
     value: torch.Tensor,
     alpha: torch.Tensor,
     alpha_min: float = 0.85,
-    alpha_max: float = 0.99,
+    alpha_max: float = 0.9995,
 ) -> torch.Tensor:
     """
     Parallel scan for h_t = alpha_t * h_{t-1} + gate_t * value_t

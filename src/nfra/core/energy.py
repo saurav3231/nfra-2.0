@@ -61,13 +61,13 @@ class DynamicEnergyBudgetAllocator(nn.Module):
         # Ensure minimum budget
         budget = torch.clamp(budget, min=self.min_budget)
         
-        # Update current budget with smoothing
+        # Update current budget with smoothing (detached)
         self.current_budget = (
-            (1 - self.adaptation_rate) * self.current_budget + 
-            self.adaptation_rate * budget
+            (1 - self.adaptation_rate) * self.current_budget.detach() +
+            self.adaptation_rate * budget.detach()
         )
         
-        return self.current_budget
+        return budget
     
     def get_total_energy_used(self) -> float:
         """Returns sum of current energy allocation."""

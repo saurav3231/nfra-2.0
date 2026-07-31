@@ -39,14 +39,17 @@ from nfra import NFRAConfig, NFRAForCausalLM, NFRA_Brain_Block
 # 'wikitext2' (default) or 'synthetic'
 DATA_SOURCE = os.environ.get('NFRA_DATA', 'wikitext2')
 HAS_DATASETS = False
+HAS_LOCAL_WIKI = os.path.exists('wikitext-train-raw-v1.txt') or os.path.exists(
+    'wikitext-valid-raw-v1.txt')
 if DATA_SOURCE == 'wikitext2':
     try:
         from datasets import load_dataset
         HAS_DATASETS = True
     except ImportError:
-        print("  WARNING: 'datasets' not installed, falling back to synthetic data")
-        print("  Install with: pip install datasets")
-        DATA_SOURCE = 'synthetic'
+        if not HAS_LOCAL_WIKI:
+            print("  WARNING: 'datasets' not installed and no local wikitext txt files")
+            print("  Install with: pip install datasets")
+            DATA_SOURCE = 'synthetic'
 
 # -- Experiment Mode -------------------------------------------------
 # 'quick'     → 4 layers, 200 steps  (verifies code, ~2 min on T4)
@@ -135,13 +138,33 @@ class WikiText2Dataset(Dataset):
         super().__init__()
         self.seq_len = seq_len
         print(f"  └- Loading WikiText-2 ({split})...", end=' ')
-        text = load_dataset("wikitext", "wikitext-2-raw-v1", split=split, trust_remote_code=True)
-        full_text = '\n'.join(text['text'])
+        text = self._load_text(split)
+        full_text = '\n'.join(text)
         ids = [CHAR2IDX.get(c, 0) for c in full_text]
         self.data = torch.tensor(ids, dtype=torch.long)
         self.num_seqs = len(self.data) // seq_len
         self.data = self.data[:self.num_seqs * seq_len + 1]
         print(f"{self.num_seqs} seqs of {seq_len}")
+
+    def _load_text(self, split):
+        try:
+            from datasets import load_dataset
+            ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split, trust_remote_code=True)
+            return list(ds['text'])
+        except Exception as e:
+            local = {'train': 'wikitext-train-raw-v1.txt',
+                     'validation': 'wikitext-valid-raw-v1.txt'}.get(split,
+                                                                    'wikitext-valid-raw-v1.txt')
+            if os.path.exists(local):
+                print(f"(local {local})", end=' ')
+                with open(local, encoding='utf-8') as f:
+                    return f.read().split('\n')
+            raise RuntimeError(
+                f"Could not load WikiText-2 ({e}). Download the raw .txt files into CWD:\n"
+                "  https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/"
+                "wikitext-2-raw-v1/train-00000-of-00001.parquet?download=true\n"
+                "  then convert parquet->txt via pandas.read_parquet + '\\n'.join(df['text'])."
+            )
 
     def __len__(self):
         return self.num_seqs
@@ -392,7 +415,7 @@ def run_benchmark() -> Dict:
     LR = 3e-4
 
     # Choose dataset: WikiText-2 (preferred) or synthetic fallback
-    USE_WIKI = DATA_SOURCE == 'wikitext2' and HAS_DATASETS
+    USE_WIKI = DATA_SOURCE == 'wikitext2' and (HAS_DATASETS or HAS_LOCAL_WIKI)
     VOCAB = VOCAB_SIZE if USE_WIKI else 4096  # 96 chars or 4096 synthetic
 
     DIM = 768

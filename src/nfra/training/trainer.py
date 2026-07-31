@@ -81,6 +81,8 @@ class NFRATrainer:
         
         # Backward pass
         self.optimizer.zero_grad()
+        if not torch.isfinite(loss):
+            return loss_dict
         loss.backward()
         
         # Gradient clipping
@@ -101,8 +103,11 @@ class NFRATrainer:
         total_tokens = 0
         
         for batch in dataloader:
-            input_ids = batch["input_ids"].to(self.device)
-            targets = batch["labels"].to(self.device)
+            if isinstance(batch, dict):
+                input_ids = batch["input_ids"].to(self.device)
+                targets = batch["labels"].to(self.device)
+            else:
+                input_ids, targets = batch[0].to(self.device), batch[1].to(self.device)
             
             outputs = self.model(input_ids)
             logits = outputs["logits"]
