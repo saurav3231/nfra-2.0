@@ -192,11 +192,11 @@ def make_nfra(vocab: int, dim: int, layers: int) -> NFRAForCausalLM:
 # ---------------------------------------------------------------------
 # Model 2: Mamba-style SSM (faithful block, pure PyTorch)
 # ---------------------------------------------------------------------
-def mamba_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def hillis_prefix(a: torch.Tensor, b: torch.Tensor):
     """
-    Exact associative scan for h_t = a_t * h_{t-1} + b_t  (Hillis-Steele).
-    Fully parallel: O(log S) sequential steps of vectorized O(S) ops.
-    Verified numerically identical to the sequential recurrence.
+    Hillis-Steele associative prefix scan. Returns (A, B) such that
+    h_t = A_t * h_0 + B_t for the recurrence h_t = a_t*h_{t-1} + b_t.
+    Exact, parallel: O(log S) steps of vectorized O(S) ops.
     """
     S = a.shape[-2]
     a_cur, b_cur = a, b
@@ -208,7 +208,34 @@ def mamba_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         a_cur = a_prev * a_shift          # A_right * A_left
         b_cur = a_prev * b_shift + b_prev # A_right * B_left + B_right
         offset *= 2
-    return b_cur
+    return a_cur, b_cur
+
+
+def mamba_scan(a: torch.Tensor, b: torch.Tensor, chunk: int = 64) -> torch.Tensor:
+    """
+    Exact chunked associative scan for h_t = a_t*h_{t-1} + b_t.
+
+    Chunking caps peak memory at O(chunk * N*E) per block (the full-sequence
+    Hillis-Steele scan OOMs at long S because autograd keeps every iteration's
+    temporaries). State is carried across chunks, so the result is identical.
+    Verified numerically equal to the sequential recurrence.
+    """
+    B, _, S, D = a.shape
+    n_chunks = math.ceil(S / chunk)
+    pad = n_chunks * chunk - S
+    if pad:
+        a = F.pad(a, (0, 0, 0, pad), value=1.0)
+        b = F.pad(b, (0, 0, 0, pad), value=0.0)
+    a = a.reshape(B, 1, n_chunks, chunk, D)
+    b = b.reshape(B, 1, n_chunks, chunk, D)
+    h = torch.zeros(B, D, device=a.device)
+    outs = []
+    for c in range(n_chunks):
+        a_rel, b_rel = hillis_prefix(a[:, :, c], b[:, :, c])   # [B,1,chunk,D]
+        out = a_rel * h.view(B, 1, 1, D) + b_rel               # apply carried state
+        h = out[:, :, -1, :].squeeze(1)                        # next chunk's state
+        outs.append(out)
+    return torch.cat(outs, dim=2)[:, :, :S, :]
 
 
 class MambaBlock(nn.Module):
