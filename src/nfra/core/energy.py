@@ -52,8 +52,13 @@ class DynamicEnergyBudgetAllocator(nn.Module):
         else:
             base = self.importance
             
-        # Normalize
-        base = base / (base.sum() + 1e-8)
+        # Scale weights so their MEAN is 1: with uniform importance every block
+        # gets exactly `hardware_factor` (so an energy_budget of 0.5 really
+        # means "half compute per block", matching the model-layer contract
+        # where 1.0 = full). The old sum-normalization made per-block budgets
+        # ~hardware_factor / num_blocks, so e.g. Lite's 0.5 silently collapsed
+        # to the 0.1 floor for every block.
+        base = base / (base.mean() + 1e-8)
         
         # Apply hardware and power constraints
         budget = base * hardware_factor * power_remaining

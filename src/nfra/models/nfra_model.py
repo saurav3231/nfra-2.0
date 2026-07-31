@@ -238,10 +238,12 @@ class NFRAForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
 
-        # Global brain state: a GRU that aggregates a whole-depth summary and
-        # injects it top-down into subsequent passes. Gives the network a
-        # persistent "global state" (like slow neuromodulatory loops) instead of
-        # only local per-token signals. Threaded at the model level.
+        # Global brain state: a slow global-state aggregator that summarizes a
+        # whole depth pass and injects it top-down into subsequent passes. Gives
+        # the network a persistent "global state" (like slow neuromodulatory
+        # loops) instead of only local per-token signals. Threaded at the model
+        # level. (The 0.5x prev-pass carry makes it a leaky integrator, not a
+        # GRU.)
         self.global_brain = None
         if self._has_neuromodulator:
             from ..core.neuro import GlobalBrainState

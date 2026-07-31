@@ -23,7 +23,8 @@ class FractalGatedMLP(nn.Module):
                  scales: Optional[List[int]] = None):
         super().__init__()
         self.dim = dim
-        self.scales = [1, 2] if scales is None else scales
+        scales = [1, 2] if scales is None else scales
+        self.scales = scales
         hidden_dim = int(dim * hidden_mult)
 
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -52,7 +53,10 @@ class FractalGatedMLP(nn.Module):
         up = self.up_proj(x)
         hidden = gate * up
 
-        pooled = x.mean(dim=1, keepdim=True)
+        # Causal per-token routing context (autoregressive-safe). The old
+        # x.mean(dim=1) leaked FUTURE tokens into every position's routing.
+        from .neuro import prefix_pool
+        pooled = prefix_pool(x)
 
         coarse = torch.sigmoid(self.coarse_router(pooled))
         fine = torch.softmax(self.fine_router(pooled), dim=-1)
@@ -72,8 +76,8 @@ class FractalGatedMLP(nn.Module):
             coarse = coarse * 1.0
 
         output = torch.zeros_like(hidden)
-        coarse_w = coarse.squeeze(1).squeeze(-1)
-        fine_w = fine.squeeze(1)
+        coarse_w = coarse.squeeze(-1)                # [B, S]
+        fine_w = fine                               # [B, S, n_scales]
         # Record which experts are meaningfully active as a tensor of flags
         # instead of a Python int: `if w.mean() > 0.01` on a CUDA tensor is an
         # implicit .item() sync (one GPU->CPU stall per expert per forward).
@@ -81,8 +85,7 @@ class FractalGatedMLP(nn.Module):
         # free of device syncs.
         active = []
         for i, expert in enumerate(self.sub_experts):
-            w = coarse_w * fine_w[:, i]
-            w = w.view(-1, 1, 1)
+            w = (coarse_w * fine_w[:, :, i]).unsqueeze(-1)   # [B, S, 1]
             active.append((w.mean() > 0.01).reshape(-1))
             output = output + w * expert(hidden)
 
@@ -151,10 +154,13 @@ class FractalResonanceBlock(nn.Module):
         x = residual + x
 
         flags = getattr(self.mlp, '_n_active_flags', None)
+        # Per-forward (not cumulative) stats: overwrite so get_sparsity reflects
+        # the LAST forward and gradient-checkpointing recompute can't double
+        # count. (The old += made the numbers depend on how many forwards —
+        # and backward recomputes — had ever run.)
         if flags is not None:
-            self.activation_count += flags.float().sum()
-        total_experts = len(self.mlp.scales)
-        self.total_count += total_experts
+            self.activation_count.copy_(flags.float().sum())
+            self.total_count.copy_(len(self.mlp.scales))
 
         if return_stats:
             return x, {
@@ -272,7 +278,10 @@ class FractalSwiGLU(nn.Module):
         up = self.up_proj(x)
         hidden = gate * up
 
-        pooled = x.mean(dim=1, keepdim=True)
+        # Causal per-token routing context (the old x.mean(dim=1) leaked the
+        # future into every position's MLP routing in an autoregressive LM).
+        from .neuro import prefix_pool
+        pooled = prefix_pool(x)
         routing = torch.softmax(self.router(pooled), dim=-1)
         weight_map = routing[:, :, self.routing_idx]
         hidden = hidden * weight_map

@@ -40,7 +40,13 @@ def load_and_tokenize(
     
     tokenized = raw_dataset.map(tokenize, batched=True, remove_columns=raw_dataset.column_names)
     
-    input_ids = torch.tensor(tokenized["input_ids"])
-    labels = input_ids.clone()
+    input_ids = torch.tensor(tokenized["input_ids"], dtype=torch.long)
+    # Autoregressive targets: predict the NEXT token. labels[t] = input_ids[t+1];
+    # the final column has no successor (-100 = ignored). PAD positions (from
+    # padding="max_length") are also ignored so the model isn't trained to emit
+    # or evaluated on trivial pad-to-pad predictions.
+    labels = torch.full_like(input_ids, -100)
+    labels[:, :-1] = input_ids[:, 1:]
+    labels = labels.masked_fill(labels == tokenizer.pad_token_id, -100)
     
     return torch.utils.data.TensorDataset(input_ids, labels)

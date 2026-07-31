@@ -86,7 +86,7 @@ def main():
         params = count_params(model)
         res = train_one(model, VOCAB, steps, train_loader, eval_loader,
                         eval_gap, ema_decay=cfg['ema_decay'],
-                        surprise=cfg['surprise'])
+                        surprise=cfg['surprise'], seed=SEED_LIST[0])
         final_eval = evaluate(model, eval_loader)
 
         traj = [(step, round(loss, 4)) for step, loss in res['eval_hist']]

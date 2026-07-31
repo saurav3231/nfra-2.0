@@ -132,7 +132,7 @@ def metric_by_span(model, loader, k, V=V):
             float(np.mean(ce_pad)))
 
 
-def _train_concurrent(models, steps, loaders):
+def _train_concurrent(models, steps, loaders, seq_len=256):
     """Train several models in parallel, one CUDA stream each.
 
     A 5M model's step is a stream of ~1000 tiny kernels with launch gaps the
@@ -207,7 +207,7 @@ def _train_concurrent(models, steps, loaders):
             'nan_steps': nan[i],
             'wall_s': wall,
             'ms_per_step': wall * 1000.0 / steps,
-            'tok_s': bs * SEQ_LEN * steps / max(wall, 1e-6),
+            'tok_s': bs * seq_len * steps / max(wall, 1e-6),
         })
     return recs, wall
 
@@ -239,9 +239,9 @@ def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False):
                 rescale_embed(m)
                 tasks.append((fam, k, m, train_loader, eval_loader))
         recs, wall = _train_concurrent([t[2] for t in tasks], steps,
-                                       [t[3] for t in tasks])
+                                       [t[3] for t in tasks], seq_len)
         agg_tok_s = (sum(getattr(t[3], 'batch_size', 1) for t in tasks)
-                     * SEQ_LEN * steps / max(wall, 1e-6))
+                     * seq_len * steps / max(wall, 1e-6))
         print('[concurrent] %d trainings in %.1fs -> %.0f tok/s aggregate'
               % (len(tasks), wall, agg_tok_s))
         for (fam, k, m, _tr, ev), rec in zip(tasks, recs):

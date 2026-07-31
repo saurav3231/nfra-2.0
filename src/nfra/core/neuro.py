@@ -566,7 +566,11 @@ class BrainMLP(nn.Module):
 
         if hormones is not None:
             da_temp = hormones[:, :, 2:3]
-            routing = routing / (da_temp + 0.1)
+            # DA ↑ → sharper routing focus: divide by (1.1 - DA), so high DA
+            # lowers the softmax temperature (0.1 divisor) and low DA softens
+            # it. The old /(DA+0.1) had high DA SOFTEN routing, inverting the
+            # documented intent.
+            routing = routing / (1.1 - da_temp)
 
         routing = torch.softmax(routing, dim=-1)
 

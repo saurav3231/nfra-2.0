@@ -46,17 +46,12 @@ class NFRALiteForCausalLM(NFRAForCausalLM):
         
         # Lite-specific optimizations
         self._lite_mode = True
-        
-        # KV Cache (optional, for longer sequences)
-        self.kv_cache = None
-        self.use_kv_cache = False
 
     def forward(
         self, 
         input_ids: torch.Tensor, 
         energy_budget: Optional[float] = None,
         return_dict: bool = True,
-        use_kv_cache: bool = False
     ) -> Dict:
         """
         Optimized forward pass for Lite mode.
@@ -64,8 +59,6 @@ class NFRALiteForCausalLM(NFRAForCausalLM):
         """
         if energy_budget is None:
             energy_budget = 0.5  # Very aggressive for Lite
-            
-        self.use_kv_cache = use_kv_cache
             
         return super().forward(
             input_ids=input_ids,

@@ -203,7 +203,7 @@ def build_family_spec(family, size, vocab):
 
 # ─────────────────────────── training ───────────────────────────
 def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
-              ema_decay=0.0, surprise=False):
+              ema_decay=0.0, surprise=False, seed=None):
     model.train()
     if COMPILE and HAS_CUDA:
         # Keep the caller's reference uncompiled (fine for later evals); train
@@ -211,17 +211,36 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
         # advances RNG between replays), so no loss of stochasticity.
         try:
             cfg = getattr(model, 'config', None)
+            ckpt_was = cfg.gradient_checkpointing if cfg is not None else None
             if cfg is not None:
                 cfg.gradient_checkpointing = False
             model = torch.compile(model, mode='reduce-overhead', dynamic=False)
             print('  [compile] torch.compile(reduce-overhead) active')
         except Exception as e:  # pragma: no cover - depends on torch version
             print('  [warn] torch.compile failed (%s) - eager fallback' % e)
+        finally:
+            # Restore the caller's config: the compiled graph already captured
+            # the flag at trace time (dynamic=False -> no re-trace), so this is
+            # safe and keeps the caller's eager model/config unmutated.
+            if cfg is not None:
+                cfg.gradient_checkpointing = ckpt_was
     opt, sched = make_optimizer(model, lr=3e-4,
                                 warmup=min(50, max(steps // 10, 1)), total=steps)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
     ema = EMA(model, ema_decay) if ema_decay > 0 else None
-    it = iter(train_loader)
+    if seed is not None:
+        # Private identically-seeded generator: every caller training on the
+        # same dataset with the same seed consumes byte-identical batches, so
+        # families/models are compared on exactly the same stream. (Sharing one
+        # DataLoader's iterator draws from the same RNG in an offset order.)
+        loader = DataLoader(
+            train_loader.dataset, batch_size=train_loader.batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(seed),
+            num_workers=0, pin_memory=train_loader.pin_memory)
+        it = iter(loader)
+    else:
+        it = iter(train_loader)
     if HAS_CUDA:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -397,9 +416,11 @@ def composite_score(metric_rows, spec):
 # ─────────────────────────── data ───────────────────────────
 def make_loaders(size_idx):
     """Shared train loaders per (size, seed); eval + extrapolation per size.
-    All families see byte-identical batches for a given (size, seed)."""
+    train_one re-wraps each seed's train loader with a private, identically-
+    seeded generator, so all families see byte-identical batches for a given
+    (size, seed)."""
     use_wiki = DATA_SOURCE == 'wikitext2'
-    wiki_ds = WikiText2Dataset('train', SEQ_LEN + 1) if use_wiki else None
+    wiki_ds = WikiText2Dataset('train', SEQ_LEN) if use_wiki else None
     train_loaders = {}
     for si, seed in enumerate(SEED_LIST):
         gen = torch.Generator().manual_seed(1000 + size_idx * 100 + si * 10)
@@ -412,8 +433,8 @@ def make_loaders(size_idx):
                                          generator=gen, num_workers=0,
                                          pin_memory=HAS_CUDA)
     if use_wiki:
-        eval_ds = WikiText2Dataset('validation', SEQ_LEN + 1)
-        ext_ds = WikiText2Dataset('validation', SEQ_LEN * EXT_FACTOR + 1)
+        eval_ds = WikiText2Dataset('validation', SEQ_LEN)
+        ext_ds = WikiText2Dataset('validation', SEQ_LEN * EXT_FACTOR)
     else:
         eval_ds = HierarchicalDataset(max(256, BATCH * 6), SEQ_LEN + 1,
                                       seed=100 + size_idx, seq_seed=300 + size_idx)
@@ -535,7 +556,8 @@ def main():
                 rescale_embed(model)
                 rec = train_one(model, VOCAB, STEPS, train_loaders[seed],
                                 eval_loader, EVAL_GAP,
-                                ema_decay=EMA_DECAY, surprise=SURPRISE)
+                                ema_decay=EMA_DECAY, surprise=SURPRISE,
+                                seed=seed)
                 runs[size][seed][family] = rec
                 if seed == SEED_LIST[-1]:
                     ext = evaluate(model, ext_loader, max_batches=6)

@@ -115,12 +115,18 @@ class NFRATrainer:
             loss = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)), 
                 targets.view(-1),
-                reduction="sum"
+                reduction="sum",
+                ignore_index=-100,
             )
             
             total_loss += loss.item()
-            total_tokens += input_ids.numel()
+            total_tokens += (targets != -100).sum().item()
         
+        if total_tokens == 0:
+            return {
+                "eval_loss": float("inf"),
+                "perplexity": float("inf")
+            }
         avg_loss = total_loss / total_tokens
         perplexity = torch.exp(torch.tensor(avg_loss)).item()
         

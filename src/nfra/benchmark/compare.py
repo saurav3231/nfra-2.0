@@ -506,7 +506,10 @@ def evaluate(model, loader, max_batches=15):
             loss = compute_loss(model, x, y)
         total += loss.item() * x.size(0); n += x.size(0)
     model.train()
-    return total / max(n, 1)
+    # Empty / too-short loader: report inf, never a silent "perfect" 0.0.
+    if n == 0:
+        return float('inf')
+    return total / n
 
 def measure_speed_memory(model, vocab, n_steps=10):
     x = torch.randint(0, vocab, (BATCH, SEQ_LEN), device=DEVICE)
@@ -566,8 +569,8 @@ def main():
     # ── data
     print("\n[1/5] Generating data ... ", end='')
     if use_wiki:
-        train_ds = WikiText2Dataset('train', SEQ_LEN + 1)
-        eval_ds = WikiText2Dataset('validation', SEQ_LEN + 1)
+        train_ds = WikiText2Dataset('train', SEQ_LEN)
+        eval_ds = WikiText2Dataset('validation', SEQ_LEN)
     else:
         train_ds = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1,
                                        seed=SEED, seq_seed=SEED)
@@ -614,7 +617,15 @@ def main():
     print(f"\n[4/5] Training {STEPS} steps (AdamW 3e-4, warmup + cosine)...")
     history = {n: {'loss': [], 'eval': []} for n in models}
     opts = {n: make_optimizer(m) for n, m in models.items()}
-    loaders = {n: iter(train_loader) for n in models}
+    # One identically-seeded DataLoader per model => every family consumes
+    # byte-identical batches at the same step (fair head-to-head). Sharing a
+    # single loader's iterator would draw offset batches from one RNG.
+    loaders = {
+        n: iter(DataLoader(train_ds, batch_size=BATCH, shuffle=True,
+                           generator=torch.Generator().manual_seed(SEED),
+                           num_workers=0, pin_memory=HAS_CUDA))
+        for n in models
+    }
     scalers = {n: (torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None) for n in models}
     step_ms = {n: [] for n in models}
     emas = {n: (EMA(m, EMA_DECAY) if EMA_DECAY > 0 else None) for n, m in models.items()}

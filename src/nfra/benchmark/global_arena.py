@@ -159,20 +159,21 @@ def phase_core(data, vocab, random_loss):
     for size in GA_SIZES:
         train_loaders, eval_loader, ext_loader = make_loaders(GA_SIZES.index(size))
         runs[size] = {}
-        for seed in arena.SEED_LIST[:GA_SEEDS]:
+        seeds = arena.SEED_LIST[:GA_SEEDS]
+        for seed in seeds:
             runs[size][seed] = {}
             for fam in ('nfra', 'mamba', 'gpt2'):
                 t0 = time.perf_counter()
                 m, _ = _build_family(fam, size, vocab, seed)
                 rec = _run(m, vocab, GA_STEPS, train_loaders[seed], eval_loader,
-                           EVAL_GAP)
+                           EVAL_GAP, seed=seed)
                 runs[size][seed][fam] = rec
                 print('  [train] %-6s @ %dM seed %-4d final %s  %.0f tok/s  '
                       '%.2f GB  (%.0fs)'
                       % (fam, size, seed,
                          '%.3f' % rec['eval_hist'][-1][1] if rec['eval_hist'] else 'NA',
                          rec['tok_s'], rec['peak_mem'], time.perf_counter() - t0))
-                if seed == arena.SEED_LIST[-1]:
+                if seed == seeds[-1]:
                     ext = evaluate(m, ext_loader, max_batches=6)
                     battery.setdefault(size, {})[fam] = {
                         'extrap_loss': ext,
@@ -224,7 +225,7 @@ def phase_ablate(data, vocab, random_loss):
             fam = build_kw.pop('fam', 'nfra')
             m, params = _build_family(fam, primary, vocab, seed, **build_kw)
             rec = _run(m, vocab, GA_STEPS, train_loaders[seed], eval_loader,
-                       EVAL_GAP, **train_kw)
+                       EVAL_GAP, seed=seed, **train_kw)
             recs.append(rec)
             print('  [train] %-16s seed %-4d final %s  %.0f tok/s  (%.0fs)'
                   % (name, seed,

@@ -49,12 +49,14 @@ class NFRACombinedLoss(nn.Module):
         total_loss = self.task_weight * task_loss
         loss_dict = {"task_loss": task_loss.item()}
         
-        # Resonance sparsity loss (encourage healthy sparsity)
+        # Resonance sparsity / energy terms are reported but NOT added to the
+        # differentiable loss: they come from detached floats, so they have no
+        # gradient path — folding them in silently inflated the loss value
+        # without training the model (a pure no-op constant). The prediction
+        # error term below is a tensor and does contribute gradients.
         if resonance_stats is not None:
             sparsity = resonance_stats.get("sparsity", 0.0)
-            # Reward sparsity between 0.7 - 0.95
             resonance_loss = max(0, 0.7 - sparsity) + max(0, sparsity - 0.95)
-            total_loss = total_loss + self.resonance_weight * resonance_loss
             loss_dict["resonance_loss"] = resonance_loss
         
         # Prediction error loss
@@ -66,7 +68,6 @@ class NFRACombinedLoss(nn.Module):
         # Energy regularization
         if energy_used is not None:
             energy_loss = max(0, energy_used - 0.6)  # Penalize using too much energy
-            total_loss = total_loss + self.energy_weight * energy_loss
             loss_dict["energy_loss"] = energy_loss
         
         loss_dict["total_loss"] = total_loss.item()

@@ -6,7 +6,34 @@ Created by Saurav Bhandari
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict
+
+
+class Int8Linear(nn.Module):
+    """Per-tensor symmetric INT8 quantization of an nn.Linear's weight.
+
+    The weight is stored as real int8 (+ one fp32 scale) — genuine 8-bit
+    storage — and dequantized on the fly at forward. The output is
+    numerically identical to rounding the original weight to the INT8 grid.
+    Bias (if any) stays fp32. For CPU inference (no gradient).
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.bias = linear.bias
+        scale = linear.weight.data.abs().max() / 127.0
+        self.scale = scale if scale > 0 else 1.0
+        self.qweight = nn.Parameter(
+            torch.round(linear.weight.data / self.scale).clamp(-128, 127).to(torch.int8),
+            requires_grad=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.qweight.float() * self.scale
+        return F.linear(x, w, self.bias)
 
 
 def quantize_to_int8(model: nn.Module) -> Dict:
@@ -46,25 +73,25 @@ def dequantize(state: Dict) -> Dict:
 
 def apply_int8_to_model(model: nn.Module):
     """
-    Apply basic INT8 quantization to linear layers.
-    Preserves original weights in original_weight attribute for reference.
-    Skips layers that have already been quantized.
+    Replace every nn.Linear with Int8Linear (real int8 weight storage).
+
+    Apply AFTER loading: it swaps linear layers in-place for CPU inference
+    (weights stored as int8, dequantized per forward). Skips layers that have
+    already been quantized. Note: the resulting module's state_dict keys
+    change (weight -> qweight + scale), so save the float model first if you
+    need to round-trip through checkpoints.
     """
-    for module in model.modules():
-        if isinstance(module, nn.Linear):
-            # Skip if already quantized
-            if hasattr(module, 'is_quantized') and module.is_quantized:
-                continue
-            
-            # Store original weight for reference (only once)
-            if not hasattr(module, 'original_weight'):
-                module.original_weight = module.weight.data.clone()
-            
-            # Quantize weight
-            scale = module.weight.data.abs().max() / 127.0
-            if scale > 0:
-                module.weight.data = torch.round(module.weight.data / scale).clamp(-128, 127).float() * scale
-            
-            module.is_quantized = True
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear) or isinstance(module, Int8Linear):
+            continue
+        if hasattr(module, 'is_quantized') and module.is_quantized:
+            continue
+        quantized = Int8Linear(module)
+        parts = name.split('.')
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], quantized)
+        quantized.is_quantized = True
     
     return model
