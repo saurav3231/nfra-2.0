@@ -61,13 +61,16 @@ from nfra import NFRAConfig, NFRAForCausalLM
 
 # ─────────────────────────── config ───────────────────────────
 DATA_SOURCE = os.environ.get('NFRA_DATA', 'synthetic').lower()
-HAS_DATASETS = False
+WIKI_PATHS = {'train': 'wikitext-train-raw-v1.txt',
+              'validation': 'wikitext-valid-raw-v1.txt',
+              'test': 'wikitext-test-raw-v1.txt'}
 if DATA_SOURCE == 'wikitext2':
-    try:
-        from datasets import load_dataset
-        HAS_DATASETS = True
-    except ImportError:
-        print("  [warn] 'datasets' missing — falling back to synthetic")
+    missing = [f for f in WIKI_PATHS.values() if not os.path.exists(f)]
+    if missing:
+        print(f"  [warn] wikitext2 files missing ({', '.join(missing)}) — "
+              "falling back to synthetic")
+        print("         run:  !wget https://huggingface.co/datasets/wikitext/"
+              "wikitext-2-raw-v1/resolve/main/<file>.txt")
         DATA_SOURCE = 'synthetic'
 
 STEP_CFG = {'quick': 150, 'standard': 600, 'rigorous': 1500}
@@ -169,15 +172,16 @@ CHAR2IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
 
 
 class WikiText2Dataset(Dataset):
-    """Character-level WikiText-2 language modeling dataset (real text)."""
+    """Character-level WikiText-2 language modeling dataset (real text).
+    Reads the raw .txt files directly (no `datasets`/scipy dependency)."""
 
     def __init__(self, split: str = 'train', seq_len: int = 256):
         super().__init__()
         self.seq_len = seq_len
-        print(f"  └- Loading WikiText-2 ({split})...", end=' ')
-        text = load_dataset("wikitext", "wikitext-2-raw-v1", split=split,
-                            trust_remote_code=True)
-        full_text = '\n'.join(text['text'])
+        path = WIKI_PATHS[split]
+        print(f"  └- Loading WikiText-2 ({split}: {path})...", end=' ')
+        with open(path, encoding='utf-8') as f:
+            full_text = f.read()
         ids = [CHAR2IDX.get(c, 0) for c in full_text]
         self.data = torch.tensor(ids, dtype=torch.long)
         self.num_seqs = len(self.data) // seq_len
@@ -456,7 +460,7 @@ def fmt_loss(v):
     return f"{v:7.2f}"
 
 def main():
-    use_wiki = DATA_SOURCE == 'wikitext2' and HAS_DATASETS
+    use_wiki = DATA_SOURCE == 'wikitext2'
     VOCAB = 96 if use_wiki else 4096
     target = int(TARGET_M * 1e6)
 
