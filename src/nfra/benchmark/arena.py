@@ -24,6 +24,8 @@
 ║     NFRA_FAMILIES   comma list: nfra,mamba,gpt2 (default all)             ║
 ║     NFRA_DATA       synthetic | wikitext2                                 ║
 ║     NFRA_BATCH      override training batch size                          ║
+║     NFRA_BANDS      NFRA Brain band count (H8 ablation: 2,4,8,16)         ║
+║     NFRA_SCAN_KERNEL 0=torch, 1=auto Triton kernel, 2=force              ║
 ║                                                                           ║
 ║   Usage:  python -m nfra.benchmark.arena     (Kaggle T4 recommended)      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
@@ -65,6 +67,7 @@ FAMILIES = [f.strip().lower() for f in
 EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
 SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
 KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
+BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation knob
 EVAL_GAP = max(50, STEPS // 6)
 EXT_FACTOR = 2                      # extrapolation test: eval at SEQ_LEN * EXT_FACTOR
 GEN_LEN = 16
@@ -96,7 +99,7 @@ def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None):
     if k_wta is None:
         k_wta = KWTA
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
-                     num_layers=depth, n_bands=16, dropout=0.1,
+                     num_layers=depth, n_bands=BANDS, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
                      gradient_checkpointing=True, k_wta_frac=k_wta)
     return NFRAForCausalLM(cfg)
@@ -419,6 +422,8 @@ def main():
     print(f"  device   : {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'}"
           + (f"   (fp16 AMP)" if USE_AMP else ""))
     feats = []
+    if BANDS != 16:
+        feats.append(f"bands={BANDS}")
     if EMA_DECAY > 0:
         feats.append(f"EMA={EMA_DECAY}")
     if SURPRISE:

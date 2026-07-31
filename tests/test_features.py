@@ -21,6 +21,33 @@ def _brain(vocab=96, dim=128, layers=4, unique=2, kwta=0.0):
     return NFRAForCausalLM(cfg)
 
 
+def test_brainmixer_band_count_knob():
+    """H8: BrainMixer must accept explicit band counts and train smoothly."""
+    from nfra.core.neuro import BrainMixer
+
+    for h in (2, 4, 8, 16):
+        m = BrainMixer(192, n_heads=h)
+        assert m.n_heads == h
+        assert m.head_dim * h == 192
+        x = torch.randn(2, 32, 192)
+        out, router = m(x)
+        assert out.shape == (2, 32, 192)
+        assert router.shape == (2, 32, 1)
+        out.mean().backward()
+        assert m.dt_proj.weight.grad is not None
+
+
+def test_brainmixer_default_is_16_head_hierarchy():
+    from nfra.core.neuro import BrainMixer
+
+    m = BrainMixer(192)               # None -> legacy [8,4,2,1]+router
+    assert m.n_heads == 16
+    assert m.head_counts == [8, 4, 2, 1]
+    m16 = BrainMixer(192, n_heads=16)  # explicit 16 -> identical structure
+    assert m16.head_counts == [8, 4, 2, 1]
+    assert m16.n_heads == 16
+
+
 def test_k_wta_is_applied_in_mlp():
     mlp = BrainMLP(64, k_wta_frac=0.5)
     captured = {}

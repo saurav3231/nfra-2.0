@@ -419,7 +419,7 @@ class NFRA_Brain_Block(nn.Module):
         self.predictor = nn.Linear(dim, dim, bias=False)
 
         self.ln1 = nn.LayerNorm(dim)
-        self.mixer = BrainMixer(dim)
+        self.mixer = BrainMixer(dim, n_heads=n_bands)
         self.thalamus = ThalamicGate(dim)
 
         # Lightweight sliding-window attention for content-addressable retrieval

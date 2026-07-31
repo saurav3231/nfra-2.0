@@ -2,6 +2,11 @@
 
 **Status:** working plan — updated through 5 criticism rounds
 **Motive anchor:** *quality AI on modest hardware* — every idea must keep **latency, peak memory, and training speed low**, and keep the benchmark **credible**.
+
+**Implementation log (dates newest-first):**
+- **2026-07-31 — kernels + Phase 0/H8/H3 tooling.** Custom fused selective-scan Triton kernel `nfra.kernels.scan` (one-pass forward, exact closed-form backward, torch fallback; `NFRA_SCAN_KERNEL` 0/1/2). `BrainMixer` now honors an explicit band count (`NFRA_BANDS`, H8 ablation: 2/4/8/16; 16 keeps the legacy `[8,4,2,1]+router` hierarchy) — `n_bands` was previously dead in Brain mode. H3 memory-horizon probe (`nfra.benchmark.recall_probe`) ships to decide memory-vs-capacity.
+- **2026-07 — NFRA 3.2 feature toggles.** EMA, surprise-weighted (dopamine-RPE) loss, k-WTA lateral inhibition (`NFRA_EMA`/`NFRA_SURPRISE`/`NFRA_KWTA`), each A/B-able and applied to all families except k-WTA (NFRA-only). Script `compare_versions` isolates 3.1-parity vs 3.2-full on identical seed/init/data.
+
 **Baseline facts (measured, Kaggle T4, WikiText-2 char, ~20M params, 600 steps):**
 
 | Model | Eval loss (↓) | Peak mem (↓) | Train tok/s (↑) |

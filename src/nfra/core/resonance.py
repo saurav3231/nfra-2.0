@@ -57,7 +57,10 @@ def parallel_scan_time_varying(
         h_t = exp(C_t) * sum_{k<=t} exp(-C_k) * gate_k * value_k,
         C_t = sum_{i<=t} log(alpha_i)
 
-    Vectorized with two cumsums — no Python loop, O(S) memory.
+    On CUDA with Triton available this dispatches to a fused custom kernel
+    (nfra.kernels.scan.selective_scan) — one pass, fp32 accumulation, no
+    intermediate tensors. Else it falls back to the vectorized two-cumsum
+    closed form below. Env: NFRA_SCAN_KERNEL (0=torch, 1=auto, 2=force).
 
     Args:
         gate:   [B, H, S, Hd] input gates in (0, 1), or None for no gating
@@ -67,10 +70,9 @@ def parallel_scan_time_varying(
     Returns:
         [B, H, S, Hd] hidden states for every timestep (parallel)
     """
-    u = value if gate is None else gate * value
-    w = torch.log(alpha.clamp(min=alpha_min, max=alpha_max))
-    cumlog = torch.cumsum(w, dim=2)
-    return torch.exp(cumlog) * torch.cumsum(torch.exp(-cumlog) * u, dim=2)
+    from ..kernels.scan import selective_scan
+
+    return selective_scan(gate, value, alpha, alpha_min, alpha_max)
 
 
 class ResonanceSignature:

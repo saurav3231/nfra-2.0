@@ -223,8 +223,19 @@ class BrainMixer(nn.Module):
     def __init__(self, dim: int, n_heads: Optional[int] = None):
         super().__init__()
         self.dim = dim
-        self.head_counts = [8, 4, 2, 1]
-        self.n_heads = sum(self.head_counts) + 1
+        # Default (16) keeps the hierarchical [8,4,2,1]+router structure used
+        # by all shipped Brain configs. An explicit n_heads builds that many
+        # uniform recurrence groups (+1 router head) — this is the H8
+        # band-count ablation knob: fewer groups = fewer temporal scales.
+        if n_heads is None or n_heads == 16:
+            self.head_counts = [8, 4, 2, 1]
+            self.n_heads = sum(self.head_counts) + 1
+            targets = [0.90, 0.95, 0.98, 0.995]
+        else:
+            content = max(1, n_heads - 1)
+            self.n_heads = content + 1
+            self.head_counts = [content]
+            targets = torch.linspace(0.90, 0.995, content).tolist()
         self.head_dim = dim // self.n_heads
         if dim != self.n_heads * self.head_dim:
             raise ValueError(f"dim ({dim}) must be divisible by {self.n_heads}")
@@ -241,8 +252,7 @@ class BrainMixer(nn.Module):
         nn.init.zeros_(self.dt_proj.bias)
 
         log_alphas = []
-        target_decays = [0.90, 0.95, 0.98, 0.995]
-        for lvl, (n, d) in enumerate(zip(self.head_counts, target_decays)):
+        for n, d in zip(self.head_counts, targets):
             # alpha = 0.85 + 0.15*sigmoid(log_alpha); invert for the target
             s = (d - 0.85) / 0.15
             log_a = torch.full((n, self.head_dim), math.log(s / (1.0 - s)))

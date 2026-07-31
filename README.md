@@ -176,6 +176,10 @@ The credible one. Answers **"who wins on which aspect"** and **"is NFRA really r
 | `NFRA_EMA` | `0` | EMA weight-averaging decay (e.g. `0.999`); eval uses averaged weights. Applied to all families for a fair head-to-head |
 | `NFRA_SURPRISE` | `0` | `1` = surprise-weighted (dopamine-RPE) gradients; mean-preserving weights. Applied to all families |
 | `NFRA_KWTA` | `0` | k-WTA lateral inhibition fraction for NFRA (e.g. `0.5`); `0` = off |
+| `NFRA_SCAN_KERNEL` | `1` | Selective-scan backend: `0` = torch closed-form, `1` = auto (Triton CUDA kernel when available), `2` = force Triton |
+| `NFRA_BANDS` | `16` | Recurrence band/head count for NFRA Brain (H8 ablation: `2,4,8,16`; `16` = hierarchical `[8,4,2,1]+router`) |
+| `NFRA_RECALL_KS` | `4,16,64,128` | Spans for the H3 memory-horizon probe (`python -m nfra.benchmark.recall_probe`) |
+| `NFRA_RECALL_STEPS` | `400` | Train steps per (span, model) in the recall probe |
 
 #### Outputs
 
