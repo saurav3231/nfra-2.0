@@ -19,10 +19,12 @@ class NFRABenchmark:
         self.model = model.to(device)
         self.device = device
         
-    def benchmark_inference(self, seq_lengths: List[int] = [128, 256, 512], 
+    def benchmark_inference(self, seq_lengths: Optional[List[int]] = None, 
                            batch_size: int = 4, warmup: int = 3, 
                            repeats: int = 10) -> Dict:
         """Benchmark inference speed across different sequence lengths."""
+        if seq_lengths is None:
+            seq_lengths = [128, 256, 512]
         results = {}
         
         self.model.eval()
@@ -61,9 +63,11 @@ class NFRABenchmark:
             
         return results
     
-    def benchmark_energy(self, energy_budgets: List[float] = [0.3, 0.5, 0.7, 1.0],
+    def benchmark_energy(self, energy_budgets: Optional[List[float]] = None,
                         seq_len: int = 256, batch_size: int = 4) -> Dict:
         """Test performance under different energy constraints."""
+        if energy_budgets is None:
+            energy_budgets = [0.3, 0.5, 0.7, 1.0]
         results = {}
         input_ids = torch.randint(
             0, self.model.config.vocab_size,

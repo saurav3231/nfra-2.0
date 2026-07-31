@@ -147,7 +147,10 @@ class CausalResonanceMixer(nn.Module):
         self.proj_out = nn.Linear(dim, dim)
 
         raw_decays = torch.empty(n_bands)
-        nn.init.normal_(raw_decays, mean=0.0, std=0.5)
+        # Init in logit space so sigmoid(log_decay) lands around 0.9 (well
+        # above the scan's 0.85 clamp) with spread across bands — otherwise
+        # every band starts at the clamped 0.85 and is indistinguishable.
+        nn.init.normal_(raw_decays, mean=math.log(0.9 / 0.1), std=0.5)
         self.log_decay = nn.Parameter(raw_decays)
 
         pos_freqs = torch.empty(n_bands)

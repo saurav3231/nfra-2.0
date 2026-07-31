@@ -19,10 +19,11 @@ class FractalGatedMLP(nn.Module):
     Energy budget controls number of active sub-experts and threshold.
     """
 
-    def __init__(self, dim: int, hidden_mult: float = 8.0 / 3.0, scales: List[int] = [1, 2]):
+    def __init__(self, dim: int, hidden_mult: float = 8.0 / 3.0,
+                 scales: Optional[List[int]] = None):
         super().__init__()
         self.dim = dim
-        self.scales = scales
+        self.scales = [1, 2] if scales is None else scales
         hidden_dim = int(dim * hidden_mult)
 
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -99,14 +100,14 @@ class FractalResonanceBlock(nn.Module):
     def __init__(
         self,
         dim: int,
-        scales: List[int] = [1, 2],
+        scales: Optional[List[int]] = None,
         n_bands: int = 4,
         dropout: float = 0.1,
         use_residual: bool = True,
     ):
         super().__init__()
         self.dim = dim
-        self.scales = scales
+        self.scales = [1, 2] if scales is None else scales
         self.n_bands = n_bands
         self.use_residual = use_residual
 
@@ -116,7 +117,7 @@ class FractalResonanceBlock(nn.Module):
         self.mixer = CausalResonanceMixer(dim, n_bands)
 
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = FractalGatedMLP(dim, scales=scales)
+        self.mlp = FractalGatedMLP(dim, scales=self.scales)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -393,13 +394,15 @@ class NFRA_Brain_Block(nn.Module):
        This is the brain's free-energy principle in action — the network
        minimises surprise by learning to predict its own representations.
 
-    9. TEMPORAL GRID CODING: Multi-oscillator position encoding inspired by
-       grid cells in entorhinal cortex. Creates a combinatorial temporal
-       signature for each position using learnable frequencies.
-
-    10. LATERAL INHIBITION: Within each fractal group, neurons compete via
-        group-level normalization. Winners represent the input; losers are
-        suppressed. Creates truly sparse, competitive representations.
+    Two further mechanisms live inside the block's sub-modules:
+    9. TEMPORAL GRID CODING (in BrainMixer): multi-oscillator position
+       encoding inspired by grid cells in entorhinal cortex. Creates a
+       combinatorial temporal signature for each position using learnable
+       frequencies.
+    10. LATERAL INHIBITION (optional, in BrainMLP): k-WTA winner-take-all
+        sparsity. When config.k_wta_frac > 0 only the top-k fraction of
+        hidden units survive per token (input-dependent sparsity, no extra
+        parameters). Off by default.
     """
 
     def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,

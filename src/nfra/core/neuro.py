@@ -16,7 +16,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 import math
 
-from .resonance import parallel_gated_scan, parallel_scan_time_varying
+from .resonance import parallel_scan_time_varying
 
 
 class NeuroModulator(nn.Module):
@@ -239,7 +239,6 @@ class BrainMixer(nn.Module):
         # (small dt) vs when to forget (large dt) for each token/head.
         self.dt_proj = nn.Linear(dim, self.n_heads, bias=True)
         nn.init.zeros_(self.dt_proj.bias)
-        self.dt_norm = nn.Parameter(torch.ones(1))
 
         log_alphas = []
         target_decays = [0.90, 0.95, 0.98, 0.995]
