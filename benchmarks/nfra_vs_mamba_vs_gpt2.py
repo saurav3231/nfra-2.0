@@ -96,6 +96,11 @@ if HAS_CUDA:
         USE_AMP = True; AMP_DTYPE = torch.float16
     gmem = torch.cuda.get_device_properties(0).total_memory / 1e9
     BATCH = 48 if gmem >= 70 else 32 if gmem >= 35 else 8 if gmem >= 14 else 4
+    if DATA_SOURCE == 'wikitext2' and BATCH > 4 and gmem < 20:
+        # all 3 models + AdamW stay resident; Mamba's fp32 forward (~10 GB at
+        # batch 8) doesn't fit on a 14.5 GB T4 alongside them.
+        BATCH = 4
+    BATCH = int(os.environ.get('NFRA_BATCH', BATCH))
 else:
     BATCH = 4
     STEPS = min(STEPS, 80); EVAL_GAP = max(20, STEPS // 4)
