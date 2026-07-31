@@ -131,7 +131,11 @@ def _train_concurrent(models, steps, loaders):
     nan = [0] * n
     nullctx = contextlib.nullcontext()
     t0 = time.perf_counter()
-    for _ in range(steps):
+    prog = max(50, steps // 12)
+    for step in range(1, steps + 1):
+        if step % prog == 0 or step == steps:
+            print('[concurrent] step %d/%d  %.0fs elapsed'
+                  % (step, steps, time.perf_counter() - t0))
         for i in range(n):
             with (torch.cuda.stream(streams[i]) if HAS_CUDA else nullctx):
                 try:
