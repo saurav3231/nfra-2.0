@@ -11,10 +11,11 @@
 ║     peak memory: GB during one train step                              ║
 ║                                                                        ║
 ║   READING THE NUMBERS                                                   ║
-║     • Loss starts ~100–150 because random-init logits scale with dim.  ║
-║       It falls as the model learns — judge it by the FINAL value.      ║
-║     • Mamba/NFRA use unfused scans here; production fused kernels      ║
-║       would make them dramatically faster than shown.                 ║
+║     • All heads use GPT-2-style init (embed std 0.02), so loss starts     ║
+║       near ln(vocab) ≈ 8.3 (random guess) for every model.               ║
+║       Judge quality by the FINAL eval loss.                              ║
+║     • Mamba/NFRA use unfused scans here; production fused kernels        ║
+║       would make them dramatically faster than shown.                    ║
 ║                                                                        ║
 ║   ENV                                                                    ║
 ║     NFRA_MODE           quick(150) | standard(600) | rigorous(1500)    ║
@@ -58,7 +59,7 @@ STEPS = int(os.environ.get('NFRA_STEPS', STEP_CFG[MODE]))
 TARGET_M = float(os.environ.get('NFRA_TARGET_PARAMS', '20'))
 DIM = int(os.environ.get('NFRA_DIM', '512'))
 D_STATE = 8
-NFRA_DEPTH = 12                      # effective NFRA depth (3 unique × 4 passes)
+NFRA_DEPTH = 12                      # effective NFRA depth (unique × passes)
 EVAL_GAP = max(50, STEPS // 6)
 SEQ_LEN = 256
 SEED = 42
@@ -154,7 +155,8 @@ def hillis_prefix(a, b):
 
 
 def mamba_scan(a, b, chunk=64):
-    """Chunked associative scan (state carried across chunks → bounded memory)."""
+    """Chunked associative scan, each chunk gradient-checkpointed so backward
+    never holds more than one chunk's intermediates (bounded memory)."""
     B, _, S, D = a.shape
     n = math.ceil(S / chunk)
     pad = n * chunk - S
@@ -162,10 +164,12 @@ def mamba_scan(a, b, chunk=64):
         a = F.pad(a, (0, 0, 0, pad), value=1.0)
         b = F.pad(b, (0, 0, 0, pad), value=0.0)
     a = a.reshape(B, 1, n, chunk, D); b = b.reshape(B, 1, n, chunk, D)
+    ckpt = torch.utils.checkpoint.checkpoint
     h = torch.zeros(B, D, device=a.device)
     outs = []
     for c in range(n):
-        a_rel, b_rel = hillis_prefix(a[:, :, c], b[:, :, c])
+        a_rel, b_rel = ckpt(hillis_prefix, a[:, :, c], b[:, :, c],
+                            use_reentrant=False)
         out = a_rel * h.view(B, 1, 1, D) + b_rel
         h = out[:, :, -1, :].squeeze(1)
         outs.append(out)
@@ -202,14 +206,7 @@ class MambaBlock(nn.Module):
         u = Bm.unsqueeze(-1) * x.unsqueeze(2)
         a_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
         u_f = u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
-        if self.training and torch.is_grad_enabled():
-            # checkpoint: recompute scan in backward instead of storing ~GB of
-            # intermediates (would otherwise OOM at 11+ blocks)
-            h = torch.utils.checkpoint.checkpoint(
-                lambda a, v: mamba_scan(a, v, chunk=64), a_f, u_f,
-                use_reentrant=False)
-        else:
-            h = mamba_scan(a_f, u_f, chunk=64)
+        h = mamba_scan(a_f, u_f, chunk=64)
         h = h.view(B, S, N, E)
         y = (h * C.unsqueeze(-1)).sum(dim=2) + self.D.unsqueeze(0).unsqueeze(0) * x
         return self.out_proj(y * F.silu(z))
@@ -283,6 +280,15 @@ class GPT2ForCausalLM(nn.Module):
 
 # ─────────────────────────── helpers ───────────────────────────
 def count_params(m): return sum(p.numel() for p in m.parameters())
+
+def rescale_embed(model, std=0.02):
+    """Scale the tied embedding/lm_head to GPT-2-style init so every model
+    starts near ln(vocab) ≈ 8.3 instead of exploding logits at random init."""
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.weight.mul_(std / max(m.weight.std(), 1e-8))
+                break
 
 def tune_layers(make_fn, target, vocab):
     """Pick layer count landing closest to the target param budget."""
@@ -396,16 +402,19 @@ def main():
 
     U, p_n = tune_unique(make_nfra, target, VOCAB, NFRA_DEPTH)
     nfra = make_nfra(VOCAB, DIM, U).to(DEVICE)
+    rescale_embed(nfra)
     n_passes = NFRA_DEPTH // U
     print(f"    ✓ NFRA Brain   {p_n/1e6:6.1f}M   {U} unique blocks x {n_passes} passes "
           f"= {NFRA_DEPTH} effective layers")
 
     L_m, p_m = tune_layers(lambda v, d, L: MambaLM(v, d, L, d_state=D_STATE), target, VOCAB)
     mamba = MambaLM(VOCAB, DIM, L_m, d_state=D_STATE).to(DEVICE)
+    rescale_embed(mamba)
     print(f"    ✓ Mamba SSM    {p_m/1e6:6.1f}M   {L_m} layers (d_state={D_STATE})")
 
     L_g, p_g = tune_layers(GPT2ForCausalLM, target, VOCAB)
     gpt2 = GPT2ForCausalLM(VOCAB, DIM, L_g, n_heads=8).to(DEVICE)
+    rescale_embed(gpt2)
     print(f"    ✓ GPT-2        {p_g/1e6:6.1f}M   {L_g} layers")
 
     models = {'NFRA Brain': nfra, 'Mamba SSM': mamba, 'GPT-2': gpt2}
