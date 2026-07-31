@@ -68,6 +68,9 @@ EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
 SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
 KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
 BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation knob
+# Gradient checkpointing trades compute for memory; on a big GPU with a small
+# model the recompute is pure overhead -> set 0 to raise tok/s.
+CHECKPOINT = os.environ.get('NFRA_CHECKPOINT', '1') == '1'
 EVAL_GAP = max(50, STEPS // 6)
 EXT_FACTOR = 2                      # extrapolation test: eval at SEQ_LEN * EXT_FACTOR
 GEN_LEN = 16
@@ -101,7 +104,7 @@ def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None):
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=depth, n_bands=BANDS, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
-                     gradient_checkpointing=True, k_wta_frac=k_wta)
+                     gradient_checkpointing=CHECKPOINT, k_wta_frac=k_wta)
     return NFRAForCausalLM(cfg)
 
 
@@ -177,7 +180,7 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
     if HAS_CUDA:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-    loss_hist, eval_hist, step_ms = [], [], []
+    loss_hist, eval_hist = [], []
     nan_steps = 0
     t_start = time.perf_counter()
     for step in range(1, steps + 1):
@@ -188,7 +191,6 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
             x, y = next(it)
         x, y = x.to(DEVICE), y.to(DEVICE)
         opt.zero_grad()
-        t0 = time.perf_counter()
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
             loss = compute_loss(model, x, y, surprise=surprise)
         if scaler:
@@ -208,13 +210,13 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
             else:
                 opt.zero_grad(set_to_none=True)
                 nan_steps += 1
-        if HAS_CUDA:
-            torch.cuda.synchronize()
-        step_ms.append((time.perf_counter() - t0) * 1000)
         sched.step()
         if ema is not None:
             ema.update(model)
-        loss_hist.append(float(loss.detach().cpu()))
+        # Defer the loss materialization: reading a CUDA scalar syncs the
+        # device, which would stall the pipeline every step. Collect detached
+        # tensors now, flatten to floats once after the loop's single sync.
+        loss_hist.append(loss.detach())
         if step % eval_gap == 0 or step == steps:
             if ema is not None:
                 ema.apply(model)
@@ -223,14 +225,17 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
                 ema.restore(model)
     if ema is not None:
         ema.apply(model)   # leave EMA weights in place for downstream evals
+    if HAS_CUDA:
+        torch.cuda.synchronize()   # single sync: drain queued work once
     wall = time.perf_counter() - t_start
+    loss_hist = [float(v) for v in loss_hist]
     mem = torch.cuda.max_memory_allocated() / 1e9 if HAS_CUDA else 0.0
     bs = getattr(train_loader, 'batch_size', 1)
     seq = SEQ_LEN
     return {
         'loss_hist': loss_hist, 'eval_hist': eval_hist,
         'tok_s': bs * seq * steps / max(wall, 1e-6),
-        'ms_per_step': sum(step_ms) / max(len(step_ms), 1),
+        'ms_per_step': wall * 1000.0 / steps,
         'peak_mem': mem, 'nan_steps': nan_steps, 'wall_s': wall,
     }
 
