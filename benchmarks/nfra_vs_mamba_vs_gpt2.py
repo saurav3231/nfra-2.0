@@ -203,7 +203,7 @@ class MambaBlock(nn.Module):
         self.dt_proj = nn.Linear(d_state, d_inner, bias=True)
         with torch.no_grad():
             self.dt_proj.bias.copy_(torch.log(torch.full_like(self.dt_proj.bias, 0.1)))
-        self.A_log = nn.Parameter(torch.randn(d_state))
+        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32)))
         self.D = nn.Parameter(torch.randn(d_inner))
         self.out_proj = nn.Linear(d_inner, dim, bias=False)
 
@@ -475,9 +475,13 @@ def main():
                 loss = compute_loss(m, x, y)
             if scalers[name]:
                 scalers[name].scale(loss).backward()
+                scalers[name].unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
                 scalers[name].step(opt); scalers[name].update()
             else:
-                loss.backward(); opt.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                opt.step()
             if HAS_CUDA:
                 torch.cuda.synchronize()
             step_ms[name].append((time.perf_counter() - t0) * 1000)
