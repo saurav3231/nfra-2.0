@@ -372,6 +372,7 @@ def measure_speed_memory(model, vocab, n_steps=10):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
     if HAS_CUDA:
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(n_steps):
