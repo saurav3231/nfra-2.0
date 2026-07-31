@@ -10,6 +10,16 @@
 ║     throughput : training tok/s (pure-PyTorch; no fused kernels)       ║
 ║     peak memory: GB during one train step                              ║
 ║                                                                        ║
+║   CONFIGURATIONS                                                        ║
+║     • All models matched on params (~20M) and effective depth (12).     ║
+║     • NFRA runs depth-shared: {U unique blocks} reused for the full     ║
+║       depth — a core NFRA design point. U and dim are tuned jointly     ║
+║       so NFRA gets several DISTINCT blocks within budget. A pure        ║
+║       1-block x depth-passes 'recurrent' config is also a valid NFRA    ║
+║       setting but is intentionally NOT used for the head-to-head.       ║
+║     • NFRA uses per-layer gradient checkpointing; Mamba's scan is       ║
+║       checkpointed per chunk and run in fp32 (fp16 overflow → NaN).     ║
+║                                                                        ║
 ║   READING THE NUMBERS                                                   ║
 ║     • All heads use GPT-2-style init (embed std 0.02), so loss starts     ║
 ║       near ln(vocab) ≈ 8.3 (random guess) for every model.               ║
@@ -134,7 +144,8 @@ class HierarchicalDataset(Dataset):
 def make_nfra(vocab, dim, unique_blocks):
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=NFRA_DEPTH, n_bands=16, dropout=0.1,
-                     depth_shared=True, unique_blocks=unique_blocks)
+                     depth_shared=True, unique_blocks=unique_blocks,
+                     gradient_checkpointing=True)
     return NFRAForCausalLM(cfg)
 
 
@@ -154,7 +165,7 @@ def hillis_prefix(a, b):
     return a_cur, b_cur
 
 
-def mamba_scan(a, b, chunk=64):
+def mamba_scan(a, b, chunk=256):
     """Chunked associative scan run in fp32 (state recurrence is numerically
     sensitive; fp16 can overflow and NaN the loss), each chunk gradient-
     checkpointed so backward never holds more than one chunk."""
@@ -209,7 +220,7 @@ class MambaBlock(nn.Module):
         u = Bm.unsqueeze(-1) * x.unsqueeze(2)
         a_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
         u_f = u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
-        h = mamba_scan(a_f, u_f, chunk=64)
+        h = mamba_scan(a_f, u_f)
         h = h.view(B, S, N, E)
         y = (h * C.unsqueeze(-1)).sum(dim=2) + self.D.unsqueeze(0).unsqueeze(0) * x
         return self.out_proj(y * F.silu(z))
@@ -312,14 +323,24 @@ def tune_layers(make_fn, target, vocab):
         prev = p
     return best
 
-def tune_unique(make_fn, target, vocab, depth):
-    """Pick NFRA unique-block count (depth-shared, effective depth fixed)."""
-    best = (1, float('inf'))
-    for U in range(1, depth + 1):
-        p = count_params(make_fn(vocab, DIM, U))
-        if abs(p - target) < abs(best[1] - target):
-            best = (U, p)
-    return best
+def tune_nfra(make_fn, target, vocab, depth, min_dim=224):
+    """Jointly tune NFRA unique_blocks and hidden dim so it lands near the
+    param budget with at least a couple of DISTINCT blocks (real layer
+    diversity — a pure 1-block x depth-passes 'recurrent' config is also a
+    valid NFRA setting, but not the one used for the head-to-head)."""
+    dims = [512, 448, 384, 352, 320, 288, 256, 224, 192, 160, 128]
+    best = None
+    for U in range(2, min(depth, 8) + 1):
+        for d in dims:
+            if d < min_dim:
+                continue
+            p = count_params(make_fn(vocab, d, U))
+            err = abs(p - target)
+            if best is None or err < best[0]:
+                best = (err, U, d, p)
+    if best is None:
+        return 1, DIM, count_params(make_fn(vocab, DIM, 1))
+    return best[1], best[2], best[3]
 
 def make_optimizer(model, lr=3e-4, warmup=50, total=STEPS):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95))
@@ -403,12 +424,12 @@ def main():
     # ── build models, matched on params
     print("\n[2/5] Building models (param-matched to ~%.0fM) ..." % TARGET_M)
 
-    U, p_n = tune_unique(make_nfra, target, VOCAB, NFRA_DEPTH)
-    nfra = make_nfra(VOCAB, DIM, U).to(DEVICE)
+    U, n_dim, p_n = tune_nfra(make_nfra, target, VOCAB, NFRA_DEPTH)
+    nfra = make_nfra(VOCAB, n_dim, U).to(DEVICE)
     rescale_embed(nfra)
     n_passes = NFRA_DEPTH // U
     print(f"    ✓ NFRA Brain   {p_n/1e6:6.1f}M   {U} unique blocks x {n_passes} passes "
-          f"= {NFRA_DEPTH} effective layers")
+          f"= {NFRA_DEPTH} effective layers (dim {n_dim})")
 
     L_m, p_m = tune_layers(lambda v, d, L: MambaLM(v, d, L, d_state=D_STATE), target, VOCAB)
     mamba = MambaLM(VOCAB, DIM, L_m, d_state=D_STATE).to(DEVICE)
