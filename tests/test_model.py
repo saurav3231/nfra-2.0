@@ -82,6 +82,53 @@ def test_save_load_roundtrip(tmp_path):
     assert torch.allclose(a, b, atol=1e-5)
 
 
+def test_brain_learns_short_recall():
+    """Smoke test: NFRA Brain must LEARN a 2-step recall task (drop below the
+    ln(16) floor) on a tiny CPU config. Guards against the block wiring
+    starving the recurrence entirely. NOTE: this does NOT reproduce the H3
+    flat-at-floor failure (dim 224 / 600 steps / k>=4), so it is not a
+    regression test for that bug — that regime needs GPU (see
+    nfra.benchmark.recall_diag)."""
+    import math
+    import numpy as np
+
+    V, k, seq = 16, 2, 32
+    torch.manual_seed(0)
+    cfg = NFRAConfig(mode="brain", vocab_size=V, hidden_size=64,
+                     num_layers=6, unique_blocks=2, dropout=0.0,
+                     gradient_checkpointing=False)
+    model = NFRAForCausalLM(cfg)
+    from nfra.benchmark.compare import rescale_embed
+    rescale_embed(model)
+
+    rng = np.random.RandomState(0)
+    keys = rng.randint(0, V, size=(8, seq + 1))
+    toks = np.empty_like(keys)
+    for t in range(seq + 1):
+        src = t - k
+        if src >= 0:
+            toks[:, t] = (keys[:, src] + 1) % V
+        else:
+            toks[:, t] = rng.randint(0, V, size=8)
+    x = torch.from_numpy(toks[:, :-1]).long()
+    y = torch.from_numpy(toks[:, 1:]).long()
+
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    losses = []
+    for _ in range(40):
+        opt.zero_grad()
+        loss = torch.nn.functional.cross_entropy(
+            model(x)["logits"].reshape(-1, V), y.reshape(-1))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        losses.append(loss.item())
+
+    floor = math.log(V)
+    assert losses[-1] < floor - 0.03, f"stuck at floor: {losses[-1]:.3f}"
+    assert losses[-1] < losses[0] - 0.1, f"no learning: {losses[0]:.3f}->{losses[-1]:.3f}"
+
+
 def test_energy_allocator_no_graph_leak():
     a = DynamicEnergyBudgetAllocator(4)
     b1 = a()

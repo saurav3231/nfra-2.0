@@ -394,10 +394,13 @@ class NFRA_Brain_Block(nn.Module):
        the routing and thinking depth decisions.
 
     8. PREDICTIVE FORWARD: Each block generates a top-down prediction of its
-       own input, then processes only the prediction error (surprise).
-       When predictions are accurate, processing cost is near zero.
-       This is the brain's free-energy principle in action — the network
-       minimises surprise by learning to predict its own representations.
+       own input and uses the prediction error (surprise) as a gating signal:
+       surprising tokens take the deep recurrence/attention stream, predictable
+       tokens take the cheap gist stream. The residual is always the input x
+       (never the prediction), so the recurrence can never be starved by a
+       predictor collapsing toward identity. This is the brain's free-energy
+       principle in action — the network minimises surprise by learning to
+       predict its own representations.
 
     Two further mechanisms live inside the block's sub-modules:
     9. TEMPORAL GRID CODING (in BrainMixer): multi-oscillator position
@@ -473,12 +476,20 @@ class NFRA_Brain_Block(nn.Module):
         depth_f = 1.0 + da * (self.max_thinking_depth - 1)
         depth_f = depth_f.clamp(1.0, self.max_thinking_depth)
 
-        # Predictive surprise (free-energy): process only the prediction error
+        # Predictive surprise (free-energy): predict the input, then route
+        # processing by how surprising the token is. The prediction error must
+        # NOT be the block's main input or residual: `residual = prediction`
+        # with `n = ln1(error)` made identity a degenerate attractor — once
+        # predictor -> I (x -> x), error -> 0, ln1(0) = 0 with ZERO gradient,
+        # so the recurrence/attention streams died and the whole block reduced
+        # to a per-token pass-through with no memory (recall probes never even
+        # fit the training set). The residual is `x`; the error only gates
+        # gist-vs-deep, preserving the free-energy intent without the collapse.
         prediction = self.predictor(x)
         error = x - prediction
 
-        residual = prediction
-        n = self.ln1(error)
+        residual = x
+        n = self.ln1(x)
 
         # Surprise-gated routing: surprising tokens take the deep stream,
         # well-predicted tokens take the cheap gist stream (one matmul).
