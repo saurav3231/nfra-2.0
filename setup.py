@@ -17,11 +17,11 @@ with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
 
 setup(
     name="nfra",
-    version="0.1.0",
+    version="3.1.0",
     description="NeuroFractal Resonance Architecture - Brain-inspired efficient neural networks",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Saurav Bhandari",
+    author="SAURAV BHANDARI",
     author_email="saurav@nfra.ai",
     url="https://github.com/saurav3231/nfra-2.0",
     project_urls={

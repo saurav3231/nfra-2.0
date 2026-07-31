@@ -3,10 +3,12 @@ NFRA 3.0 — NeuroFractal Resonance Architecture
 
 A brain-inspired neural network with efficient multi-band sequence mixing
 and fractal gated MLPs for ultra-low-power and legacy hardware.
+
+Author: SAURAV BHANDARI
 """
 
 __version__ = "3.1.0"
-__author__ = "NFRA Research Team"
+__author__ = "SAURAV BHANDARI"
 __license__ = "MIT"
 
 from .core import (
