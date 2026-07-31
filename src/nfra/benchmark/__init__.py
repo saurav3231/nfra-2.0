@@ -6,5 +6,6 @@ matched on params, identical data + optimizer.
 """
 
 from .compare import main
+from .arena import main as arena_main
 
-__all__ = ["main"]
+__all__ = ["main", "arena_main"]

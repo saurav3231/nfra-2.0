@@ -14,7 +14,7 @@ class ModelConfig:
     vocab_size: int = 50257
     hidden_size: int = 512
     num_layers: int = 8
-    fractal_scales: List[int] = None
+    fractal_scales: Optional[List[int]] = None
     dropout: float = 0.1
 
 

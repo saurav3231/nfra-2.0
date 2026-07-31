@@ -22,7 +22,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="SAURAV BHANDARI",
-    author_email="saurav@nfra.ai",
+    author_email="bhandarisaurav15@gmail.com",
     url="https://github.com/saurav3231/nfra-2.0",
     project_urls={
         "Documentation": "https://github.com/saurav3231/nfra-2.0#readme",

@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "SAURAV BHANDARI", email = "saurav@nfra.ai"}
+    {name = "SAURAV BHANDARI", email = "bhandarisaurav15@gmail.com"}
 ]
 keywords = [
     "neural-networks",
