@@ -347,10 +347,18 @@ class BrainMLP(nn.Module):
     When cortisol is high, low-weighted groups are zeroed — the model
     dynamically shrinks its effective capacity under metabolic stress.
     This mirrors the brain's energy conservation under threat.
+
+    Lateral inhibition (k-WTA): when k_wta_frac > 0, only the top-k
+    fraction of hidden units survive per token (winner-take-all). This is
+    input-dependent, structured sparsity — no extra parameters, no skipped
+    compute, just capacity placement focused on the winning dimensions.
     """
 
-    def __init__(self, dim: int, hidden_mult: float = 4.0):
+    def __init__(self, dim: int, hidden_mult: float = 4.0,
+                 k_wta_frac: float = 0.0):
         super().__init__()
+        self.dim = dim
+        self.k_wta_frac = k_wta_frac
         hidden_dim = int(dim * hidden_mult)
 
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -423,5 +431,13 @@ class BrainMLP(nn.Module):
         if hormones is not None:
             ne = hormones[:, 1:2].view(B, 1, 1)
             hidden = hidden * (1.0 + 0.5 * ne)
+
+        # Lateral inhibition (k-WTA): keep only the top-k fraction of units
+        # per token. The threshold comes from the k-th largest value, so the
+        # mask is data-dependent (input-dependent sparsity).
+        if self.k_wta_frac > 0.0:
+            k = max(1, int(math.ceil(self.k_wta_frac * hidden.shape[-1])))
+            thr = hidden.topk(k, dim=-1).values[..., -1:]
+            hidden = hidden * (hidden >= thr).float()
 
         return self.down_proj(hidden)

@@ -44,6 +44,11 @@ class NFRAConfig:
     # reused over multiple passes → far fewer params at equal depth.
     depth_shared: bool = False
     unique_blocks: int = 4
+
+    # k-WTA lateral inhibition in the Brain MLP: keep only the top-k fraction
+    # of hidden units per token (0.0 = off). Input-dependent sparsity, no
+    # extra params or skipped compute.
+    k_wta_frac: float = 0.0
     
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
@@ -123,12 +128,12 @@ class NFRAForCausalLM(nn.Module):
             self.n_unique = config.num_layers
             self.depth_passes = 1
 
+        block_kwargs = dict(dim=config.hidden_size, n_bands=config.n_bands,
+                            dropout=config.dropout)
+        if config.mode == "brain":
+            block_kwargs['k_wta_frac'] = config.k_wta_frac
         self.layers = nn.ModuleList([
-            block(
-                dim=config.hidden_size,
-                n_bands=config.n_bands,
-                dropout=config.dropout,
-            )
+            block(**block_kwargs)
             for _ in range(self.n_unique)
         ])
 

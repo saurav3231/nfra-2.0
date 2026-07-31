@@ -173,6 +173,9 @@ The credible one. Answers **"who wins on which aspect"** and **"is NFRA really r
 | `NFRA_BATCH` | auto | Override training batch size |
 | `NFRA_TARGET_PARAMS` | `20` | Target params (M) for `compare` |
 | `NFRA_DIM` | `512` | Hidden size for `compare` |
+| `NFRA_EMA` | `0` | EMA weight-averaging decay (e.g. `0.999`); eval uses averaged weights. Applied to all families for a fair head-to-head |
+| `NFRA_SURPRISE` | `0` | `1` = surprise-weighted (dopamine-RPE) gradients; mean-preserving weights. Applied to all families |
+| `NFRA_KWTA` | `0` | k-WTA lateral inhibition fraction for NFRA (e.g. `0.5`); `0` = off |
 
 #### Outputs
 

@@ -403,7 +403,7 @@ class NFRA_Brain_Block(nn.Module):
     """
 
     def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,
-                 max_thinking_depth: int = 3):
+                 max_thinking_depth: int = 3, k_wta_frac: float = 0.0):
         super().__init__()
         self.dim = dim
         self.max_thinking_depth = max_thinking_depth
@@ -437,7 +437,7 @@ class NFRA_Brain_Block(nn.Module):
         )
 
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = BrainMLP(dim, hidden_mult=4.0)
+        self.mlp = BrainMLP(dim, hidden_mult=4.0, k_wta_frac=k_wta_frac)
 
         self.dropout = nn.Dropout(dropout)
 

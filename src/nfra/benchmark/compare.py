@@ -80,6 +80,12 @@ MODE = os.environ.get('NFRA_MODE', 'standard')
 STEPS = int(os.environ.get('NFRA_STEPS', STEP_CFG[MODE]))
 TARGET_M = float(os.environ.get('NFRA_TARGET_PARAMS', '20'))
 DIM = int(os.environ.get('NFRA_DIM', '512'))
+# NFRA 3.2 feature toggles (applied to ALL families when enabled, so the
+# head-to-head stays fair): EMA weight averaging for eval, surprise-weighted
+# (RPE) gradients, and k-WTA lateral inhibition (NFRA architecture only).
+EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
+SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
+KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
 D_STATE = 8
 NFRA_DEPTH = 12                      # effective NFRA depth (unique × passes)
 EVAL_GAP = max(50, STEPS // 6)
@@ -109,7 +115,7 @@ if HAS_CUDA:
 else:
     BATCH = 4
     STEPS = min(STEPS, 80); EVAL_GAP = max(20, STEPS // 4)
-    print("  [warn] CPU mode — few steps, speed numbers are not representative")
+    print("  [warn] CPU mode - few steps, speed numbers are not representative")
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 
@@ -200,11 +206,13 @@ class WikiText2Dataset(Dataset):
 
 
 # ─────────────────────────── models ───────────────────────────
-def make_nfra(vocab, dim, unique_blocks):
+def make_nfra(vocab, dim, unique_blocks, k_wta=None):
+    if k_wta is None:
+        k_wta = KWTA
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=NFRA_DEPTH, n_bands=16, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
-                     gradient_checkpointing=True)
+                     gradient_checkpointing=True, k_wta_frac=k_wta)
     return NFRAForCausalLM(cfg)
 
 
@@ -420,9 +428,62 @@ def make_optimizer(model, lr=3e-4, warmup=50, total=STEPS):
         return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))
     return opt, torch.optim.lr_scheduler.LambdaLR(opt, sched)
 
-def compute_loss(model, x, y):
+class EMA:
+    """Exponential moving average of model weights (zero-cost at inference).
+
+    Shadow weights are updated every optimizer step: shadow = decay*shadow +
+    (1-decay)*param. At eval time the EMA weights are temporarily swapped in,
+    then restored. Lowers eval loss on small models at no extra inference cost.
+    """
+
+    def __init__(self, model, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {
+            k: v.detach().clone().float()
+            for k, v in model.named_parameters() if v.requires_grad
+        }
+        self._backup = {}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.named_parameters():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(),
+                                                     alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply(self, model):
+        self._backup = {
+            k: v.detach().clone()
+            for k, v in model.named_parameters() if k in self.shadow
+        }
+        for k, v in model.named_parameters():
+            if k in self.shadow:
+                v.data.copy_(self.shadow[k])
+
+    @torch.no_grad()
+    def restore(self, model):
+        for k, v in model.named_parameters():
+            if k in self._backup:
+                v.data.copy_(self._backup[k])
+        self._backup = {}
+
+
+def compute_loss(model, x, y, surprise: bool = False):
     logits = model(x)['logits']
-    return F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+    logits = logits.view(-1, logits.size(-1))
+    targets = y.view(-1)
+    logp = logits.log_softmax(-1)
+    ce = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)   # [N]
+    if surprise:
+        # Dopamine-style reward-prediction-error weighting: tokens where the
+        # model was wrong/unsure (low P(correct) → high surprise) get higher
+        # gradient weight. Weights are normalized to mean 1, so the effective
+        # learning rate is unchanged (mean-preserving).
+        w = 1.0 - torch.exp(-ce)                                # surprise in (0,1)
+        w = w / (w.mean() + 1e-6)
+        return (ce * w).mean()
+    return ce.mean()
 
 @torch.no_grad()
 def evaluate(model, loader, max_batches=15):
@@ -481,6 +542,15 @@ def main():
     print(f"  params  : ~{TARGET_M:.0f}M    steps: {STEPS}    batch: {BATCH}")
     print(f"  device  : {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'}"
           + ("   (fp16 AMP)" if USE_AMP else ""))
+    feats = []
+    if EMA_DECAY > 0:
+        feats.append(f"EMA={EMA_DECAY}")
+    if SURPRISE:
+        feats.append("surprise-weighted loss")
+    if KWTA > 0:
+        feats.append(f"k-WTA={KWTA}")
+    if feats:
+        print(f"  features: {', '.join(feats)}  (NFRA 3.2 toggles; apply to all families)")
     print("=" * 66)
 
     # ── data
@@ -535,6 +605,7 @@ def main():
     loaders = {n: iter(train_loader) for n in models}
     scalers = {n: (torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None) for n in models}
     step_ms = {n: [] for n in models}
+    emas = {n: (EMA(m, EMA_DECAY) if EMA_DECAY > 0 else None) for n, m in models.items()}
 
     for step in range(1, STEPS + 1):
         for name, m in models.items():
@@ -547,7 +618,7 @@ def main():
             opt.zero_grad()
             t0 = time.perf_counter()
             with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
-                loss = compute_loss(m, x, y)
+                loss = compute_loss(m, x, y, surprise=SURPRISE)
             if scalers[name]:
                 scalers[name].scale(loss).backward()
                 scalers[name].unscale_(opt)
@@ -566,10 +637,18 @@ def main():
                 torch.cuda.synchronize()
             step_ms[name].append((time.perf_counter() - t0) * 1000)
             sched.step()
+            if emas[name] is not None:
+                emas[name].update(m)
             history[name]['loss'].append(loss.item())
 
         if step % EVAL_GAP == 0 or step == 1 or step == STEPS:
-            evals = {n: evaluate(m, eval_loader) for n, m in models.items()}
+            evals = {}
+            for n, m in models.items():
+                if emas[n] is not None:
+                    emas[n].apply(m)
+                evals[n] = evaluate(m, eval_loader)
+                if emas[n] is not None:
+                    emas[n].restore(m)
             for n in models:
                 history[n]['eval'].append((step, evals[n]))
             line = f"    step {step:>5d}/{STEPS}   eval loss:  " + \

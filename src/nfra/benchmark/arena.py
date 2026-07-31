@@ -42,7 +42,7 @@ from nfra import NFRAConfig, NFRAForCausalLM
 from nfra.benchmark.compare import (
     MambaLM, GPT2ForCausalLM, HierarchicalDataset, WikiText2Dataset,
     count_params, rescale_embed, compute_loss, evaluate, make_optimizer,
-    DEVICE, HAS_CUDA, USE_AMP, BATCH, D_STATE, SEQ_LEN, DATA_SOURCE,
+    EMA, DEVICE, HAS_CUDA, USE_AMP, BATCH, D_STATE, SEQ_LEN, DATA_SOURCE,
     NFRA_DEPTH, WIKI_PATHS, CHAR_VOCAB,
 )
 
@@ -60,6 +60,11 @@ SEED_CNT = int(os.environ.get('NFRA_SEEDS', '3' if MODE == 'rigorous' else '2'))
 SEED_LIST = [42, 7, 2026, 1337, 777][:SEED_CNT]
 FAMILIES = [f.strip().lower() for f in
             os.environ.get('NFRA_FAMILIES', 'nfra,mamba,gpt2').split(',') if f.strip()]
+# NFRA 3.2 feature toggles. EMA + surprise-weighted loss apply to ALL families
+# (fair head-to-head); k-WTA is an NFRA architecture change only.
+EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
+SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
+KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
 EVAL_GAP = max(50, STEPS // 6)
 EXT_FACTOR = 2                      # extrapolation test: eval at SEQ_LEN * EXT_FACTOR
 GEN_LEN = 16
@@ -87,11 +92,13 @@ METRIC_SPEC = [
 
 
 # ─────────────────────────── builders ───────────────────────────
-def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH):
+def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None):
+    if k_wta is None:
+        k_wta = KWTA
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=depth, n_bands=16, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
-                     gradient_checkpointing=True)
+                     gradient_checkpointing=True, k_wta_frac=k_wta)
     return NFRAForCausalLM(cfg)
 
 
@@ -156,11 +163,13 @@ def build_family_spec(family, size, vocab):
 
 
 # ─────────────────────────── training ───────────────────────────
-def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap):
+def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap,
+              ema_decay=0.0, surprise=False):
     model.train()
     opt, sched = make_optimizer(model, lr=3e-4,
                                 warmup=min(50, max(steps // 10, 1)), total=steps)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
+    ema = EMA(model, ema_decay) if ema_decay > 0 else None
     it = iter(train_loader)
     if HAS_CUDA:
         torch.cuda.empty_cache()
@@ -178,7 +187,7 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap):
         opt.zero_grad()
         t0 = time.perf_counter()
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
-            loss = compute_loss(model, x, y)
+            loss = compute_loss(model, x, y, surprise=surprise)
         if scaler:
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -200,9 +209,17 @@ def train_one(model, vocab, steps, train_loader, eval_loader, eval_gap):
             torch.cuda.synchronize()
         step_ms.append((time.perf_counter() - t0) * 1000)
         sched.step()
+        if ema is not None:
+            ema.update(model)
         loss_hist.append(float(loss.detach().cpu()))
         if step % eval_gap == 0 or step == steps:
+            if ema is not None:
+                ema.apply(model)
             eval_hist.append((step, evaluate(model, eval_loader)))
+            if ema is not None:
+                ema.restore(model)
+    if ema is not None:
+        ema.apply(model)   # leave EMA weights in place for downstream evals
     wall = time.perf_counter() - t_start
     mem = torch.cuda.max_memory_allocated() / 1e9 if HAS_CUDA else 0.0
     bs = getattr(train_loader, 'batch_size', 1)
@@ -401,6 +418,15 @@ def main():
     print(f"  families : {FAMILIES}    batch: {BATCH}    seq: {SEQ_LEN}")
     print(f"  device   : {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'}"
           + (f"   (fp16 AMP)" if USE_AMP else ""))
+    feats = []
+    if EMA_DECAY > 0:
+        feats.append(f"EMA={EMA_DECAY}")
+    if SURPRISE:
+        feats.append("surprise-weighted loss")
+    if KWTA > 0:
+        feats.append(f"k-WTA={KWTA}")
+    if feats:
+        print(f"  features : {', '.join(feats)}")
     print("=" * 72)
 
     env = {
@@ -411,6 +437,9 @@ def main():
         'gpu_mem_gb': round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
         if HAS_CUDA else None,
         'python': sys.version.split()[0],
+        'ema': EMA_DECAY,
+        'surprise': int(SURPRISE),
+        'kwta': KWTA,
     }
 
     # ── build specs per size
@@ -438,7 +467,8 @@ def main():
                 model = spec['builder'](VOCAB, spec['dim'], **spec['extra']).to(DEVICE)
                 rescale_embed(model)
                 rec = train_one(model, VOCAB, STEPS, train_loaders[seed],
-                                eval_loader, EVAL_GAP)
+                                eval_loader, EVAL_GAP,
+                                ema_decay=EMA_DECAY, surprise=SURPRISE)
                 runs[size][seed][family] = rec
                 if seed == SEED_LIST[-1]:
                     ext = evaluate(model, ext_loader, max_batches=6)
