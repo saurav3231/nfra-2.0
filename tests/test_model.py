@@ -179,11 +179,16 @@ def test_brain_feature_toggles_forward_backward():
     finite gradients (CPU smoke)."""
     cfg = NFRAConfig(mode="brain", vocab_size=16, hidden_size=64,
                      num_layers=4, unique_blocks=2, dropout=0.0,
-                     local_route=True, div_norm=True, astro=True)
+                     local_route=True, div_norm=True, astro=True,
+                     theta=True, ach_retain=True, gain_nov=True, lora_rank=8)
     model = NFRAForCausalLM(cfg)
     assert model.layers[0].mlp.local_route is True
     assert model.layers[0].mlp.div_norm is True
     assert model.layers[0].mixer.astro_proj is not None
+    assert model.layers[0].mixer.theta_amp is not None
+    assert model.layers[0].mixer.ach_retain is True
+    assert model.layers[0].mixer.gain_nov is True
+    assert model.pass_lora is not None and len(model.pass_lora) == model.depth_passes
     torch.manual_seed(0)
     x = torch.randint(0, 16, (2, 32))
     out = model(x)
@@ -201,6 +206,62 @@ def test_brain_feature_toggles_off_by_default():
     assert model.layers[0].mlp.local_route is False
     assert model.layers[0].mlp.div_norm is False
     assert model.layers[0].mixer.astro_proj is None
+    assert model.layers[0].mixer.theta_amp is None
+    assert model.layers[0].mixer.ach_retain is False
+    assert model.layers[0].mixer.gain_nov is False
+    assert model.pass_lora is None
+
+
+def test_brain_levers_identity_init():
+    """Theta / novelty-gain / LoRA are identity at init (amp=0, gain=0, B=0):
+    with shared weights copied across models, enabling them must produce
+    logits IDENTICAL to the baseline. (New params consume RNG mid-construction,
+    so models can't share init via the same seed — copy weights by name.)"""
+    base = NFRAForCausalLM(NFRAConfig(mode="brain", vocab_size=16,
+                                      hidden_size=64, num_layers=4,
+                                      unique_blocks=2, dropout=0.0))
+    on = NFRAForCausalLM(NFRAConfig(mode="brain", vocab_size=16,
+                                    hidden_size=64, num_layers=4,
+                                    unique_blocks=2, dropout=0.0,
+                                    theta=True, gain_nov=True, lora_rank=8))
+    on_state = dict(on.named_parameters())
+    with torch.no_grad():
+        for n, p in base.named_parameters():
+            on_state[n].copy_(p)
+    # sanity: identity-init params really are at identity
+    assert on.layers[0].mixer.theta_amp.abs().max().item() == 0.0
+    assert on.layers[0].mixer.gain_nov_w.item() == 0.0
+    assert all(l.B.abs().max().item() == 0.0 for l in on.pass_lora)
+    base.eval(); on.eval()
+    x = torch.randint(0, 16, (2, 32))
+    with torch.no_grad():
+        a = base(x)["logits"]
+        b = on(x)["logits"]
+    assert (a - b).abs().max().item() < 1e-5, \
+        "theta/gain_nov/lora must be identity at init"
+    assert sum(p.numel() for p in on.parameters()) > \
+        sum(p.numel() for p in base.parameters()), "lora must add params"
+
+
+def test_brain_no_future_leak_all_levers():
+    """Strict causality must hold even with every future-safe lever enabled
+    (theta is t-only, gain_nov is a causal prefix variance, lora is per-token,
+    ach_retain is per-token)."""
+    torch.manual_seed(0)
+    cfg = NFRAConfig(mode="brain", vocab_size=16, hidden_size=64,
+                     num_layers=4, unique_blocks=2, dropout=0.0,
+                     theta=True, ach_retain=True, gain_nov=True, lora_rank=8)
+    model = NFRAForCausalLM(cfg)
+    model.eval()
+    x = torch.randint(0, 16, (2, 24))
+    with torch.no_grad():
+        a = model(x)["logits"]
+        xp = x.clone()
+        xp[:, 17] = (xp[:, 17] + 3) % 16
+        b = model(xp)["logits"]
+    earlier = (a[:, :8] - b[:, :8]).abs().max().item()
+    assert earlier < 1e-5, \
+        f"future token leaked into earlier logits: {earlier:.6f}"
 
 
 def test_energy_allocator_no_graph_leak():

@@ -416,7 +416,8 @@ class NFRA_Brain_Block(nn.Module):
     def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,
                  max_thinking_depth: int = 3, k_wta_frac: float = 0.0,
                  local_route: bool = False, div_norm: bool = False,
-                 astro: bool = False):
+                 astro: bool = False, theta: bool = False,
+                 ach_retain: bool = False, gain_nov: bool = False):
         super().__init__()
         self.dim = dim
         self.max_thinking_depth = max_thinking_depth
@@ -429,7 +430,9 @@ class NFRA_Brain_Block(nn.Module):
         self.predictor = nn.Linear(dim, dim, bias=False)
 
         self.ln1 = nn.LayerNorm(dim)
-        self.mixer = BrainMixer(dim, n_heads=n_bands, astro=astro)
+        self.mixer = BrainMixer(dim, n_heads=n_bands, astro=astro,
+                                theta=theta, ach_retain=ach_retain,
+                                gain_nov=gain_nov)
         self.thalamus = ThalamicGate(dim)
 
         # Lightweight sliding-window attention for content-addressable retrieval

@@ -19,6 +19,30 @@ import math
 from .resonance import parallel_scan_time_varying
 
 
+def prefix_pool(x: torch.Tensor) -> torch.Tensor:
+    """Causal per-token prefix mean: pooled_t = mean(x[0..t]).
+
+    One O(S·D) cumsum — the honest autoregressive replacement for a
+    whole-sequence pool (which leaks the future). Shared by every
+    neuromodulatory component so the reduction is computed once and the
+    causality rule lives in one place."""
+    B, S, D = x.shape
+    cnt = torch.arange(1, S + 1, device=x.device, dtype=x.dtype).view(1, S, 1)
+    return x.cumsum(1) / cnt                                # [B, S, D]
+
+
+def prefix_var(x: torch.Tensor) -> torch.Tensor:
+    """Causal per-token prefix variance: var_t = Var(x[0..t]).
+
+    E[x²]-minus-mean² over the prefix — a causal novelty/contrast signal.
+    A second cumsum pair; still O(S·D), no extra sequence state."""
+    pooled = prefix_pool(x)
+    cnt = torch.arange(1, x.shape[1] + 1, device=x.device,
+                       dtype=x.dtype).view(1, x.shape[1], 1)
+    cum2 = (x * x).cumsum(1)
+    return (cum2 / cnt - pooled * pooled).clamp(min=0.0)    # [B, S, D]
+
+
 class NeuroModulator(nn.Module):
     """
     Emotional-cognitive neuromodulatory system for NFRA Brain.
@@ -61,14 +85,11 @@ class NeuroModulator(nn.Module):
         # x.mean(dim=1) leaked FUTURE tokens into every position's hormones
         # (an autoregressive LM may not look ahead) — with a per-token prefix
         # mean each position gets its own honestly-causal "mood".
-        cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
-        pooled = x.cumsum(1) / cnt                          # [B, S, D]
-        delta = self.context_gland(pooled)                  # [B, S, n_hormones]
+        pooled = prefix_pool(x)                              # [B, S, D]
+        delta = self.context_gland(pooled)                   # [B, S, n_hormones]
 
-        cum2 = (x * x).cumsum(1)
-        var = (cum2 / cnt - pooled * pooled).clamp(min=0.0) # [B, S, D]
-        novelty = var.mean(dim=-1, keepdim=True)            # [B, S, 1]
-        delta = delta + self.novelty_gland(novelty)         # [B, S, n_hormones]
+        novelty = prefix_var(x).mean(dim=-1, keepdim=True)   # [B, S, 1]
+        delta = delta + self.novelty_gland(novelty)          # [B, S, n_hormones]
 
         raw = torch.sigmoid(delta + self.baseline.unsqueeze(0))
 
@@ -201,8 +222,7 @@ class GlobalBrainState(nn.Module):
         (state_t from the prev pass only saw tokens <= t), preserving the
         cross-pass neuromodulatory loop without leaking the future."""
         B, S, D = x.shape
-        cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
-        pooled = x.cumsum(1) / cnt                           # [B, S, D]
+        pooled = prefix_pool(x)                              # [B, S, D]
         h = torch.tanh(self.pool_proj(pooled))               # [B, S, state_dim]
         if state is not None and state.ndim == 3:
             # Per-position slow prior: state_t from the previous pass only saw
@@ -240,7 +260,8 @@ class BrainMixer(nn.Module):
     """
 
     def __init__(self, dim: int, n_heads: Optional[int] = None,
-                 astro: bool = False):
+                 astro: bool = False, theta: bool = False,
+                 ach_retain: bool = False, gain_nov: bool = False):
         super().__init__()
         self.dim = dim
         self.astro = astro
@@ -295,6 +316,36 @@ class BrainMixer(nn.Module):
         # selectivity (dt).
         self.astro_proj = nn.Linear(dim, 1, bias=False) if astro else None
 
+        # Theta-gamma rhythmic decay (TIME axis): each band carries a learnable
+        # theta rhythm that rhythmically OPENS/CLOSES its memory window, so at
+        # any moment some band is in a "record" phase — hippocampal theta-gamma
+        # coupling. Modulates α_t pre-scan, causal (depends only on t).
+        # Identity-init (amp = 0) so the lever starts exactly at baseline.
+        if theta:
+            self.theta_amp = nn.Parameter(torch.zeros(self.n_heads))
+            self.theta_freq = nn.Parameter(torch.randn(self.n_heads) * 0.5 + 2.0)
+            self.theta_phase = nn.Parameter(torch.randn(self.n_heads) * math.pi)
+        else:
+            self.theta_amp = None
+            self.theta_freq = None
+            self.theta_phase = None
+
+        # ACh-retention polarity (TIME axis): test the encoding hypothesis.
+        # Legacy prior: high ACh → forget (arousal resets context). The
+        # alternative: high ACh → HOLD memory (ACh facilitates hippocampal
+        # encoding). One division, no params.
+        self.ach_retain = ach_retain
+
+        # Novelty gain on write-in (GAIN axis): prefix-variance (novelty /
+        # contrast) scales the recurrence write `value`, so high-contrast
+        # regions write in stronger (contrast gain). Learnable scalar,
+        # identity-init (0.0). No extra sequence state.
+        self.gain_nov = gain_nov
+        if gain_nov:
+            self.gain_nov_w = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.register_parameter('gain_nov_w', None)
+
         self._dim = dim
 
     def forward(
@@ -328,8 +379,11 @@ class BrainMixer(nn.Module):
 
         dt = torch.sigmoid(self.dt_proj(x_grid)) * 2.0               # [B, S, H]
         if hormones is not None:
-            ach = hormones[:, :, 0:1]                            # high ACh → forget
-            dt = dt * (1.0 + 0.5 * ach)
+            ach = hormones[:, :, 0:1]                            # ACh per token
+            if self.ach_retain:
+                dt = dt / (1.0 + 0.5 * ach)               # high ACh → HOLD
+            else:
+                dt = dt * (1.0 + 0.5 * ach)                # legacy: high ACh → forget
         alpha = torch.exp(base_log.view(1, H, 1, Hd)
                           * dt.permute(0, 2, 1).view(B, H, S, 1))    # [B, H, S, Hd]
 
@@ -337,9 +391,25 @@ class BrainMixer(nn.Module):
         # x) scales ALL band decays together (global memory-horizon shift).
         # Causal so position t never sees future tokens. The scan then clamps.
         if self.astro_proj is not None:
-            cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
-            astro = torch.tanh(self.astro_proj(x.cumsum(1) / cnt))   # [B, S, 1]
+            astro = torch.tanh(self.astro_proj(prefix_pool(x)))   # [B, S, 1]
             alpha = alpha * (1.0 + 0.2 * astro.view(B, 1, S, 1))
+
+        # Theta-gamma rhythmic decay (TIME axis): each band's decay rhythmically
+        # opens/closes its memory window. Causal (t only), elementwise.
+        if self.theta_amp is not None:
+            tpos = torch.arange(S, device=x.device).float()
+            rhythm = torch.sin(
+                2.0 * math.pi * self.theta_freq[:, None] * tpos[None, :] / S
+                + self.theta_phase[:, None]
+            )                                                  # [H, S]
+            alpha = alpha * (1.0 + self.theta_amp.view(1, H, 1, 1)
+                             * rhythm.view(1, H, S, 1))
+
+        # Novelty gain on write-in (GAIN axis): causal prefix-variance scales
+        # the recurrence write. Identity-init (gain_nov_w = 0) at baseline.
+        if self.gain_nov:
+            nov = prefix_var(x).mean(dim=-1, keepdim=True)       # [B, S, 1]
+            value = value * (1.0 + self.gain_nov_w * nov.view(B, 1, S, 1))
 
         # Parallel closed-form time-varying scan —
         # h_t = alpha_t*h_{t-1} + gate_t*value_t (one vectorized cumsum pair)
@@ -489,7 +559,7 @@ class BrainMLP(nn.Module):
         # tokens); local + global keeps the stable coarse prior while adding
         # input-dependent per-token capacity.
         cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
-        pooled = x.cumsum(1) / cnt                             # [B, S, D]
+        pooled = prefix_pool(x)                              # [B, S, D]
         if self.local_route:
             pooled = pooled + self._local_pool(x)
         routing = self.router(pooled)

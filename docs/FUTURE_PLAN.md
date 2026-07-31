@@ -313,3 +313,18 @@ Config: `NFRA_RECALL_KS=4,16,64,128 NFRA_RECALL_DIM=224 NFRA_RECALL_CONCURRENT=1
 - Decision (user): fix both now, then overnight `global_arena` run on Kaggle T4.
 
 **Next:** commit+push → Kaggle: `pip install` → restart kernel → `python -m nfra.benchmark.recall_diag` (quick decisive) → `python -m nfra.benchmark.global_arena`; report back `global_arena_report.md` + JSON.
+
+### 2026-07-31 (post-fix) — structural changes + four new levers (all off-by-default)
+
+**Structural (shipped, 15/15 tests pass):**
+- **`prefix_pool` / `prefix_var` helpers** (`neuro.py`): one causal `cumsum` reduction shared by NeuroModulator / GlobalBrainState / astro / BrainMLP — removes 4 duplicated reductions, keeps the causality rule in one place (the leak fix's contract).
+- **AFC-LoRA per-pass (`lora_rank`, `NFRA_LORA_RANK`)** — the v0 plan's Space-axis lever, now real: one low-rank adapter per depth pass on the shared block (`y = x + (x@A)@B`, `B=0` ⇒ exact identity at init). Direct structural fix for the depth-dilution critique (6 unique blocks vs Mamba's 30 real layers) at ~0.9% params (r=8, 5M).
+
+**New creative levers (one axis each, identity-init, near-zero cost, in `global_arena` ablate):**
+- **`theta` (`NFRA_THETA`)** — Time axis. Per-band learnable theta rhythm modulates the decay *pre-scan* (`alpha *= 1 + amp·sin(2πft/S + φ)`): memory windows rhythmically open/close (hippocampal theta-gamma coupling). Causal (t-only); `amp=0` at init.
+- **`ach_retain` (`NFRA_ACH_RETAIN`)** — Time axis. One-line polarity toggle: high ACh → *hold* memory (`dt / (1+0.5·ACh)`) vs legacy high ACh → *forget* (`dt · (1+0.5·ACh)`). Tests the encoding hypothesis; zero params.
+- **`gain_nov` (`NFRA_GAIN_NOV`)** — Gain axis. Causal prefix-variance scales the recurrence *write* (`value *= 1 + w·Var(x[0..t])`, `w` learnable, init 0): high-contrast tokens are written in harder (surprise-modulated plasticity).
+
+**Verified:** 15/15 tests (new: levers-identity-init — enabling theta/gain_nov/lora is bit-identical to baseline at init; no-future-leak-with-all-levers — still exactly 0.0; levers forward/backward). Levers confirmed *live* (perturbing identity params moves logits). All-levers model still learns the corrected recall task (CE 1.79 < floor 2.77). Docs: `BRAIN_LEVERS.md` now documents all seven levers; ablate table has 14 variants (added `nfra_theta`, `nfra_achretain`, `nfra_gainnov`, `nfra_lora8`). No local training runs (CPU-only box).
+
+**Next:** overnight `global_arena` on Kaggle decides which levers pay; the corrected `recall_diag` decides the H3 root-cause question.

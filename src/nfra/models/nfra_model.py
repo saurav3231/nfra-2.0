@@ -65,6 +65,22 @@ class NFRAConfig:
     local_route: bool = False
     div_norm: bool = False
     astro: bool = False
+
+    # More brain levers (same contract: off by default, one axis, near-zero
+    # cost, identity-init so the baseline is untouched until trained).
+    # theta      : TIME axis — per-band theta-gamma rhythmic decay (memory
+    #              windows rhythmically open/close). Learnable rhythm, amp
+    #              starts at 0.
+    # ach_retain : TIME axis — ACh-retention polarity: high ACh → HOLD memory
+    #              (encoding hypothesis) instead of the legacy "forget" prior.
+    # gain_nov   : GAIN axis — causal prefix-variance (novelty/contrast) scales
+    #              the recurrence write value; learnable scalar, starts at 0.
+    # lora_rank  : SPACE axis — per-pass low-rank adapters on the depth-shared
+    #              block (0 = off). Breaks depth-sharing symmetry cheaply.
+    theta: bool = False
+    ach_retain: bool = False
+    gain_nov: bool = False
+    lora_rank: int = 0
     
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
@@ -116,6 +132,26 @@ class NFRAConfig:
             self.depth_shared = True
 
 
+class PassLoRA(nn.Module):
+    """Per-depth-pass low-rank adapter (AFC-LoRA, Space axis).
+
+    y = x + (x @ A) @ B   with A: [dim, r], B: [r, dim], and B initialized to
+    0 so the adapter is the exact identity at init (safe to enable, changes
+    nothing until trained). At rank r: two tiny matmuls (2·dim·r per token),
+    2·r·dim params per pass — far cheaper than duplicating the block. Applied
+    per depth pass it breaks depth-sharing symmetry, so the SAME shared weights
+    compute a different function at each depth (the depth-dilution fix)."""
+
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.A = nn.Parameter(torch.randn(dim, rank) * 0.02)
+        self.B = nn.Parameter(torch.zeros(rank, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + (x @ self.A) @ self.B
+
+
 class NFRAForCausalLM(nn.Module):
     """Base NFRA Model (used by all modes)"""
     
@@ -155,6 +191,9 @@ class NFRAForCausalLM(nn.Module):
             block_kwargs['local_route'] = config.local_route
             block_kwargs['div_norm'] = config.div_norm
             block_kwargs['astro'] = config.astro
+            block_kwargs['theta'] = config.theta
+            block_kwargs['ach_retain'] = config.ach_retain
+            block_kwargs['gain_nov'] = config.gain_nov
         self.layers = nn.ModuleList([
             block(**block_kwargs)
             for _ in range(self.n_unique)
@@ -172,6 +211,17 @@ class NFRAForCausalLM(nn.Module):
         else:
             self.register_parameter('pass_scale', None)
             self.register_parameter('pass_bias', None)
+
+        # Per-pass LoRA (SPACE axis): one low-rank adapter per depth pass on
+        # the shared block. B starts at 0 → exact identity at init.
+        if (config.depth_shared and self.depth_passes > 1
+                and config.lora_rank > 0):
+            self.pass_lora = nn.ModuleList([
+                PassLoRA(config.hidden_size, config.lora_rank)
+                for _ in range(self.depth_passes)
+            ])
+        else:
+            self.pass_lora = None
         
         if config.energy_aware:
             self.energy_allocator = DynamicEnergyBudgetAllocator(
@@ -243,6 +293,9 @@ class NFRAForCausalLM(nn.Module):
                         hidden_states, hormones = layer(
                             hidden_states, hormones=hormones, energy_budget=budgets[i]
                         )
+                # Per-pass LoRA: adapt this pass's output (identity at init).
+                if self.pass_lora is not None:
+                    hidden_states = self.pass_lora[p](hidden_states)
                 # Top-down global brain state: aggregate the current pass, then
                 # feed it back into the NEXT pass (slow neuromodulatory loop).
                 if self.global_brain is not None:
@@ -261,6 +314,8 @@ class NFRAForCausalLM(nn.Module):
                         )
                     else:
                         hidden_states = layer(hidden_states, energy_budget=budgets[i])
+                if self.pass_lora is not None:
+                    hidden_states = self.pass_lora[p](hidden_states)
         
         logits = self.lm_head(hidden_states)
         

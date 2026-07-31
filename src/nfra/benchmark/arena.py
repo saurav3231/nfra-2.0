@@ -71,6 +71,10 @@ KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
 LOCAL_ROUTE = os.environ.get('NFRA_LOCALROUTE', '0') == '1'
 DIV_NORM = os.environ.get('NFRA_DIVNORM', '0') == '1'
 ASTRO = os.environ.get('NFRA_ASTRO', '0') == '1'
+THETA = os.environ.get('NFRA_THETA', '0') == '1'
+ACH_RETAIN = os.environ.get('NFRA_ACH_RETAIN', '0') == '1'
+GAIN_NOV = os.environ.get('NFRA_GAIN_NOV', '0') == '1'
+LORA_RANK = int(os.environ.get('NFRA_LORA_RANK', '0'))     # 0 = off (Space axis)
 BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation knob
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
 # model the recompute is pure overhead -> set 0 to raise tok/s.
@@ -109,7 +113,8 @@ METRIC_SPEC = [
 
 # ─────────────────────────── builders ───────────────────────────
 def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
-               local_route=None, div_norm=None, astro=None):
+               local_route=None, div_norm=None, astro=None, theta=None,
+               ach_retain=None, gain_nov=None, lora_rank=0):
     if k_wta is None:
         k_wta = KWTA
     if local_route is None:
@@ -118,11 +123,21 @@ def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
         div_norm = DIV_NORM
     if astro is None:
         astro = ASTRO
+    if theta is None:
+        theta = THETA
+    if ach_retain is None:
+        ach_retain = ACH_RETAIN
+    if gain_nov is None:
+        gain_nov = GAIN_NOV
+    if not lora_rank:
+        lora_rank = LORA_RANK
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=depth, n_bands=BANDS, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
                      gradient_checkpointing=CHECKPOINT, k_wta_frac=k_wta,
-                     local_route=local_route, div_norm=div_norm, astro=astro)
+                     local_route=local_route, div_norm=div_norm, astro=astro,
+                     theta=theta, ach_retain=ach_retain, gain_nov=gain_nov,
+                     lora_rank=lora_rank)
     return NFRAForCausalLM(cfg)
 
 

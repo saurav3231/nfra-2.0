@@ -1,30 +1,37 @@
 # NFRA Brain Levers — Adaptive Computation on the Space / Gain / Time Axis
 
-**Design, examples, use cases, advantages, and what success would mean — for the three near-zero-cost brain-inspired mechanisms added to NFRA Brain:**
+**Design, examples, use cases, advantages, and what success would mean — for the seven near-zero-cost brain-inspired mechanisms added to NFRA Brain:**
 
 | Lever | Env flag | `NFRAConfig` field | Brain component | Axis it adapts |
 |-------|----------|--------------------|-----------------|----------------|
 | **Local cortical routing** | `NFRA_LOCALROUTE` | `local_route=True` | `BrainMLP` | *Space* — where capacity is placed per token |
 | **Divisive (contrast) normalization** | `NFRA_DIVNORM` | `div_norm=True` | `BrainMLP` | *Gain* — how strongly each unit responds |
 | **Astrocytic timescale homeostat** | `NFRA_ASTRO` | `astro=True` | `BrainMixer` | *Time* — how long memory persists |
+| **Theta-gamma rhythmic decay** | `NFRA_THETA` | `theta=True` | `BrainMixer` | *Time* — rhythmic memory windows |
+| **ACh-retention polarity** | `NFRA_ACH_RETAIN` | `ach_retain=True` | `BrainMixer` | *Time* — ACh→hold vs ACh→forget |
+| **Novelty gain on write-in** | `NFRA_GAIN_NOV` | `gain_nov=True` | `BrainMixer` | *Gain* — contrast scales the write |
+| **Per-pass LoRA** | `NFRA_LORA_RANK` | `lora_rank=8` | model (depth passes) | *Space* — per-depth capacity |
 
-All three are **off by default**, individually toggleable, GPU-parallel friendly, and cost effectively **zero extra parameters** (one has 0, one has `dim+1` per block, one has 0). They are the *first* of a "small but powerful" program: can a network that **adapts its own computation** — the way a cortex does — close the quality gap to much larger models, at a fraction of the memory?
+All seven are **off by default**, individually toggleable, GPU-parallel friendly, and cost effectively **near-zero extra parameters** (most have 0; the two with learnable scalars/rhythms start at identity; LoRA adds `2·depth_passes·dim·rank` and is the one lever that *does* add capacity by design). They are the *first* of a "small but powerful" program: can a network that **adapts its own computation** — the way a cortex does — close the quality gap to much larger models, at a fraction of the memory?
 
 ---
 
-## 1. Why three new levers?
+## 1. Why seven new levers?
 
 NFRA Brain already encodes six neuroscience principles (neuromodulation, cortical columns, thalamic gating, oscillatory phase, homeostatic energy, prediction error). Those are mostly *structural* — the shape of the network is fixed and the "adaptation" is baked into parameters.
 
-These three levers add something qualitatively different: **the network changes its own computation on the fly, per token and per sequence, without being told to.** Fixed-shape networks waste capacity: a static MLP routes the same fraction of units into the same groups no matter what the input is; a static recurrence forgets at the same rate no matter what the sequence needs.
+These levers add something qualitatively different: **the network changes its own computation on the fly, per token and per sequence, without being told to.** Fixed-shape networks waste capacity: a static MLP routes the same fraction of units into the same groups no matter what the input is; a static recurrence forgets at the same rate no matter what the sequence needs.
 
 Biology does not work that way:
 
 - A cortical column routes signals through *different* microcircuits depending on the **local** input neighborhood — not a single global summary.
 - Cortical neurons do not fire at a fixed gain; their response is **normalized by the contrast of the surrounding activity** (divisive normalization is arguably *the* canonical cortical computation, Heeger 1992).
 - Neurons do not hold memory with a fixed half-life; **glial cells** — the "support cells" biology long ignored — regulate synaptic strength on slow timescales, shifting the whole network's memory horizon to match the situation.
+- Hippocampal memory is not written at a constant rate; it is **paced by theta rhythms** that rhythmically open and close encoding windows (theta-gamma coupling), and **acetylcholine** sets the direction of plasticity — facilitating *encoding* when novel.
+- A cortical microcircuit does not fire with a fixed write strength; **novel/contrasty input is written in harder** (surprise-modulated plasticity).
+- Depth-shared ("universal transformer") weights run the *same* function at every depth; biology gives each processing stage its **own identity**, cheaply.
 
-These levers are a minimal, honest translation of all three into GPU code, at near-zero cost, so they can be **A/B-tested on identical hardware and data** — no hand-waving.
+These levers are a minimal, honest translation of all of these into GPU code, at near-zero cost, so they can be **A/B-tested on identical hardware and data** — no hand-waving.
 
 ---
 
@@ -35,11 +42,14 @@ Think of a language model as a computation that must place capacity (where), spe
 ```
       WHERE?              HOW MUCH?                 HOW LONG?
    local_route          div_norm                   astro
-   ─────────────────    ─────────────────          ─────────────────
+   lora_pass            gain_nov                   theta
+   ─────────────────    ─────────────────          ach_retain
    routing context =    hidden /= (1 + <h²>)       alpha *= (1 + 0.2·tanh(pool))
-   global pool + local  → each unit is rescaled    → one slow per-sequence
-   sliding-window pool  → by its own local         → signal raises/lowers
-   (window 64)          → contrast                 → every band's decay
+   global pool + local  value *= (1 + w·novelty)   alpha *= (1 + amp·sin(θ·t/S))
+   sliding-window pool  → contrast scales both    → memory windows breathe
+   (window 64)          → the recurrence write    → (theta-gamma)
+   + per-pass LoRA on   ─────────────────         ACh: dt ÷ (1+.5·ACh) (hold)
+   the shared block     GAIN AXIS                  vs dt × (1+.5·ACh) (forget)
    ─────────────────    ─────────────────          ─────────────────
    SPACE AXIS           GAIN AXIS                  TIME AXIS
 ```
@@ -249,25 +259,150 @@ If `nfra_astro` improves long-context extrapolation or sample efficiency, it est
 
 ---
 
-## 6. How the levers compose
+## 6. Lever 4 — `theta`: theta-gamma rhythmic decay (the Time axis)
 
-The three levers touch three different parts of `NFRA_Brain_Block`:
+### 6.1 Neuroscience basis
+The hippocampus does not maintain memory at a uniform strength. Its principal cells fire in **gamma bursts** whose gain is **gated by a slower theta rhythm** (4–8 Hz); each theta cycle is a "packet" during which encoding/retrieval is briefly privileged. The result: a set of memories whose *accessibility rhythmically opens and closes* over time, instead of decaying monotonically.
+
+### 6.2 Design
+Give each band its own learnable theta rhythm that modulates its decay *before* the scan:
+
+```
+alpha_t,band *= 1 + amp_band · sin(2π·f_band·t/S + φ_band)
+```
+
+`amp`, `f`, `φ` are learnable per band and **identity-init** (`amp = 0` ⇒ exactly the baseline until trained). Because `f_band` differs per band, at any moment *some* band is in its "record" phase and others in "release" — a standing wave of memory windows, at zero extra sequence state.
+
+### 6.3 Implementation
+`BrainMixer.__init__(theta=True)` adds three `[n_heads]` params; the forward multiplies `alpha` elementwise (causal, `t`-only) with `rhythm.view(1, H, S, 1)`. The scan's `alpha_min/max` clamp still bounds stability.
+
+### 6.4 Worked example
+A contract paragraph where clause 3 is referenced at position 90 and again at 250. A band whose theta window is open at both positions holds it; bands that close in between shed other material. Without rhythm, all bands decay monotonically and long-distance recall must fight the same baseline everywhere.
+
+### 6.5 Advantages
+Rhythmic (non-monotonic) memory is a *different inductive bias* than fixed decay: it can represent "available again later" — retrieval windows, not just fading traces.
+
+### 6.6 Use cases
+Long-horizon associative recall at multiple distances; code where a definition appears, is unused, then reused; any task where the right memory is **not** the most recent one.
+
+### 6.7 If it succeeds
+`nfra_theta` beating baseline on the corrected H3 recall probe at mid `k` values would show rhythmic memory is a real, learnable substrate — a genuinely novel claim for sequence models.
+
+---
+
+## 7. Lever 5 — `ach_retain`: ACh-retention polarity (the Time axis)
+
+### 7.1 Neuroscience basis
+Acetylcholine is the brain's "this is worth remembering" signal: high ACh in hippocampus **facilitates encoding** of novel material. The code's legacy prior maps high ACh → *forget* (decay ↑), which is arguably backwards for a *novelty* hormone. Which mapping is right is an empirical question — and it is a one-line toggle.
+
+### 7.2 Design
+```
+legacy (off):  dt *= 1 + 0.5·ACh      # high ACh → forget faster
+ach_retain :   dt /= 1 + 0.5·ACh      # high ACh → hold memory longer
+```
+Both are per-token, causal, zero-parameter. `dt` is the selective-decay rate; scaling it down lengthens the effective horizon exactly when the (prefix-variance-driven) novelty hormone is high.
+
+### 7.3 Implementation
+`BrainMixer.__init__(ach_retain=True)` flips the ACh branch in `forward`. No new params; the division `/(1+0.5·ACh)` is bounded (`≥1`) so decay is never amplified beyond the scan clamp.
+
+### 7.4 Worked example
+Novel tokens (high prefix-variance ⇒ high novelty gland output on some channel) carry high ACh. Under `ach_retain` they hold memory; under legacy they reset it. For associative recall, the *novel key* must be retained until its query appears — retention on novelty is exactly the right prior.
+
+### 7.5 Advantages
+Directly tests the encoding hypothesis with one bit; zero cost; composes with `theta` and `astro` (which also sit on `alpha`/`dt`).
+
+### 7.6 Use cases
+Any task where remembering *new* material matters more than discarding it: streaming/continual-style inputs, rare-token recall, novel-context generalization.
+
+### 7.7 If it succeeds
+On the H3 probe, `nfra_achretain` beating `nfra_baseline` at fixed `k` would confirm the ACh→retain mapping is the right inductive prior — and the legacy mapping gets corrected.
+
+---
+
+## 8. Lever 6 — `gain_nov`: novelty gain on write-in (the Gain axis)
+
+### 8.1 Neuroscience basis
+Plasticity is **surprise-modulated**: synapses strengthen more for unexpected/contrasty input (prediction-error weighting). The cortex writes novel material in harder, not at a constant rate.
+
+### 8.2 Design
+Scale the recurrence *write* `value` by the causal prefix-variance of the token — a contrast/novelty estimate:
+
+```
+value_t *= 1 + w · Var(x[0..t])          # w learnable, identity-init (0.0)
+```
+
+### 8.3 Implementation
+`BrainMixer.__init__(gain_nov=True)` adds one learnable scalar `gain_nov_w` (init `0.0`); the forward reuses the shared `prefix_var` reduction (already computed by the block's neuromodulator, so the extra work is one reuse of an `O(S·D)` reduction). Causal by construction.
+
+### 8.4 Worked example
+At the boundary between two regimes of a document (sudden topic change), prefix variance spikes. `gain_nov` writes that transition in with higher strength — the model "notices" regime changes.
+
+### 8.5 Advantages
+The *write* side complements `astro`/`theta`/`ach_retain` (all on decay): you can now control **how strongly** something is stored, not only how long it survives.
+
+### 8.6 Use cases
+Boundary/switchpoint modeling, dedup of redundant streams (low variance ⇒ weak writes ⇒ energy saved), episodic memory of salient events.
+
+### 8.7 If it succeeds
+Lower loss at fixed steps on mixed-context corpora, or better recall on the probe's *transition* positions, shows contrast-gated storage is load-bearing.
+
+---
+
+## 9. Lever 7 — `lora_pass`: per-pass low-rank adapters (the Space axis)
+
+### 9.1 Neuroscience basis
+Depth-shared ("universal transformer") weights run the *same* function at every depth — a pathological symmetry the brain does not have. Even a cheap per-stage identity differentiates each processing stage, letting deep stages specialize on what earlier ones leave.
+
+### 9.2 Design
+For each depth pass `p`, apply a low-rank adapter to the shared block's output:
+
+```
+y = x + (x @ A_p) @ B_p        A_p: [dim, r], B_p: [r, dim]
+```
+
+`B_p = 0` at init ⇒ **exact identity** (the lever adds capacity only as training turns it on). This is the v0 plan's **AFC-LoRA** lever and the direct structural fix for the depth-dilution critique (6 unique blocks vs Mamba's 30 real layers).
+
+### 9.3 Implementation
+`NFRAConfig(lora_rank=r)` builds `PassLoRA` adapters at the model level (`NFRAForCausalLM.pass_lora`), applied after each pass's layer loop. Cost: `2·depth_passes·dim·r` params and two tiny matmuls per token — far less than duplicating a block, but a real capacity increase per depth.
+
+### 9.4 Worked example
+Pass 0 extracts local n-grams; pass 1 (via its adapter) re-reads them under a longer-horizon prior. With identity init the adapter *starts* doing nothing and must earn its place — a clean test of whether depth-specialization actually pays.
+
+### 9.5 Advantages
+Attacks the **capacity-placement** hypothesis (the v0 "depth dilution" diagnosis) directly, at 0.1–1% parameter cost, without giving up depth sharing's memory win.
+
+### 9.6 Use cases
+Any depth-shared model that shows a capacity wall; the overnight `global_arena` ablate (`nfra_lora8`) is the decisive A/B.
+
+### 9.7 If it succeeds
+`nfra_lora8` beating baseline (and ideally closing part of the NFRA→Mamba gap) confirms the depth-dilution diagnosis and makes per-pass LoRA the first *capacity* lever that does not cost memory at inference.
+
+---
+
+## 10. How the levers compose
+
+The levers touch four different parts of `NFRA_Brain_Block`:
 
 ```
 NFRA_Brain_Block
-├── LN → ThalamicGate + BrainMixer  ── astro lives here (decay/horizon)
+├── LN → ThalamicGate + BrainMixer  ── astro / theta / ach_retain (decay·horizon)
+│                                     └── gain_nov (write strength)
 └── LN → BrainMLP  ── local_route (routing context) + div_norm (gain) live here
+Per depth pass     ── lora_pass (per-depth identity) at the model level
 ```
 
 Because they act on disjoint axes, they can be combined without interacting adversarially — and the `nfra_all` variant in the ablate suite tests exactly that. Expected synergies:
 
 - **local_route + div_norm:** routing decides *which groups get capacity*; normalization decides *how loud they are*. Together: "put capacity in the right place, at the right gain."
 - **astro + local_route:** the network simultaneously chooses *how long to remember* (astro) and *where to focus locally* (routing) — long-memory mode for a contract, then local attention for its numbered clauses.
-- **all three + k-WTA / ema / surprise:** the ablate suite measures whether the brain-inspired stack beats each lever alone, and whether it beats plain NFRA.
+- **gain_nov + ach_retain:** novel tokens are both *written harder* (gain) and *held longer* (retain) — a coherent "novelty gets stored" policy across both storage controls.
+- **theta + astro:** rhythmic windows on top of a global horizon shift — per-band bursts *within* a chosen overall memory budget.
+- **lora_pass + everything else:** per-depth specialization multiplies any per-token adaptation the block learns.
+- **all + k-WTA / ema / surprise:** the ablate suite measures whether the brain-inspired stack beats each lever alone, and whether it beats plain NFRA.
 
 ---
 
-## 7. Cost accounting (the "small" promise)
+## 11. Cost accounting (the "small" promise)
 
 At a 5M model (dim 224, 12 depth passes), measured bookkeeping:
 
@@ -276,13 +411,17 @@ At a 5M model (dim 224, 12 depth passes), measured bookkeeping:
 | `local_route` | 0 | ~`S·D` (one cumsum) | one `[B,S,D]` temp |
 | `div_norm` | 0 | ~`S·D` (square+mean) | one scalar |
 | `astro` | 225/block | ~`D` (one dot) | one scalar |
-| **Total** | **~2,700** (0.05%) | **~3× `S·D`** (≪ the `S·D²` of any MLP layer) | negligible |
+| `theta` | 48/block (amp/f/φ) | elementwise on `alpha` | one `[H,S]` temp |
+| `ach_retain` | 0 | one division | one scalar |
+| `gain_nov` | 1/block | reuse of the prefix-variance reduction | one scalar |
+| `lora_pass` (r=8) | ~2·passes·dim·8 (≈43k at 5M, 0.9%) | 2·r·dim tiny matmuls | negligible |
+| **Six non-LoRA levers** | **~1,650** (0.03%) | **~3× `S·D`** (≪ the `S·D²` of any MLP layer) | negligible |
 
-The design rule that keeps this true: **no new sequence states, no new attention, no new per-head tensors.** Everything is a reduction over existing tensors or a `dim→1` projection. This is what makes them honest "free lever" candidates rather than "new capacity that happens to help."
+The design rule that keeps this true: **no new sequence states, no new attention, no new per-head tensors.** Everything is a reduction over existing tensors or a `dim→1` projection. This is what makes them honest "free lever" candidates rather than "new capacity that happens to help." (LoRA is the one deliberate exception — it *is* capacity, bought at 0.9% of the model, and its whole question is whether per-depth specialization pays for that.)
 
 ---
 
-## 8. How to enable and test
+## 12. How to enable and test
 
 ### In code
 
@@ -293,6 +432,10 @@ cfg = NFRAConfig(
     local_route=True,   # Space  axis
     div_norm=True,      # Gain   axis
     astro=True,         # Time   axis
+    theta=True,         # Time   axis (rhythmic memory windows)
+    ach_retain=True,    # Time   axis (ACh → hold)
+    gain_nov=True,      # Gain   axis (novelty write gain)
+    lora_rank=8,        # Space  axis (per-pass capacity)
 )
 model = NFRAForCausalLM(cfg)
 ```
@@ -300,7 +443,9 @@ model = NFRAForCausalLM(cfg)
 ### Via environment (benchmarking)
 
 ```bash
-NFRA_LOCALROUTE=1 NFRA_DIVNORM=1 NFRA_ASTRO=1 python -m nfra.benchmark.compare
+NFRA_LOCALROUTE=1 NFRA_DIVNORM=1 NFRA_ASTRO=1 \
+NFRA_THETA=1 NFRA_ACH_RETAIN=1 NFRA_GAIN_NOV=1 NFRA_LORA_RANK=8 \
+python -m nfra.benchmark.compare
 ```
 
 Each flag is independent; leave any unset to keep that lever off.
@@ -309,13 +454,15 @@ Each flag is independent; leave any unset to keep that lever off.
 
 - `test_local_pool_matches_sliding_window` — `_local_pool` equals a naive manual window, including sequence-start (fewer than `local_win` tokens seen) and window edges.
 - `test_brain_feature_toggles_forward_backward` — each lever changes the forward output and still trains (backward runs, gradients finite).
-- `test_brain_feature_toggles_off_by_default` — default `NFRAConfig` keeps all three off, so existing benchmarks/results are bit-identical.
+- `test_brain_feature_toggles_off_by_default` — default `NFRAConfig` keeps all levers off, so existing benchmarks/results are bit-identical.
+- `test_brain_levers_identity_init` — theta / gain_nov / LoRA are the *exact identity* at init (amp=0, gain=0, B=0): with shared weights copied, enabling them produces identical logits.
+- `test_brain_no_future_leak_all_levers` — strict causality holds even with every future-safe lever on (theta is `t`-only, gain_nov is a causal prefix variance, LoRA is per-token).
 
 ---
 
-## 9. The experiments that will decide
+## 13. The experiments that will decide
 
-The **`ablate` phase of `global_arena`** trains 10 variants on identical data/optimizer/schedule (param-matched at the primary size):
+The **`ablate` phase of `global_arena`** trains 14 variants on identical data/optimizer/schedule (param-matched at the primary size):
 
 | Variant | Levers | Asks |
 |---------|--------|------|
@@ -323,6 +470,10 @@ The **`ablate` phase of `global_arena`** trains 10 variants on identical data/op
 | `nfra_local` | `local_route` | does spatial adaptation help alone? |
 | `nfra_divnorm` | `div_norm` | does gain normalization help alone? |
 | `nfra_astro` | `astro` | does the homeostat help alone? |
+| `nfra_theta` | `theta` | does rhythmic decay help alone? |
+| `nfra_achretain` | `ach_retain` | does ACh→retain beat ACh→forget? |
+| `nfra_gainnov` | `gain_nov` | does contrast-gated write help alone? |
+| `nfra_lora8` | `lora_rank=8` | does per-depth capacity pay for its 0.9%? |
 | `nfra_kwta` | `k_wta` | existing sparsity lever, for context |
 | `nfra_ema` / `nfra_surprise` | EMA / surprise loss | existing training levers, for context |
 | `nfra_all` | all levers + ema + surprise | does the full brain stack help most? |
@@ -334,20 +485,20 @@ The **`recall` phase** (recall_diag) separately pins the H3 root-cause question 
 
 ---
 
-## 10. Success criteria
+## 14. Success criteria
 
-A lever "wins" if, at the primary size, it improves on `nfra_baseline` on the composite score — most importantly **eval loss and sample-efficiency** — with the cost accounting of §7 intact (no meaningful speed or memory regression). Priority ordering of evidence:
+A lever "wins" if, at the primary size, it improves on `nfra_baseline` on the composite score — most importantly **eval loss and sample-efficiency** — with the cost accounting of §11 intact (no meaningful speed or memory regression). Priority ordering of evidence:
 
 1. **Quality:** eval loss drops (and stays dropped across seeds).
 2. **Sample-efficiency:** learning-curve AUC improves (learns more from fewer tokens).
 3. **Extrapolation:** 2×-context delta improves (adaptation generalizes, not just fits).
 4. **Composite:** the net score beats baseline and, ideally, closes part of the NFRA→Mamba quality gap.
 
-`nfra_all` winning *more* than each lever alone is the strong signal that the three axes are complementary, not redundant.
+`nfra_all` winning *more* than each lever alone is the strong signal that the seven axes are complementary, not redundant.
 
 ---
 
-## 11. Failure modes — and what each one teaches us
+## 15. Failure modes — and what each one teaches us
 
 | Observation | Interpretation | Action |
 |-------------|----------------|--------|
@@ -361,19 +512,19 @@ Negative results here are still valuable: NFRA is committed to *evidence*, and a
 
 ---
 
-## 12. If all three succeed — the "small but powerful" outcome
+## 16. If the levers succeed — the "small but powerful" outcome
 
-The project's thesis is that **capable AI can be made dramatically more efficient**, and that the brain's principles — not raw scale — are the path. If the three levers stack (best case: `nfra_all` gains on quality *and* sample-efficiency *and* extrapolation at 0.05% extra parameters), the claim becomes concrete and portable:
+The project's thesis is that **capable AI can be made dramatically more efficient**, and that the brain's principles — not raw scale — are the path. If the levers stack (best case: `nfra_all` gains on quality *and* sample-efficiency *and* extrapolation at 0.03–0.9% extra parameters), the claim becomes concrete and portable:
 
 - NFRA Brain stays at ~0.6 GB peak memory while reducing the quality gap to Mamba — **brain-inspired adaptive computation as a substitute for parameter count.**
-- Every lever is a standalone, trivially portable patch (zero or 225 params each) — a gift to the wider ML community: *"cortical routing, divisive normalization, and a glial homeostat, each worth studying in your own architecture."*
+- Every lever is a standalone, trivially portable patch (zero or a handful of params each) — a gift to the wider ML community: *"cortical routing, divisive normalization, a glial homeostat, rhythmic decay, ACh-retention, contrast-gated writes, and per-pass LoRA, each worth studying in your own architecture."*
 - The mechanisms open the next design questions the plan already flags: AFC-α memory, contrastive two-population gating, local-expert routing — each to be added under the same near-zero-cost discipline.
 
 And it directly serves the stated mission: **quality AI on modest hardware, for everyone** — because a 0.05%-parameter addition that improves learning is exactly the kind of win that helps a phone, a laptop, or a Raspberry Pi far more than 100 extra million parameters does.
 
 ---
 
-## 13. Design rules for future levers (this file is the contract)
+## 17. Design rules for future levers (this file is the contract)
 
 Any future mechanism admitted into `NFRA_Brain_Block` under the "lever" umbrella must satisfy:
 
@@ -386,25 +537,31 @@ Any future mechanism admitted into `NFRA_Brain_Block` under the "lever" umbrella
 
 ---
 
-## 14. FAQ
+## 18. FAQ
 
 **Q: Why not just make the model bigger?**
-A: The whole thesis is *evidence* that adaptation beats raw scale at the same cost. Each lever's cost is 0–225 params; a comparable quality gain from scale would cost millions. That is the bet this file documents.
+A: The whole thesis is *evidence* that adaptation beats raw scale at the same cost. Each lever's cost is 0–225 params (LoRA is the exception: 0.9% for a deliberate capacity question); a comparable quality gain from scale would cost millions. That is the bet this file documents.
 
 **Q: Are these always on in released configs?**
-A: No — all three default to `False`. The baseline NFRA results in the README are unchanged. The ablate experiment decides what becomes default.
+A: No — all seven default to `False`/`0`. The baseline NFRA results in the README are unchanged. The ablate experiment decides what becomes default.
 
 **Q: `div_norm` and LayerNorm both normalize — redundant?**
 A: No. LayerNorm normalizes the *input* of a layer across the dim axis; `div_norm` normalizes the *activation gain* of the hidden units by their own pooled intensity per token. One fixes input scale, the other fixes output gain. They are on different tensors and are trivially composable.
 
-**Q: Does `astro` break the parallel scan?**
-A: No. It multiplies `alpha` *before* the closed-form scan, and the scan's `alpha_min`/`alpha_max` clamp bounds the result, so the time-varying scan stays numerically safe (same guarantee the H3/audit work relies on).
+**Q: Does `astro` / `theta` break the parallel scan?**
+A: No. Both multiply `alpha` *before* the closed-form scan, and the scan's `alpha_min`/`alpha_max` clamp bounds the result, so the time-varying scan stays numerically safe (same guarantee the H3/audit work relies on). `theta` multiplies by `(1 + amp·sin(·))` with `amp` learned from an identity start; the clamp holds.
+
+**Q: Does `ach_retain` risk division-by-zero or instability?**
+A: No — it divides by `(1 + 0.5·ACh)` with `ACh ∈ [0,1]`, so the divisor is always `≥ 1`, and the resulting `dt` is strictly *smaller* (a longer horizon, the safe direction).
 
 **Q: Why a 64-token window for `local_route`?**
 A: It is the sweet spot for the regimes tested (sequences 256–1024): short enough to be genuinely "local" per token, long enough to capture meaningful recent structure. It is a single constant and a candidate for a future ablation.
 
+**Q: Why is `lora_pass` the only lever that adds real parameters?**
+A: Because it is the *capacity* lever — its entire question is whether per-depth specialization (the fix for depth dilution) pays for ~0.9% extra params. The other six stay near-zero-parameter so a win can only be attributed to the adaptive mechanism, not to added size.
+
 **Q: Can I run these on CPU?**
-A: Yes — all three are pure PyTorch reductions, no CUDA-specific code. (Real training/benchmarks should still run on the T4 as documented.)
+A: Yes — all seven are pure PyTorch reductions/elementwise ops, no CUDA-specific code. (Real training/benchmarks should still run on the T4 as documented.)
 
 **Q: Where do the results get reported?**
 A: `python -m nfra.benchmark.global_arena` produces `global_arena_report.md` (human-readable) and `global_arena_results.json` (machine-readable); the ablate section lists every lever's delta vs baseline.

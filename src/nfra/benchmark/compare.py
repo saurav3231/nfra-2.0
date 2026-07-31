@@ -89,6 +89,10 @@ KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
 LOCAL_ROUTE = os.environ.get('NFRA_LOCALROUTE', '0') == '1'
 DIV_NORM = os.environ.get('NFRA_DIVNORM', '0') == '1'
 ASTRO = os.environ.get('NFRA_ASTRO', '0') == '1'
+THETA = os.environ.get('NFRA_THETA', '0') == '1'
+ACH_RETAIN = os.environ.get('NFRA_ACH_RETAIN', '0') == '1'
+GAIN_NOV = os.environ.get('NFRA_GAIN_NOV', '0') == '1'
+LORA_RANK = int(os.environ.get('NFRA_LORA_RANK', '0'))     # 0 = off (Space axis)
 D_STATE = 8
 NFRA_DEPTH = 12                      # effective NFRA depth (unique × passes)
 EVAL_GAP = max(50, STEPS // 6)
@@ -216,7 +220,9 @@ def make_nfra(vocab, dim, unique_blocks, k_wta=None):
                      num_layers=NFRA_DEPTH, n_bands=16, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
                      gradient_checkpointing=True, k_wta_frac=k_wta,
-                     local_route=LOCAL_ROUTE, div_norm=DIV_NORM, astro=ASTRO)
+                     local_route=LOCAL_ROUTE, div_norm=DIV_NORM, astro=ASTRO,
+                     theta=THETA, ach_retain=ACH_RETAIN, gain_nov=GAIN_NOV,
+                     lora_rank=LORA_RANK)
     return NFRAForCausalLM(cfg)
 
 
