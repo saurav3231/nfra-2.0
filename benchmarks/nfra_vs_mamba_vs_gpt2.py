@@ -36,6 +36,10 @@
 ║     NFRA_TARGET_PARAMS  target params in millions (default 20)        ║
 ║     NFRA_DIM            hidden size (default 512)                      ║
 ║                                                                        ║
+║   NOTE: the synthetic bigram is a random VxV table — unlearnable at     ║
+║   small token budgets, so every model plateaus at random-guess loss.    ║
+║   Use NFRA_DATA=wikitext2 (real text) to actually differentiate them.  ║
+║                                                                        ║
 ║   Usage: python nfra_vs_mamba_vs_gpt2.py   (Kaggle T4 recommended)     ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -145,6 +149,43 @@ class HierarchicalDataset(Dataset):
     def __getitem__(self, idx):
         return (torch.from_numpy(self.data[idx, :-1]),
                 torch.from_numpy(self.data[idx, 1:]))
+
+
+# ─────────────────────────── WikiText-2 (char) ───────────────────────────
+CHAR_VOCAB = ['\n', ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+',
+              ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8',
+              '9', ':', ';', '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E',
+              'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
+              'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_',
+              'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+              'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+              '{', '|', '}', '~']
+CHAR2IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
+
+
+class WikiText2Dataset(Dataset):
+    """Character-level WikiText-2 language modeling dataset (real text)."""
+
+    def __init__(self, split: str = 'train', seq_len: int = 256):
+        super().__init__()
+        self.seq_len = seq_len
+        print(f"  └- Loading WikiText-2 ({split})...", end=' ')
+        text = load_dataset("wikitext", "wikitext-2-raw-v1", split=split,
+                            trust_remote_code=True)
+        full_text = '\n'.join(text['text'])
+        ids = [CHAR2IDX.get(c, 0) for c in full_text]
+        self.data = torch.tensor(ids, dtype=torch.long)
+        self.num_seqs = len(self.data) // seq_len
+        self.data = self.data[:self.num_seqs * seq_len + 1]
+        print(f"{self.num_seqs} seqs of {seq_len}")
+
+    def __len__(self):
+        return self.num_seqs
+
+    def __getitem__(self, idx):
+        start = idx * self.seq_len
+        return (self.data[start:start + self.seq_len],
+                self.data[start + 1:start + self.seq_len + 1])
 
 
 # ─────────────────────────── models ───────────────────────────
