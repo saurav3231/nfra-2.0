@@ -65,15 +65,14 @@ from nfra import NFRAConfig, NFRAForCausalLM
 # ─────────────────────────── config ───────────────────────────
 DATA_SOURCE = os.environ.get('NFRA_DATA', 'synthetic').lower()
 WIKI_PATHS = {'train': 'wikitext-train-raw-v1.txt',
-              'validation': 'wikitext-valid-raw-v1.txt',
-              'test': 'wikitext-test-raw-v1.txt'}
+              'validation': 'wikitext-valid-raw-v1.txt'}
 if DATA_SOURCE == 'wikitext2':
     missing = [f for f in WIKI_PATHS.values() if not os.path.exists(f)]
     if missing:
         print(f"  [warn] wikitext2 files missing ({', '.join(missing)}) — "
               "falling back to synthetic")
-        print("         run:  !wget https://huggingface.co/datasets/wikitext/"
-              "wikitext-2-raw-v1/resolve/main/<file>.txt")
+        print("         download from huggingface.co/datasets/Salesforce/wikitext "
+              "(wikitext-2-raw-v1)")
         DATA_SOURCE = 'synthetic'
 
 STEP_CFG = {'quick': 150, 'standard': 600, 'rigorous': 1500}
