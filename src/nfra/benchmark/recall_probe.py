@@ -104,31 +104,36 @@ def _run_model(name, builder, ks, steps, dim, seq_len, batch):
     torch.manual_seed(0)
     rows = {}
     for k in ks:
-        loader = make_loader(k, seq_len, batch, seed=42)
+        train_loader = make_loader(k, seq_len, batch, seed=42)
+        eval_loader = make_loader(k, seq_len, batch, seed=7)  # held-out seqs
         model = builder(V, dim).to(DEVICE)
         rescale_embed(model)
         params = count_params(model)
-        train_one(model, V, steps, loader, loader, max(25, steps // 6),
-                  ema_decay=0.0, surprise=False)
-        ce_span, acc_span, ce_pad = metric_by_span(model, loader, k)
+        rec = train_one(model, V, steps, train_loader, eval_loader,
+                        max(25, steps // 6), ema_decay=0.0, surprise=False)
+        ce_span, acc_span, ce_pad = metric_by_span(model, eval_loader, k)
         rows[k] = {
             'span_ce': round(ce_span, 4),
             'span_acc': round(acc_span, 4),
             'pad_ce': round(ce_pad, 4),
+            'train_first': round(rec['loss_hist'][0], 4),
+            'train_last': round(rec['loss_hist'][-1], 4),
             'params': params,
         }
-        print('[%s] k=%-4d span_ce=%.4f span_acc=%.4f pad_ce=%.4f (floor %.2f)'
-              % (name, k, ce_span, acc_span, ce_pad, math.log(V)))
+        print('[%s] k=%-4d train %.4f -> %.4f | span_ce=%.4f span_acc=%.4f '
+              'pad_ce=%.4f (floor %.2f)'
+              % (name, k, rows[k]['train_first'], rows[k]['train_last'],
+                 ce_span, acc_span, ce_pad, math.log(V)))
     return rows
 
 
 def main():
     ks = [int(x) for x in
           os.environ.get('NFRA_RECALL_KS', '4,16,64,128').split(',') if x.strip()]
-    steps = int(os.environ.get('NFRA_RECALL_STEPS', '400'))
-    dim = int(os.environ.get('NFRA_RECALL_DIM', '128'))
+    steps = int(os.environ.get('NFRA_RECALL_STEPS', '600'))
+    dim = int(os.environ.get('NFRA_RECALL_DIM', '224'))
     depth = int(os.environ.get('NFRA_RECALL_DEPTH', '12'))
-    unique = int(os.environ.get('NFRA_RECALL_UNIQUE', '2'))
+    unique = int(os.environ.get('NFRA_RECALL_UNIQUE', '4'))
     batch = int(os.environ.get('NFRA_RECALL_BATCH', '8'))
     seq_len = int(os.environ.get('NFRA_RECALL_SEQ', '256'))
     out_json = os.environ.get('NFRA_RECALL_OUT', 'recall_probe.json')
