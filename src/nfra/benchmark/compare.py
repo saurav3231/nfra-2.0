@@ -342,10 +342,11 @@ class GPT2Block(nn.Module):
 
 
 class GPT2ForCausalLM(nn.Module):
-    def __init__(self, vocab_size, dim=512, n_layers=6, n_heads=8, dropout=0.1):
+    def __init__(self, vocab_size, dim=512, n_layers=6, n_heads=8, dropout=0.1,
+                 pos_len=8192):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        self.pos_embed = nn.Embedding(8192, dim)
+        self.pos_embed = nn.Embedding(pos_len, dim)
         self.blocks = nn.ModuleList([GPT2Block(dim, n_heads, dropout)
                                      for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(dim)
