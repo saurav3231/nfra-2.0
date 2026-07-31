@@ -415,15 +415,17 @@ class NFRA_Brain_Block(nn.Module):
         self.gist_proj = nn.Linear(dim, dim, bias=False)
         self.gist_gate = nn.Linear(dim, 1, bias=False)
 
+        # Learned depth-refinement operator (tensorized — replaces the 3x loop)
+        self.depth_refine = nn.Sequential(
+            nn.Linear(dim, dim, bias=False),
+            nn.GELU(),
+            nn.Linear(dim, dim, bias=False),
+        )
+
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = BrainMLP(dim, hidden_mult=4.0)
 
         self.dropout = nn.Dropout(dropout)
-
-        # Precompute depth weights for tensorized thinking depth
-        dw = torch.tensor([0.5 ** d for d in range(max_thinking_depth)])
-        self.register_buffer('depth_weights', dw, persistent=False)
-        self.register_buffer('depth_cumsum', dw.cumsum(0), persistent=False)
 
     def forward(
         self,
@@ -444,36 +446,37 @@ class NFRA_Brain_Block(nn.Module):
                 hormones[:, 5:],
             ], dim=-1)
 
-        # Tensor-based thinking depth: no .item() sync, no Python-level dynamic loop
+        # Tensorized thinking depth: dopamine → per-batch depth factor [B,1,1]
         da = hormones[:, 2:3].mean(dim=-1, keepdim=True).view(-1, 1, 1)
         depth_f = 1.0 + da * (self.max_thinking_depth - 1)
         depth_f = depth_f.clamp(1.0, self.max_thinking_depth)
 
+        # Predictive surprise (free-energy): process only the prediction error
         prediction = self.predictor(x)
         error = x - prediction
 
         residual = prediction
         n = self.ln1(error)
 
-        gist = self.gist_proj(n)
-        gist_gate = torch.sigmoid(self.gist_gate(n))
+        # Surprise-gated routing: surprising tokens take the deep stream,
+        # well-predicted tokens take the cheap gist stream (one matmul).
+        surprise = error.norm(dim=-1, keepdim=True) / math.sqrt(D)
+        gate = (0.7 * torch.sigmoid(self.gist_gate(error))
+                + 0.3 * torch.sigmoid(surprise)).clamp(0.05, 0.95)
+        if energy_budget is not None:
+            gate = gate * (0.3 + 0.7 * energy_budget)  # low budget → prefer gist
 
-        # Always loop max_thinking_depth times with tensor mask
-        dw = self.depth_weights
-        state = torch.zeros_like(n)
-        for d in range(self.max_thinking_depth):
-            recurrence_out, router_score = self.mixer(n, hormones=hormones)
-            deep = self.thalamus(n, hormones, recurrence_out)
-            combined = gist * gist_gate + deep * (1.0 - gist_gate)
-            depth_mask = (depth_f > d).float()
-            state = state + depth_mask * dw[d] * combined
+        gist = self.gist_proj(n)                       # cheap intuition stream
 
-        # Tensor normalization: gather norm factor per batch element
-        depth_idx = (depth_f.long().clamp(0, self.max_thinking_depth - 1)).view(-1)
-        norm = self.depth_cumsum[depth_idx].view(B, 1, 1)
-        state = state / (norm + 1e-8)
-        state = self.dropout(state)
-        x = residual + state
+        # Deep stream: single parallel-scan mixer pass (no sequential loop)
+        recurrence_out, router_score = self.mixer(n, hormones=hormones)
+        deep = self.thalamus(n, hormones, recurrence_out)
+
+        # Tensorized depth refinement applied ONCE (dopamine scales its strength)
+        deep = deep + depth_f * self.depth_refine(deep)
+
+        combined = gate * deep + (1.0 - gate) * gist
+        x = residual + self.dropout(combined)
 
         residual = x
         n = self.ln2(x)

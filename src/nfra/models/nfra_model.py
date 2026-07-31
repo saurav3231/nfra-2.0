@@ -39,6 +39,11 @@ class NFRAConfig:
     energy_aware: bool = True
     aggressive_sparsity: bool = False
     
+    # Depth sharing (universal-transformer style): fewer unique blocks
+    # reused over multiple passes → far fewer params at equal depth.
+    depth_shared: bool = False
+    unique_blocks: int = 4
+    
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
         if self.mode not in valid_modes:
@@ -80,6 +85,8 @@ class NFRAConfig:
             self.aggressive_sparsity = False
             self.num_fractal_experts = 0
             self.top_k_experts = 0
+            self.depth_shared = True
+            self.unique_blocks = 4
 
 
 class NFRAForCausalLM(nn.Module):
@@ -104,19 +111,28 @@ class NFRAForCausalLM(nn.Module):
             block = NFRA_Brain_Block
         else:
             block = FractalResonanceBlock
-        
+
+        # Depth sharing: n_unique unique blocks reused depth_passes times.
+        # Effective depth ≈ num_layers, but params only scale with n_unique.
+        if config.depth_shared:
+            self.n_unique = max(1, min(config.unique_blocks, config.num_layers))
+            self.depth_passes = max(1, config.num_layers // self.n_unique)
+        else:
+            self.n_unique = config.num_layers
+            self.depth_passes = 1
+
         self.layers = nn.ModuleList([
             block(
                 dim=config.hidden_size,
                 n_bands=config.n_bands,
                 dropout=config.dropout,
             )
-            for _ in range(config.num_layers)
+            for _ in range(self.n_unique)
         ])
         
         if config.energy_aware:
             self.energy_allocator = DynamicEnergyBudgetAllocator(
-                num_blocks=config.num_layers
+                num_blocks=self.n_unique
             )
         else:
             self.energy_allocator = None
@@ -143,19 +159,21 @@ class NFRAForCausalLM(nn.Module):
             budgets_t = self.energy_allocator(hardware_factor=energy_budget)
             budgets = budgets_t.detach().cpu().tolist()
         elif energy_budget is not None:
-            budgets = [energy_budget] * self.config.num_layers
+            budgets = [energy_budget] * self.n_unique
         else:
-            budgets = [1.0] * self.config.num_layers
+            budgets = [1.0] * self.n_unique
         
         hormones = None
         if self._has_neuromodulator:
-            for i, layer in enumerate(self.layers):
-                hidden_states, hormones = layer(
-                    hidden_states, hormones=hormones, energy_budget=budgets[i]
-                )
+            for _ in range(self.depth_passes):
+                for i, layer in enumerate(self.layers):
+                    hidden_states, hormones = layer(
+                        hidden_states, hormones=hormones, energy_budget=budgets[i]
+                    )
         else:
-            for i, layer in enumerate(self.layers):
-                hidden_states = layer(hidden_states, energy_budget=budgets[i])
+            for _ in range(self.depth_passes):
+                for i, layer in enumerate(self.layers):
+                    hidden_states = layer(hidden_states, energy_budget=budgets[i])
         
         logits = self.lm_head(hidden_states)
         

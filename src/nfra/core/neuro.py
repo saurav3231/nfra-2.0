@@ -16,6 +16,8 @@ import torch.nn as nn
 from typing import Optional, Tuple
 import math
 
+from .resonance import parallel_gated_scan
+
 
 class NeuroModulator(nn.Module):
     """
@@ -218,38 +220,37 @@ class BrainMixer(nn.Module):
         if hormones is not None:
             ach = hormones[:, 0:1].view(B, 1, 1, 1)
             alpha = 0.8 + 0.19 * alpha + 0.1 * ach * alpha
-            alpha = alpha.clamp(max=0.99)
 
-        # Phase signal and sparse coherence (recomputed each forward for gradient flow)
-        positions = torch.arange(S, device=x.device)
-        phases = (
-            2.0 * math.pi * self.frequencies[:, None] * positions[None, :] / S
-            + self.phases[:, None]
-        )
-        phase_signal = torch.sin(phases)
+        # Parallel closed-form scan — h_t = alpha*h_{t-1} + gate_t*value_t
+        # (replaces the O(S) sequential loop with one vectorized cumsum)
+        h = parallel_gated_scan(gate, value, alpha)
 
-        phase_mean = torch.cos(
-            phases[:, None, :] - phases[None, :, :]
-        ).mean(dim=-1)
-        coherence = torch.sigmoid(self.phase_gate_raw) * torch.sigmoid(phase_mean * 5.0)
+        # Cross-head coherence via CLOSED-FORM oscillatory similarity (O(H²)).
+        # Coherence of two oscillators over S steps = |(1/S) sum_t e^{i 2π Δf t/S}|
+        # has a geometric-series closed form → no [S,S] tensor materialized.
+        df = self.frequencies[:, None] - self.frequencies[None, :]          # [H,H]
+        num = torch.sin(math.pi * df)
+        den = S * torch.sin(math.pi * df / S)
+        frac = torch.where(torch.abs(df) < 1e-3, torch.ones_like(df), num / (den + 1e-9))
+        coherence = torch.sigmoid(self.phase_gate_raw) * frac.clamp(-1.0, 1.0)
 
         topk = max(2, H // 4)
         _, topk_idx = coherence.topk(topk, dim=-1)
-        sparse_coherence = torch.zeros_like(coherence)
-        sparse_coherence.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
+        sparse = torch.zeros_like(coherence)
+        sparse.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
 
-        # Preallocate output buffer, avoid list+cat, replace einsum with bmm
-        out = torch.empty_like(value)
-        h = torch.zeros(B, H, 1, Hd, device=x.device, dtype=x.dtype)
-        for t in range(S):
-            g_t = gate[:, :, t:t+1]
-            v_t = value[:, :, t:t+1]
-            h_3d = h.squeeze(2)
-            cross = torch.bmm(sparse_coherence.unsqueeze(0).expand(B, -1, -1), h_3d).unsqueeze(2)
-            h = h * alpha + g_t * v_t + 0.05 * cross
-            phase_amp = phase_signal[:, t].view(1, H, 1, 1)
-            h = h * (1.0 + 0.05 * phase_amp)
-            out[:, :, t:t+1] = h
+        # Cross-head injection: each head gets 0.05 * weighted sum of its top-K
+        # coherent heads. One einsum over H (H small → cheap), not per-timestep.
+        cross = torch.einsum('bhsd,gh->bgsd', h, sparse)
+        h = h + 0.05 * cross
+
+        # Phase amplitude modulation (O(H*S))
+        positions = torch.arange(S, device=x.device).float()
+        phase_signal = torch.sin(
+            2.0 * math.pi * self.frequencies[:, None] * positions[None, :] / S
+            + self.phases[:, None]
+        )  # [H, S]
+        out = h * (1.0 + 0.05 * phase_signal.unsqueeze(0).unsqueeze(-1))
 
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
 

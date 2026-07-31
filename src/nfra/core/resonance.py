@@ -9,6 +9,36 @@ from typing import Tuple, Optional
 import math
 
 
+def parallel_gated_scan(
+    gate: Optional[torch.Tensor],
+    value: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Closed-form parallel scan for h_t = alpha * h_{t-1} + gate_t * value_t.
+
+    This replaces the Python-level sequential loop (O(S) iterations of small
+    GPU ops) with a single vectorized cumsum in log-space:
+
+        h_t = alpha^t * sum_{k<=t} alpha^{-k} * gate_k * value_k
+
+    Args:
+        gate:   [B, H, S, Hd] input gates in (0, 1), or None for no gating
+        value:  [B, H, S, Hd] values
+        alpha:  [1, H, 1, Hd] per-head decay in (0, 1)
+
+    Returns:
+        [B, H, S, Hd] hidden states for every timestep (parallel, O(S) memory)
+    """
+    u = value if gate is None else gate * value
+    w = torch.log(alpha.clamp(min=0.85, max=0.99))   # w <= -0.01 for numerical safety
+    S = u.shape[2]
+    pos = torch.arange(1, S + 1, device=u.device).float().view(1, 1, S, 1)
+    decay_inv = torch.exp(-w * pos)                   # alpha^{-t}  (<= 1e18 at S=256)
+    decay_fwd = torch.exp(w * pos)                    # alpha^{t}
+    return decay_fwd * torch.cumsum(decay_inv * u, dim=2)
+
+
 class ResonanceSignature:
     def __init__(self, frequency: float, phase: float):
         self.frequency = frequency
@@ -121,12 +151,8 @@ class CausalResonanceMixer(nn.Module):
         pos_mod = pos_mod.view(1, self.n_bands, S, 1)
         content = content * (1.0 + 0.1 * pos_mod)
 
-        # Preallocate output buffer, avoid list+cat overhead
-        out = torch.empty_like(content)
-        h = torch.zeros_like(content[:, :, 0:1])
-        for t in range(S):
-            h = h * decay + content[:, :, t:t+1]
-            out[:, :, t:t+1] = h
+        # Parallel closed-form scan (no Python loop)
+        out = parallel_gated_scan(None, content, decay)
 
         band_weights = torch.sigmoid(self.band_gate_logits)
         out = out * band_weights.view(1, self.n_bands, 1, 1)
@@ -170,13 +196,7 @@ class ParallelGatedRecurrence(nn.Module):
         alpha = 0.8 + 0.19 * alpha
         alpha = alpha.view(1, H, 1, Hd)
 
-        # Preallocate output, avoid list+cat
-        out = torch.empty_like(value)
-        h = torch.zeros(B, H, 1, Hd, device=x.device, dtype=x.dtype)
-        for t in range(S):
-            h = h * alpha + gate[:, :, t:t+1] * value[:, :, t:t+1]
-            out[:, :, t:t+1] = h
-
+        out = parallel_gated_scan(gate, value, alpha)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
         return self.proj_out(out)
 
@@ -246,13 +266,7 @@ class MultiScaleGatedRecurrence(nn.Module):
         alpha = torch.sigmoid(self.log_alpha)
         alpha = alpha.view(1, H, 1, Hd)
 
-        # Preallocate output, avoid list+cat
-        out = torch.empty_like(value)
-        h = torch.zeros(B, H, 1, Hd, device=x.device, dtype=x.dtype)
-        for t in range(S):
-            h = h * alpha + gate[:, :, t:t+1] * value[:, :, t:t+1]
-            out[:, :, t:t+1] = h
-
+        out = parallel_gated_scan(gate, value, alpha)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
 
         router_state = out[..., -self.head_dim:]
