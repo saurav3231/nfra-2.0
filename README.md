@@ -227,6 +227,7 @@ nfra-2.0/
 |-----|----------|
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | Full step-by-step benchmark guide (Kaggle T4) + methodology + how to read results |
 | [FAQ.md](FAQ.md) | Frequently asked questions (usage, results, comparison, troubleshooting) |
+| [docs/BRAIN_LEVERS.md](docs/BRAIN_LEVERS.md) | Design, examples, use cases, advantages, and success criteria for the three brain-inspired levers (`local_route`, `div_norm`, `astro`) |
 | [docs/NFRA_2.0_Research_Paper_Draft.md](docs/NFRA_2.0_Research_Paper_Draft.md) | Research paper draft |
 | [docs/PAPER_OUTLINE.md](docs/PAPER_OUTLINE.md) | Paper outline |
 | [docs/DATASETS.md](docs/DATASETS.md) | Dataset notes |
