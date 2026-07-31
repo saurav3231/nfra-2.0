@@ -18,7 +18,8 @@
 ║       1-block x depth-passes 'recurrent' config is also a valid NFRA    ║
 ║       setting but is intentionally NOT used for the head-to-head.       ║
 ║     • NFRA uses per-layer gradient checkpointing; Mamba's scan is       ║
-║       checkpointed per chunk and run in fp32 (fp16 overflow → NaN).     ║
+║       checkpointed per chunk and the whole block runs in fp32 (its      ║
+║       unfused recurrence overflows fp16 under AMP → NaN).              ║
 ║                                                                        ║
 ║   READING THE NUMBERS                                                   ║
 ║     • All heads use GPT-2-style init (embed std 0.02), so loss starts     ║
@@ -208,22 +209,26 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(d_inner, dim, bias=False)
 
     def forward(self, x):
-        B, S, D = x.shape
-        N, E = self.d_state, self.d_inner
-        x, z = self.in_proj(x).chunk(2, dim=-1)
-        x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :S, :]
-        x = F.silu(x)
-        dt, Bm, C = self.x_proj(x).chunk(3, dim=-1)
-        dt = F.softplus(self.dt_proj(dt))
-        A = -torch.exp(self.A_log)
-        alpha = torch.exp(A.view(1, 1, N, 1) * dt.unsqueeze(2))
-        u = Bm.unsqueeze(-1) * x.unsqueeze(2)
-        a_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
-        u_f = u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
-        h = mamba_scan(a_f, u_f)
-        h = h.view(B, S, N, E)
-        y = (h * C.unsqueeze(-1)).sum(dim=2) + self.D.unsqueeze(0).unsqueeze(0) * x
-        return self.out_proj(y * F.silu(z))
+        x_dtype = x.dtype
+        x = x.float()
+        with torch.autocast(device_type=DEVICE.type, enabled=False):
+            B, S, D = x.shape
+            N, E = self.d_state, self.d_inner
+            x, z = self.in_proj(x).chunk(2, dim=-1)
+            x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :S, :]
+            x = F.silu(x)
+            dt, Bm, C = self.x_proj(x).chunk(3, dim=-1)
+            dt = F.softplus(self.dt_proj(dt))
+            A = -torch.exp(self.A_log)
+            alpha = torch.exp(A.view(1, 1, N, 1) * dt.unsqueeze(2))
+            u = Bm.unsqueeze(-1) * x.unsqueeze(2)
+            a_f = alpha.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
+            u_f = u.permute(0, 2, 1, 3).reshape(B, 1, S, N * E)
+            h = mamba_scan(a_f, u_f)
+            h = h.view(B, S, N, E)
+            y = (h * C.unsqueeze(-1)).sum(dim=2) + self.D.unsqueeze(0).unsqueeze(0) * x
+            out = self.out_proj(y * F.silu(z))
+        return out.to(x_dtype)
 
 
 class MambaLM(nn.Module):
