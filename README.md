@@ -2,6 +2,8 @@
 
 **A brain-inspired neural network for quality AI on modest hardware — benchmarked apples-to-apples against Mamba-SSM and GPT-2.**
 
+> Built on **PyTorch** for **large language model (LLM)** research and deployment: next-token prediction, sequence modeling, and autoregressive text generation on a single modest GPU. A drop-in comparison subject against **Transformer** and **State Space Model (SSM)** baselines such as Mamba, with low-memory training and inference.
+
 > Built by **SAURAV BHANDARI** — conceived, designed, and developed with AI assistance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -124,8 +126,9 @@ print(logits.shape)         # [2, 64, 32000]
 ### NFRA Lite (legacy hardware)
 
 ```python
+from nfra import NFRAConfig
 from nfra.models.nfra_lite import NFRALiteForCausalLM
-model = NFRALiteForCausalLM(NFRALiteConfig(vocab_size=50257))
+model = NFRALiteForCausalLM(NFRAConfig(mode="lite", vocab_size=50257))
 ```
 
 ---
