@@ -35,9 +35,12 @@ import math
 import json
 import time
 import contextlib
+import functools
 
 os.environ.setdefault('NFRA_SEEDS', '1')
 os.environ.setdefault('NFRA_SIZES', '5')
+
+print = functools.partial(print, flush=True)
 
 import numpy as np
 import torch
