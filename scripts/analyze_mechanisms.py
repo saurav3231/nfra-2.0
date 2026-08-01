@@ -94,24 +94,13 @@ def run_ablate():
 
     train_loaders, eval_loader, _ = make_loaders(0)
 
-    # Pre-build all model specs so we know the correct unique_blocks/dim for each size
-    # build_family_spec handles param-matching automatically
-    family_specs = {}
-    for name, build_kw, train_kw, n_seeds_req in ABLATE:
-        fam = build_kw.pop("fam", "nfra")
-        if fam not in family_specs:
-            family_specs[fam] = build_family_spec(fam, size, V)
-        build_kw["fam"] = fam  # restore for later lookup
-
     results = {}
     for name, build_kw, train_kw, n_seeds_req in ABLATE:
         n_seeds_req = min(n_seeds_req, n_seeds)
         seeds = SEED_LIST[:n_seeds_req]
         variant_results = []
 
-        fam = build_kw.pop("fam", "nfra")
-        spec = family_specs[fam]
-        build_kw["fam"] = fam  # restore
+        spec = build_family_spec("nfra", size, V)
 
         for seed in seeds:
             print(f"\n  [{name}] seed={seed} ...")
