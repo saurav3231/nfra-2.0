@@ -605,6 +605,7 @@ def phase_ablate(vocab):
             t0 = time.perf_counter()
             fam = build_kw.pop('fam', 'nfra')
             m, params = _build_fam_ga(fam, PRIMARY, vocab, seed, **build_kw)
+            m = m.to(DEVICE)
             rec = _run_ga(m, vocab, steps, train_loaders[seed], eval_loader,
                           max(50, steps // 6), seed=seed, **train_kw)
             recs.append(rec)

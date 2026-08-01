@@ -25,7 +25,7 @@ class Int8Linear(nn.Module):
         self.out_features = linear.out_features
         self.bias = linear.bias
         scale = linear.weight.data.abs().max() / 127.0
-        self.scale = scale if scale > 0 else 1.0
+        self.register_buffer('scale', scale if scale > 0 else 1.0)
         self.qweight = nn.Parameter(
             torch.round(linear.weight.data / self.scale).clamp(-128, 127).to(torch.int8),
             requires_grad=False,
