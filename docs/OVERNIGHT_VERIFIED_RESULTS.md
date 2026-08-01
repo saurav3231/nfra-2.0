@@ -231,3 +231,43 @@ Execute on Kaggle (full families, real T4 numbers):
 
 Judge against the retnet baseline at the SAME geometry: nfra@5M loss ≈ 2.04–2.10,
 tok/s ≈ 15k+ (vs 4.3k), RWKV finite.
+
+## 11. 3.3b Cortex — VERIFIED live run (both targets hit)
+
+Full core-phase run on **Kaggle T4**, `mode=standard` (600 steps, 5/20M, seeds
+42/7), WikiText-2 char (vocab 96, random loss 4.564), batch 8, fp16 AMP, EMA 0.99.
+Phase completed in ~23 min, exit 0. Both declared targets are met.
+
+| size | family | eval (seed 42 / 7) | mean | tok/s | peak mem |
+|---|---|---|---|---|---|
+| 5M | **nfra** | 1.959 / 1.952 | **1.955** | 9,432 / 9,418 | 1.41 GB |
+| 5M | retnet | 2.127 / 2.143 | 2.135 | 18,129 / 18,134 | 1.15 GB |
+| 5M | gpt2 | 3.212 / 3.204 | 3.208 | 33,491 / 33,192 | 0.97 GB |
+| 5M | rwkv | 4.275 / 4.267 | 4.271 | 13,588 / 13,656 | 0.95 GB |
+| 20M | **nfra** | 1.748 / 1.744 | **1.746** | 9,589 / 9,567 | 2.19 GB |
+| 20M | retnet | 1.811 / 1.810 | 1.811 | 24,610 / 24,571 | 1.26–1.58 GB |
+| 20M | gpt2 | 2.962 / 2.935 | 2.949 | 50,789 / 50,849 | 0.71–1.19 GB |
+| 20M | rwkv | 3.931 / 4.090 | 4.010 | 11,247 / 11,101 | 2.24–2.40 GB |
+
+**Verified facts (apples-to-apples: identical data, optimizer, token budget, EMA):**
+
+- **nfra BEATS retnet on loss at both sizes, both seeds, no overlap** — 5M by
+  −0.18 nats (1.955 vs 2.135), 20M by −0.065 nats (1.746 vs 1.811). The retention-QK
+  redesign closed the §9/§10 loss gap; the architecture now leads the field on
+  quality, not just memory.
+- **Exact geometry match confirmed in the live build**: nfra builds dim 112 /
+  depth 33 / 5.03M @5M and dim 224 / depth 33 / 20.00M @20M — bit-identical to
+  retnet's tuning. Clean head-to-head.
+- **v2 → 3.3b improvement**: 5M 2.296→1.955 (−0.34), 20M 2.152→1.746 (−0.41);
+  speed 4.3k→9.5k tok/s (~2.2×). The launch-bound bottleneck is largely gone.
+- **RWKV NaN is fixed** (ratio clamp + EMA NaN guard): finite at both sizes.
+  RWKV's quality is now the weakest (≈ random+0.3), a separate small-model issue
+  (fast per-channel decay limits its effective context), not a stability bug.
+- **Speed gap remains on nfra's side**: 9.5k tok/s vs retnet 18–25k / gpt2 33–51k.
+  Quality target met; throughput is the next open lever (see §11 notes in
+  FUTURE_PLAN or the follow-up speed work).
+- Memory: nfra 1.41 GB @5M / 2.19 GB @20M — slightly above retnet (1.15 / ~1.4),
+  still far below a 16 GB T4 and the old mamba-era 8 GB.
+
+Run config snapshot: `NFRA_CORTEX=1 NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core`,
+commit `504b9e6`. Report/JSON saved to `overnight_report.md` / `overnight_results.json`.
