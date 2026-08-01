@@ -328,3 +328,51 @@ Config: `NFRA_RECALL_KS=4,16,64,128 NFRA_RECALL_DIM=224 NFRA_RECALL_CONCURRENT=1
 **Verified:** 15/15 tests (new: levers-identity-init — enabling theta/gain_nov/lora is bit-identical to baseline at init; no-future-leak-with-all-levers — still exactly 0.0; levers forward/backward). Levers confirmed *live* (perturbing identity params moves logits). All-levers model still learns the corrected recall task (CE 1.79 < floor 2.77). Docs: `BRAIN_LEVERS.md` now documents all seven levers; ablate table has 14 variants (added `nfra_theta`, `nfra_achretain`, `nfra_gainnov`, `nfra_lora8`). No local training runs (CPU-only box).
 
 **Next:** overnight `global_arena` on Kaggle decides which levers pay; the corrected `recall_diag` decides the H3 root-cause question.
+
+---
+
+## Part 11 — 3.3b Cortex verified findings + the post-run prune plan (agreed 2026-08-01)
+
+**Decision recorded from the user:** after the current full 8-phase overnight run ends, the next goal is to **find which ideas actually helped and keep helping, and remove the non-helping ones.** The verified evidence below is the input to that prune.
+
+### What is already verified (see `OVERNIGHT_VERIFIED_RESULTS.md` §11–§13)
+
+| idea | status | verified evidence |
+|---|---|---|
+| Neuromodulated retention (ACh→HOLD value gate, NE→MLP gain gland) | **KEEP — likely the differentiator** | nfra beats retnet at bit-identical geometry (−0.18 @5M, −0.048 @20M, both seeds); the only family that improves at 4× length |
+| Retention-QK mixer (multi-scale decay −5…+3) | **KEEP** | the operator that finally closed the §9/§10 loss gap |
+| GEMM fusion (qkvr 5D, gate_up 2h) | **KEEP** | 9→5 GEMMs/block, +10% tok/s, bit-identical fwd/bwd (0.0 diff) |
+| Low-dim neuromodulator scan | **KEEP** | +3% tok/s, exact (1.2e-7) |
+| EMA 0.99 | **REMOVE** | ablate: 1.779 vs 1.763 baseline, −23% tok/s |
+| Surprise-weighted (dopamine-RPE) loss | **REMOVE** | ablate: 1.950 vs 1.763 (−0.19 nats) — actively harmful |
+| k-WTA (0.25) | **REMOVE** | 1.770 — a wash, costs kernels |
+| local_route / div_norm / astro / theta / ach_retain / gain_nov / lora8 | **REMOVE (dead weight)** | ablate: all exactly 1.763 = no-ops in the Cortex block |
+| nfra_all (stacked levers) | **REMOVE** | clearly worst: 1.985/1.962, 7.7k tok/s |
+| Energy-budget / adaptive-exit gate | **FIX OR REMOVE** | efficiency: zero effect across all budgets (gate never learns to exit) |
+| Mamba in default grid | **REMOVE (done in `2118e7e`)** | ~700 tok/s, burns 30 min/run in ablate |
+
+### The open question this plan answers
+
+The ablate proved *baseline > stacked levers*, but it **never removed the neuromodulator or the gates themselves**. So "the gated block wins" is verified; *which* gate carries it is not. The prune needs an **isolation ablation** before deleting anything:
+
+1. **Isolation sweep @5M, ~2 min/config** (dim 112, depth 33, 600 steps):
+   - baseline (all on)
+   - neuromodulator gland OFF (hormones=None path)
+   - value gate OFF (v unmodulated)
+   - receptance gate OFF
+   - phase modulation OFF
+   - exit gate OFF
+2. **Decision rule:** keep a component iff loss gain ≥ ~0.02 at ≤5% tok/s cost; otherwise remove it and its params. Pre-committed negative result: if the gland itself contributes nothing, drop it and shrink the block further.
+
+### Follow-up targets (from the user's stated goals)
+
+- Loss ~1.1–1.2 at 20M/600 steps: **not reachable** at this budget (600 steps = 0.11 epochs; best-in-grid mamba is 1.52). Requires more steps + more params — map the loss-vs-steps curve empirically first (3000-step single-family probe, ~10 min T4).
+- 17–18k tok/s: reachable — retnet does 24.9k @20M; nfra has fewer FLOPs/block; profiler (`scripts/prof_nfra.py`) pinpoints the remaining launch/elementwise overhead.
+- <1 GB mem @20M: not in the current batch-8 fp16 setup (floor ≈ 1.2–1.3 GB); needs grad-ckpt / fp8 / smaller batch.
+
+### Order of operations (after this run ends)
+
+1. Post the full-run tail (recall/deploy/perf/data2 results) → document remaining phases.
+2. Run the isolation sweep above → prune to the verified keep-list.
+3. Profile (`PROF_ARCH=nfra` then `retnet`) → attack the actual tok/s hotspot.
+4. Optional: 3000-step nfra@20M probe to establish the real loss ceiling at this size.
