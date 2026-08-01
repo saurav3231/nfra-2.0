@@ -346,3 +346,44 @@ phases completed this run:
 > regardless of the family list, burning ~30 min each at ~700 tok/s. Fixed in
 > `2118e7e`: ablate now skips families not in `NFRA_OVN_FAMILIES` (mamba is
 > excluded by default).
+
+---
+
+## 13. NFRA identity audit — what is genuinely ours vs borrowed
+
+A truthful attribution of NFRA 3.3b Cortex. The atoms are almost all from the
+literature; the claim we are allowed to make is the synthesis, and — because it
+is verified — the measured effect of that synthesis.
+
+### Ours (verified to matter)
+
+| claim | mechanism | evidence it is real |
+|---|---|---|
+| **Neuromodulated retention** | a 6-channel causal prefix gland (ACh/NE/DA/5HT/CORT/OX) pools to hormones per token; ACh gates the mixer's value-write (ACh→HOLD) and NE gates the MLP gain; smoothed across blocks | nfra beats retnet at **bit-identical geometry** (dim 112/33 @5M, dim 224/33 @20M): −0.18 nats @5M, −0.048 nats @20M, both seeds. If the gland were decorative, losses would be equal |
+| **Resonance identity** | multi-scale decay heads (log_decay −5…+3) + sin-phase-modulated selectivity gates as one framing | the only family that **improves** at 4× length (1.759→1.719 @1024) while gpt2 collapses (+0.44) and retnet barely moves |
+| **Verified long-horizon memory** | the combination above, measured | recall + context phases (§12); graceful span degradation 62%→11% with usable memory far beyond mamba's k≥16 collapse |
+
+### Borrowed (credit where due)
+
+| atom | source |
+|---|---|
+| Retention-QK operator (decayed QKᵀ, no softmax, GroupNorm heads) | **RetNet** (Microsoft, 2023) |
+| Exponential per-head decay masks γ^(i−j) | RetNet / ALiBi / xPos lineage |
+| Value-gate + receptance-gate selectivity | **RWKV**-style time-mixing selectivity |
+| Matrix state (SSD-style B/C write-read) | **Mamba/SSD** (v1/v2 only — dropped in 3.3b) |
+| Gumbel straight-through early-exit | **ACT** lineage (adaptive-compute-time) |
+| WKV two-cumsum recurrence | **RWKV** |
+| EMA, SwiGLU, GroupNorm, LayerNorm | standard |
+
+### The honest bottom line
+
+No component is atomically novel — but that is true of essentially every modern
+architecture (Transformer = pre-existing attention + norms + MLP + positions).
+What is defensibly ours:
+
+1. The **neuromodulated-gate synthesis applied to retention**, and
+2. The only claim this repo asserts: it **wins quality at matched params**, verified
+   on identical data/optimizer/token-budget across two sizes and two seeds.
+
+The ablate phase (§12) additionally proves the win comes from these gates, not
+from stacking more levers: baseline beats every single legacy toggle.
