@@ -1,15 +1,15 @@
 """
 NFRA 3.3b Cortex-Resonance Block.
 
-Diagnosis that motivated this rewrite (see docs/OVERNIGHT_VERIFIED_RESULTS.md §9):
+Diagnosis that motivated this rewrite (see docs/OVERNIGHT_VERIFIED_RESULTS.md sec 9):
 
   * The 3.3 matrix-state LINEAR-RECURRENCE mixer lost to RetNet by ~0.25 nats
     (nfra 2.296 vs retnet 2.040 @ 5M). Root cause: a linear recurrence
-    (accumulate gate*value ⊗ B, read with C) has NO query-key interaction —
+    (accumulate gate*value (x) B, read with C) has NO query-key interaction --
     linear attention is fundamentally weaker per layer on language than
     QK-based mixing, regardless of depth or decay mechanics.
   * It was also SLOWER (4323 tok/s vs retnet 23338). The recurrence ran as a
-    [B,H,S,Hd,N] 5-D elementwise grid (cumsum + einsum + permutes) — dozens of
+    [B,H,S,Hd,N] 5-D elementwise grid (cumsum + einsum + permutes) -- dozens of
     tiny memory-bound kernels per block, plus 8 components/block. RetNet is
     fast because each block is ~3 big GEMMs.
 
@@ -20,9 +20,9 @@ multi-scale decayed QK^T attention of RetNet, computed as two O(S^2) matmuls
 
 Preserved identity:
   * RESONANCE   : per-head exponential decays are init across a multi-scale
-                  grid (log_decay -5..3 → long-range 0.99+ down to local) —
+                  grid (log_decay -5..3 -> long-range 0.99+ down to local) --
                   the "multiple timescales" of the brain/cortex framing.
-  * SELECTIVITY : a neuromodulated VALUE gate (ACh → HOLD) + an output
+  * SELECTIVITY : a neuromodulated VALUE gate (ACh -> HOLD) + an output
                   receptance gate (RWKV-style) keep input-dependent routing
                   without breaking the constant-decay parallel form.
   * NEUROMOD    : lean causal hormone gland threads ACh/NE/etc across blocks.
@@ -55,7 +55,7 @@ class CortexMixer(nn.Module):
     computed as two O(S^2) matmuls (GPU-efficient, no per-token scan kernel).
     Selectivity (the linear-attention advantage) is kept cheaply: a learned
     VALUE gate per token (ACh/phase-modulated, like 3.1's write gate) and an
-    output receptance gate (RWKV-style) — both input-dependent but applied as
+    output receptance gate (RWKV-style) -- both input-dependent but applied as
     plain elementwise multiplies, so the parallel form stays intact.
     """
 
@@ -165,11 +165,11 @@ class CortexMLP(nn.Module):
     Replaces 3.3's router-based BrainMLP in the Cortex path: the router,
     cortisol pruning and k-WTA all cost extra kernels that (at small width)
     make the block launch-bound. A plain SwiGLU gives the same FLOPs at a
-    fraction of the kernels — this is what makes RetNet's block fast.
+    fraction of the kernels -- this is what makes RetNet's block fast.
 
     hidden_mult=2.0 deliberately rebalances capacity toward the retention
-    mixer: with the 3-proj gated MLP the block becomes (6 mixer + 6 MLP) D^2 —
-    the SAME total as RetNet's (4 + 8) D^2 — so at matched params nfra builds
+    mixer: with the 3-proj gated MLP the block becomes (6 mixer + 6 MLP) D^2 --
+    the SAME total as RetNet's (4 + 8) D^2 -- so at matched params nfra builds
     the identical dim/depth geometry as retnet (e.g. 112/33 @ 5M) and the
     mixer's extra selectivity carries the differentiator.
     """
@@ -203,7 +203,7 @@ class CortexNeuromodulator(nn.Module):
 
     3.3's NeuroModulator also computed a prefix-variance novelty term (a
     second cumsum pair per block). For the launch-bound small-width regime
-    that overhead is pure cost — the prefix-mean gland carries the same
+    that overhead is pure cost -- the prefix-mean gland carries the same
     "slow whole-state mood" identity at half the kernels.
     """
 
@@ -227,7 +227,7 @@ class NFRA_Cortex_Block(nn.Module):
     """NFRA 3.3b Cortex block: lean neuromodulated retention mixer + gated MLP.
 
     The whole block is ~3 matmuls for the mixer, 3 for the MLP, plus norms,
-    gates and the cheap hormone gland — RetNet-shaped, so it trains at
+    gates and the cheap hormone gland -- RetNet-shaped, so it trains at
     RetNet speed instead of the 5-D-scan 3.3 block (4323 vs 23338 tok/s).
     """
 
