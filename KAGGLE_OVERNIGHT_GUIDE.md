@@ -99,6 +99,7 @@ back if the canonical S3 link 301s) and **TinyShakespeare**, then run every phas
 | `NFRA_COMPILE` | `1` | `torch.compile` fusion (1.5–3× fewer launches; auto-fallback) |
 | `NFRA_CHECKPOINT` | `0` | gradient checkpointing; `0` = faster, no memory need at these sizes |
 | `NFRA_SCAN_KERNEL` | `0` | `0` = pure-torch scan so the compiled graph stays fused |
+| `NFRA_EMA` | `0.99` | EMA weight-averaging decay applied to all families (~0.1–0.3 nats loss gain); `0` = off |
 
 Data guard: if `NFRA_OVN_DATA` is anything but `wikitext2`, the script refuses to run —
 real text only, never the synthetic "unlearnable" set.

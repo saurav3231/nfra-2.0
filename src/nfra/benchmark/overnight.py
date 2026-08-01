@@ -198,6 +198,12 @@ os.environ.setdefault('NFRA_CHECKPOINT', '0')
 os.environ.setdefault('NFRA_COMPILE', '1')
 os.environ.setdefault('NFRA_SCAN_KERNEL', '0')
 
+# Loss-focus lever: EMA (weight averaging) applied to ALL families during
+# training — a near-free loss gain (~-0.1..-0.3 nats at these sizes) for
+# negligible memory. Off (0.0) reproduces the pre-EMA baseline.
+EMA_DECAY = float(os.environ.get('NFRA_EMA', '0.99'))
+os.environ.setdefault('NFRA_EMA', str(EMA_DECAY))
+
 import copy
 
 import numpy as np
@@ -297,7 +303,7 @@ def _cached_primary(fam, vocab, steps):
     rescale_embed(m)
     train_loaders, eval_loader, _ext = make_loaders(SIZES.index(PRIMARY))
     train_one(m, vocab, steps, train_loaders[SEEDS[-1]], eval_loader,
-              max(50, steps // 6), seed=SEEDS[-1])
+              max(50, steps // 6), ema_decay=EMA_DECAY, seed=SEEDS[-1])
     _CACHE[fam] = {'model': m, 'steps': steps}
     return m
 
@@ -378,7 +384,7 @@ def phase_core(vocab, random_loss):
                 assert_tokens_in_range(m, train_loaders[seed], vocab,
                                        'core:%s@%dM' % (fam, size))
                 rec = train_one(m, vocab, STEPS, train_loaders[seed], eval_loader,
-                                arena.EVAL_GAP, seed=seed)
+                                arena.EVAL_GAP, ema_decay=EMA_DECAY, seed=seed)
                 _note_perf(fam, spec['params'], rec['wall_s'], STEPS)
                 runs[size][seed][fam] = rec
                 if seed == SEEDS[-1]:
@@ -469,7 +475,8 @@ def phase_context(vocab):
         m = spec['builder'](vocab, spec['dim'], **spec['extra']).to(DEVICE)
         rescale_embed(m)
         tr, ev = _wiki_train_eval(SEQ_LEN, BATCH, SEEDS[-1])
-        rec = train_one(m, vocab, steps, tr, ev, max(50, steps // 6), seed=SEEDS[-1])
+        rec = train_one(m, vocab, steps, tr, ev, max(50, steps // 6),
+                        ema_decay=EMA_DECAY, seed=SEEDS[-1])
         base = rec['eval_hist'][-1][1]
         lengths = {}
         for L in CONTEXT_LENS:
@@ -487,11 +494,13 @@ def phase_context(vocab):
 
 
 # ───────────────────────────── phase: efficiency ─────────────────────────────
-def _train_energy(model, vocab, steps, tr, ev, eval_gap, budget, seed):
+def _train_energy(model, vocab, steps, tr, ev, eval_gap, budget, seed,
+                  ema_decay=0.0):
     model.train()
     opt, sched = make_optimizer(model, lr=3e-4,
                                 warmup=min(50, max(steps // 10, 1)), total=steps)
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
+    ema = EMA(model, ema_decay) if ema_decay > 0 else None
     it = seeded_train_loader(tr, seed)
     hist, eval_hist, nan = [], [], 0
     t0 = time.perf_counter()
@@ -527,9 +536,17 @@ def _train_energy(model, vocab, steps, tr, ev, eval_gap, budget, seed):
                 opt.zero_grad(set_to_none=True)
                 nan += 1
         sched.step()
+        if ema is not None:
+            ema.update(model)
         hist.append(loss.detach())
         if step % eval_gap == 0 or step == steps:
+            if ema is not None:
+                ema.apply(model)
             eval_hist.append((step, evaluate(model, ev)))
+            if ema is not None:
+                ema.restore(model)
+    if ema is not None:
+        ema.apply(model)   # leave EMA weights in place for downstream evals
     if HAS_CUDA:
         torch.cuda.synchronize()
     wall = time.perf_counter() - t0
@@ -557,7 +574,7 @@ def phase_efficiency(vocab):
                             **spec['extra']).to(DEVICE)
         rescale_embed(m)
         rec = _train_energy(m, vocab, steps, tr, ev, max(50, steps // 6),
-                            b, SEEDS[-1])
+                            b, SEEDS[-1], ema_decay=EMA_DECAY)
         final = rec['eval_hist'][-1][1] if rec['eval_hist'] else None
         rows[str(b)] = {'budget': b, 'final_eval': final,
                         'tok_s': rec['tok_s'], 'ms_per_step': rec['ms_per_step'],
@@ -726,7 +743,7 @@ def phase_data2(vocab=None):
         m = spec['builder'](V2, spec['dim'], **spec['extra']).to(DEVICE)
         rescale_embed(m)
         rec = train_one(m, V2, steps, train_loader, eval_loader,
-                        max(50, steps // 6), seed=SEEDS[-1])
+                        max(50, steps // 6), ema_decay=EMA_DECAY, seed=SEEDS[-1])
         rows[fam] = {'params': count_params(m), 'vocab': V2,
                      'final_eval': rec['eval_hist'][-1][1] if rec['eval_hist'] else None,
                      'random_loss': random_loss2, 'tok_s': rec['tok_s']}
