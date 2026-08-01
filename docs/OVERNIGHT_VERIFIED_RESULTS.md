@@ -187,3 +187,23 @@ Default grid is now `nfra, rwkv, retnet, gpt2`; `mamba` stays available but is
 
 Status: parse-only syntax checks pending; execute on Kaggle via
 `NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core python -m nfra.benchmark.overnight`.
+
+## 9. 3.3 Cortex v2 — speed/loss mechanics (based on the first live 5M run)
+
+First live core-phase run (T4, fp16 AMP, batch 4) showed nfra behind on BOTH axes
+it was meant to win: retnet@5M hit **2.040 @ 23.3k tok/s** vs nfra@5M **2.282 @
+7.8k tok/s**; nfra@20M (2.126) barely beat retnet@5M. Root causes and fixes:
+
+| symptom | root cause | fix (this session) |
+|---|---|---|
+| nfra slow despite "fast matrix mixer" | mixer materialized ~7 five-D tensors `[B,H,S,Hd,N]` per block and ran a per-token selective-scan kernel; at forced batch 4 the small elementwise kernels dominate wall time | **Resonance-cumsum mixer**: decay is now CONSTANT per (head, state-index) (multi-scale 0.90/0.95/0.98/0.995), so the recurrence collapses to ONE vectorized two-cumsum closed form (`_resonance_scan`) — matmul/cumsum-shaped like RetNet/RWKV instead of a scan kernel. Selectivity moves to SSD-style input-dependent B/C + gated value (ACh modulates the write gate). Run in fp32 (a⁻ᵗ ~1e12 at S=256 overflows fp16); sequences > 256 use an exact chunked combine (long-context eval). Phase modulation moved from the 5-D hidden grid to the cheap `[S,H]` write gate. |
+| nfra loss stuck / 20M barely helped | tuner chose **U=2–6 giant re-used blocks, depth 12** vs retnet/gpt2/rwkv's 24–25 *distinct* layers; LM wants depth, not width | **Distinct-layer scaling**: `tune_nfra_size` now maximizes distinct blocks within a 20% param budget (U=depth ⇒ plain distinct stack, passes=1); nfra depth = 24 for the benchmark grid; `DIM_GRID` extended down to 112 (5M) / 160 (20M). Result: nfra@5M = 24 blocks × dim 112 ≈ 5.75M; nfra@20M = 24 blocks × dim 224 ≈ 21.5M — directly comparable to retnet's 25. Depth-shared recurrence stays available via `NFRA_DEPTH` for memory-constrained configs. |
+| 7.8k tok/s at batch 4 | launch-bound; batch 4 was forced for the old Mamba-resident grid | wikitext batch clamp 4→8 (Mamba gone, cumsum mixer + shallow blocks are memory-light), and overnight now frees non-cached models + `empty_cache` between runs so batch 8 fits at 20M. |
+| RWKV NaN / RetNet underflow | (RWKV) fp16 `k*v` overflow + `exp(wpos)` cumsum; (RetNet) uniform `log_decay=-1` → every head γ²⁵⁵≈1e-42 | fixed in `compare.py`: RWKV pre-norm + fp32 WKV path + proper `time_mix_r2`; RetNet `log_decay` spread linspace(−5,3) across heads. Both verified stable under real fp16 autocast on CPU. |
+
+Local verification (potato CPU only): `_resonance_scan` == sequential recurrence to
+fp32 precision at S=256/512/1024 (single and chunked); real 5M spec (U=24, dim
+112) forward/backward finite and stable under fp16 autocast.
+
+Execute on Kaggle:
+`NFRA_CORTEX=1 NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core python -m nfra.benchmark.overnight`

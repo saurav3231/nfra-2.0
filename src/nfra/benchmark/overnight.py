@@ -413,6 +413,13 @@ def phase_core(vocab, random_loss):
                       % (fam, size, seed,
                          '%.3f' % rec['eval_hist'][-1][1] if rec['eval_hist'] else 'NA',
                          rec['tok_s'], rec['peak_mem'], time.perf_counter() - t0))
+                # Only primary-size, last-seed models stay cached (perf/deploy
+                # phases reuse them). Free everything else so non-primary and
+                # extra-seed models don't accumulate and OOM the second size.
+                if not (size == PRIMARY and seed == SEEDS[-1]):
+                    del m
+                    if HAS_CUDA:
+                        torch.cuda.empty_cache()
     metrics = {}
     for size in SIZES:
         metrics[size] = {}
@@ -496,6 +503,9 @@ def phase_context(vocab):
                      'delta_4x': lengths[CONTEXT_LENS[2]] - base}
         print('  [ctx] %-6s final %.3f | @256 %.3f  @512 %.3f  @1024 %.3f'
               % (fam, base, lengths[256], lengths[512], lengths[1024]))
+        del m
+        if HAS_CUDA:
+            torch.cuda.empty_cache()
     return rows
 
 

@@ -97,8 +97,8 @@ PROMPT_LEN = 64
 PRE_HEAD = max(BATCH, 8)            # prefill throughput batch
 
 DIM_GRID = {
-    5:  [256, 224, 192, 160, 128],
-    20: [512, 448, 384, 352, 320, 288, 256],
+    5:  [256, 224, 192, 160, 128, 112, 96],
+    20: [512, 448, 384, 352, 320, 288, 256, 224, 192, 160],
     50: [768, 704, 640, 576, 512],
 }
 
@@ -170,15 +170,25 @@ def build_retnet(vocab, dim, n_layers, n_heads=8, dropout=0.1):
     return RetNetLM(vocab, dim, n_layers, n_heads, dropout)
 
 
-def tune_nfra_size(target, vocab, depth, dims):
-    best = (float('inf'), None, None, None)
-    for U in range(2, min(depth, 8) + 1):
+def tune_nfra_size(target, vocab, depth, dims, tol=0.20):
+    """Pick (unique_blocks, dim) for NFRA. Prefer the MOST DISTINCT blocks
+    (real layer diversity — deep-and-narrow stacks beat the 3.2 shallow
+    recurrence on LM, see docs/OVERNIGHT_VERIFIED_RESULTS.md: retnet's 25
+    distinct layers beat nfra's 6 re-used blocks at the same budget) among
+    configs within `tol` of the param budget; tie-break by param proximity.
+    `depth` is the number of effective layers; U = depth gives a plain
+    distinct-layer stack (passes=1), U < depth keeps the depth-shared
+    recurrence identity."""
+    best = (None, None, None, None)      # (err, U, d, p)
+    for U in range(depth, 1, -1):        # descending: max distinct blocks first
         if depth % U:
             continue
         for d in dims:
             p = count_params(build_nfra(vocab, d, U, depth))
-            err = abs(p - target)
-            if err < best[0]:
+            err = abs(p - target) / target
+            if err <= tol:
+                return U, d, p           # first (highest-U) config in budget
+            if best[0] is None or err < best[0]:
                 best = (err, U, d, p)
     if best[1] is None:
         return 1, dims[-1], count_params(build_nfra(vocab, dims[-1], 1, depth))
@@ -205,10 +215,16 @@ def build_family_spec(family, size, vocab):
     keys = sorted(DIM_GRID)
     dims = next((DIM_GRID[k] for k in keys if size <= k), DIM_GRID[keys[-1]])
     if family == 'nfra':
-        U, dim, params = tune_nfra_size(target, vocab, NFRA_DEPTH, dims)
+        # Distinct-layer scaling: match the field's depth (retnet 25, rwkv 24,
+        # gpt2 24) instead of the 3.2 depth-shared shallow recurrence, so the
+        # head-to-head measures real per-depth compute. tuner picks U=depth
+        # (plain distinct stack) when params allow; depth-sharing stays an
+        # option for memory-constrained configs via NFRA_DEPTH.
+        depth = max(NFRA_DEPTH, 24)
+        U, dim, params = tune_nfra_size(target, vocab, depth, dims)
         spec = dict(builder=build_nfra, dim=dim, extra=dict(unique_blocks=U,
-                                                            depth=NFRA_DEPTH),
-                    params=params, depth=NFRA_DEPTH)
+                                                            depth=depth),
+                    params=params, depth=depth)
         if CORTEX:
             spec['cortex'] = True
     elif family == 'mamba':

@@ -14,6 +14,11 @@ depth-sharing memory, length generalization, graceful recall):
           thalamus, depth_refine, O(H^2) topk+scatter+einsum, per-forward
           attention-mask rebuild). The Cortex block removes the redundant
           linear streams, caches the sliding-window mask, and fuses QKV.
+          The matrix-state mixer now uses CONSTANT multi-scale resonance decay
+          so the recurrence collapses to ONE vectorized two-cumsum closed form
+          (torch.compile-fused, matmul-balanced like RetNet/RWKV instead of a
+          per-token selective-scan kernel). Selectivity moves to the SSD-style
+          write/read (input-dependent B/C + gated value); A stays fixed.
   ADAPT : dopamine "thinking depth" was decorative (depth_f scaling). It is
           now a REAL learnable per-pass EXIT GATE (Gumbel straight-through,
           compute-regularized): easy tokens stop early, hard tokens spend all
@@ -29,8 +34,61 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
-from .resonance import parallel_scan_time_varying, ResonanceGuidedLocalAttention
+from .resonance import ResonanceGuidedLocalAttention
 from .neuro import prefix_pool
+
+
+def _resonance_scan(u: torch.Tensor, a: torch.Tensor, chunk: int = 256):
+    """Stable constant-decay scan: h_t[hd,n] = a[hd,n] * h_{t-1}[hd,n] + u_t.
+
+    With FIXED decay a the recurrence collapses to the vectorized two-cumsum
+    closed form h_t = a^t * cumsum_t(a^-i u_i) — a single pair of cumsums, no
+    per-step alpha materialization and no selective-scan kernel (this is what
+    makes RetNet/RWKV fast in eager torch: matmul/cumsum-shaped ops instead of
+    hundreds of small elementwise kernels).
+
+    For short sequences (the fast path) the whole S collapses to one chunk.
+    a^-t reaches ~1e12 at S=256 and overflows fp32 (~S=1000 for the 0.90
+    scale), so the caller feeds fp32 u and sequences longer than `chunk` are
+    processed chunk-by-chunk: intra-chunk is a SAFE closed form (a^-chunk is
+    tiny) with a cheap sequential combine over the S/chunk boundaries — exact
+    (bit-identical to the recurrence), only used at long-context eval.
+
+    Args:
+        u:     [B, H, S, Hd, N] write contributions (fp32)
+        a:     [H, N] per-(head, state-index) decay in (0, 1)
+        chunk: intra-chunk length for the chunked path (default 256)
+    """
+    B, H, S, Hd, N = u.shape
+    loga = torch.log(a)                                   # [H, N] (< 0)
+    n_chunks = max(1, math.ceil(S / chunk))
+    if n_chunks == 1:
+        pos = torch.arange(1, S + 1, device=u.device).float()
+        di = torch.exp(-pos[:, None, None] * loga[None])   # [S, H, N]
+        df = torch.exp(pos[:, None, None] * loga[None])
+        di = di.permute(1, 0, 2).view(1, H, S, 1, N)
+        df = df.permute(1, 0, 2).view(1, H, S, 1, N)
+        return df * torch.cumsum(di * u, dim=2)
+
+    h_in = torch.zeros(B, H, Hd, N, device=u.device, dtype=u.dtype)
+    outs = []
+    for c in range(n_chunks):
+        uc = u[:, :, c * chunk:(c + 1) * chunk]            # [B,H,C,Hd,N]
+        C = uc.shape[2]
+        pos = torch.arange(1, C + 1, device=u.device).float()
+        di = torch.exp(-pos[:, None, None] * loga[None]).permute(1, 0, 2)
+        df = torch.exp(pos[:, None, None] * loga[None]).permute(1, 0, 2)
+        di = di.view(1, H, C, 1, N)                        # [1,H,C,1,N]
+        df = df.view(1, H, C, 1, N)
+        # NOTE: pos starts at 1, so df[t] = a^{t+1} and di[t] = a^{-(t+1)};
+        # the offsets cancel inside `local` (still the exact zero-state prefix)
+        # and give df[t]*h_in = a^{t+1}*h_in for the incoming state — exactly
+        # the decay from position c*chunk-1 down to c*chunk+t.
+        local = df * torch.cumsum(di * uc, dim=2)          # zero-state prefix
+        true = local + df * h_in.unsqueeze(2)              # + incoming state decay
+        outs.append(true)
+        h_in = true[:, :, -1, :, :]                        # next chunk's input
+    return torch.cat(outs, dim=2)
 
 
 class CortexMixer(nn.Module):
@@ -39,14 +97,16 @@ class CortexMixer(nn.Module):
     Each head carries a matrix state  H_t in R^{Hd x N}  instead of a single
     vector. The recurrence per (channel, state-index):
 
-        H_t[hd, n] = alpha_t[hd, n] * H_{t-1}[hd, n] + B_t[n] * gate_t[hd] * value_t[hd]
+        H_t[hd, n] = a[hd, n] * H_{t-1}[hd, n] + B_t[n] * gate_t[hd] * value_t[hd]
 
-    alpha_t is the multi-scale resonance decay (per-scale targets like 3.1,
-    modulated per token by ACh -> dt selectivity), B/C are learned write/read
-    vectors (SSD-style) giving ~N times the effective memory per parameter.
-
-    Scan runs on the flattened [B, H, S, Hd*N] grid so it reuses the existing
-    parallel_scan_time_varying (closed-form, torch.compile-friendly).
+    a is a CONSTANT multi-scale resonance decay (per-scale targets like 3.1:
+    0.90 / 0.95 / 0.98 / 0.995 across head groups). Keeping A fixed lets the
+    whole recurrence run as one vectorized two-cumsum (see _resonance_scan),
+    while selectivity is preserved the SSD way — input-dependent B/C write and
+    read vectors plus a gated value (ACh-modulated). This is the "noble
+    mechanic" for the benchmark: it stays a true linear-recurrence identity
+    (length generalization, O(1) per step) but trains matmul/cumsum-fast in
+    eager torch instead of a per-token selective-scan kernel.
     """
 
     def __init__(self, dim: int, n_scales: Tuple[int, ...] = (8, 4, 2, 1),
@@ -67,12 +127,11 @@ class CortexMixer(nn.Module):
         self.C_proj = nn.Linear(dim, self.n_heads * d_state, bias=False)
         self.proj_out = nn.Linear(dim, dim, bias=False)
 
-        # Input-dependent (selective) per-token, per-head decay rate.
-        self.dt_proj = nn.Linear(dim, self.n_heads, bias=True)
-        nn.init.zeros_(self.dt_proj.bias)
-
         # Multi-scale decay targets (like 3.1's [0.90, 0.95, 0.98, 0.995]),
-        # one per scale group, over the N state indices.
+        # one per scale group, over the N state indices. log_alpha is a LOGIT:
+        # base_alpha = 0.85 + 0.15*sigmoid(log_alpha) lands on the targets at
+        # init. (Using the logit directly in exp() would give alpha > 1 for the
+        # 0.995 group.)
         targets = [0.90, 0.95, 0.98, 0.995]
         log_a = []
         for n, d in zip(self.head_counts, targets[:len(self.head_counts)]):
@@ -83,10 +142,14 @@ class CortexMixer(nn.Module):
                                 math.log(s_router / (1.0 - s_router))))
         self.log_alpha = nn.Parameter(torch.cat(log_a, dim=0))   # [H, N]
 
-        # Resonance readout: fixed per-head frequencies/phase (no extra
-        # state), applied elementwise after the scan.
+        # Resonance phase: fixed per-head frequencies/phase, applied as a
+        # cheap [S, H] modulation on the WRITE gate (multi-scale identity,
+        # without a full 5-D elementwise pass over the hidden grid).
         self.freqs = nn.Parameter(torch.randn(self.n_heads) * 0.5 + 2.0)
         self.phases = nn.Parameter(torch.randn(self.n_heads) * math.pi)
+
+    def alpha(self) -> torch.Tensor:
+        return (0.85 + 0.15 * torch.sigmoid(self.log_alpha)).clamp(0.85, 0.9995)
 
     def forward(
         self,
@@ -99,41 +162,26 @@ class CortexMixer(nn.Module):
         gv = self.proj_gate_value(x)                        # [B, S, 2D]
         gate = torch.sigmoid(gv[..., :D]).view(B, S, H, Hd)
         value = gv[..., D:].view(B, S, H, Hd)
-
-        # Selective per-token, per-head decay (ACh modulates retention).
-        dt = torch.sigmoid(self.dt_proj(x))                 # [B, S, H] in (0,1)
         if hormones is not None:
             ach = hormones[:, :, 0:1]
-            dt = dt / (1.0 + 0.5 * ach)                     # high ACh -> HOLD
+            gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))    # high ACh -> HOLD
 
-        # alpha[b,h,t,hd,n] = exp(log(base_alpha) * dt)  (const over hd)
-        # base_alpha = 0.85 + 0.15*sigmoid(log_alpha) — log_alpha is a LOGIT
-        # (init: sigmoid(log_alpha)=s so base_alpha lands on the targets).
-        # Using the logit directly in exp() would give alpha > 1 for the
-        # 0.995 group and clamp every head to the scan ceiling — no multi-scale.
-        base_alpha = 0.85 + 0.15 * torch.sigmoid(self.log_alpha)   # [H, N]
-        base_log = torch.log(base_alpha.clamp(min=1e-4))           # [H, N] (<0)
-        a = torch.exp(base_log.unsqueeze(1) * dt.permute(0, 2, 1).unsqueeze(-1))
-        a = a.unsqueeze(3).expand(B, H, S, Hd, N)           # [B,H,S,Hd,N]
-        a_flat = a.reshape(B, H, S, Hd * N)                 # (hd,n) inner
-
-        # Write: u = gate * value (outer) B write vectors -> [B,H,S,Hd,N]
-        gv_c = (gate * value).unsqueeze(-1)                 # [B,S,H,Hd,1]
-        Bt = self.B_proj(x).view(B, S, H, N)                # [B,S,H,N]
-        u5 = gv_c * Bt.unsqueeze(3)                         # [B,S,H,Hd,N]
-        u_flat = u5.permute(0, 2, 1, 3, 4).reshape(B, H, S, Hd * N)
-
-        h = parallel_scan_time_varying(None, u_flat, a_flat,
-                                       alpha_min=0.75, alpha_max=0.9995)
-        h = h.reshape(B, H, S, Hd, N).permute(0, 2, 1, 3, 4)  # [B,S,H,Hd,N]
-
-        # Resonance phase modulation (multi-scale identity), elementwise.
+        # Resonance phase modulation on the WRITE gate (cheap [S,H], keeps the
+        # multi-scale phase identity without touching the 5-D hidden grid).
         pos = torch.arange(S, device=x.device).float()
         phase = torch.sin(
             2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
             + self.phases[:, None])                        # [H, S]
-        phase_mod = (1.0 + 0.05 * phase.t().view(1, S, H, 1, 1))
-        h = h * phase_mod
+        gate = gate * (1.0 + 0.05 * phase.t())[None, :, :, None]
+
+        # Write: u = gate*value outer B write vectors -> [B,H,S,Hd,N]
+        Bt = self.B_proj(x).view(B, S, H, N)                # [B,S,H,N]
+        u = (gate * value).unsqueeze(-1) * Bt.unsqueeze(3)  # [B,S,H,Hd,N]
+        u = u.permute(0, 2, 1, 3, 4).float()                # [B,H,S,Hd,N] fp32
+
+        # Constant multi-scale decay scan (fast two-cumsum; chunked for S>256).
+        h = _resonance_scan(u, self.alpha())
+        h = h.permute(0, 2, 1, 3, 4)                        # [B,S,H,Hd,N]
 
         # Read: y[hd] = sum_n h[hd,n] * C_t[n]
         Ct = self.C_proj(x).view(B, S, H, N)                # [B,S,H,N]
