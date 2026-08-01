@@ -207,3 +207,27 @@ fp32 precision at S=256/512/1024 (single and chunked); real 5M spec (U=24, dim
 
 Execute on Kaggle:
 `NFRA_CORTEX=1 NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core python -m nfra.benchmark.overnight`
+
+## 10. 3.3b Cortex — retention-QK mixer (why v2 still lost; supersedes §7/§9 mixer)
+
+The v2 (cumsum) mechanics did NOT move the needle on the second live 5M core run:
+**nfra 2.296 @ 4.3k tok/s / 0.19 GB** vs retnet 2.040 @ 23.3k tok/s. Two wrong
+bets, now root-caused:
+
+| symptom | root cause | 3.3b fix |
+|---|---|---|
+| loss still ~0.25 nats behind retnet (2.296 vs 2.040) | the cumsum mixer is a **linear recurrence** (accumulate `gate·value ⊗ B`, read with `C`) — no query·key interaction. Linear attention is fundamentally weaker per layer on language than QK-based mixing, regardless of depth or decay mechanics. Both v1 (selective-decay) and v2 (constant-decay) are the linear class. | **Retention-QK mixer**: `y_h = ((Q_h·K_hᵀ/√Hd) ⊙ D_h) @ V_h`, `D_h[i,j]=γ_h^(i−j)`, `γ_h=exp(−exp(log_decay_h))` — RetNet's proven operator, in NFRA's multi-scale resonance framing (log_decay init across −5..3). Selectivity kept as cheap elementwise input-dependent **value gate** (ACh→HOLD, phase-modulated) + **output receptance gate** (RWKV-style) — plain multiplies, parallel form intact. |
+| speed WORSE (4.3k vs 7.8k) | v2 doubled execs (12→24) at half width → ~2× more tiny kernels/block; block still had ~8 components (neuromod, LN, mixer, local-attn, attn-gate, LN, MLP, exit). At dim 112 every GEMM is µs while launches cost ~10µs → **launch-bound, not FLOP-bound**. Batch 4→8 didn't help small kernels (latency-bound). | **Lean RetNet-shaped block**: ln1 → retention mixer → ln2 → gated MLP (SwiGLU, `hidden_mult=2.0`) → exit gate. Dropped local-attn, attn-gate, 5-D scan grid, router-based MLP, novelty gland. ~3 big GEMMs for the mixer + 3 for the MLP per block. |
+| params | the 4× gated MLP + 6 mixer GEMMs made the block ~1.5× heavier per layer than retnet's (12 vs 18 D²) | **`hidden_mult=2.0`** rebalances to (6 mixer + 6 MLP) D² = same total as RetNet (4 + 8) → nfra builds the IDENTICAL geometry: 5M = **dim 112 / depth 33 / 5.03M**, 20M = **dim 224 / depth 33 / 20.00M** (both ≈0% err). Clean head-to-head. |
+| misc | — | arena `NFRA_CHECKPOINT` default 0 (activations are now small — recompute was pure overhead); cortex depth 24→33 (matches retnet's winning build); `NFRA_CORTEX_STATE`/`d_state` kept for config compat but the state dimension no longer exists. |
+
+Local verification (potato CPU only): tuned specs land within 0.7% / 0.0% of the
+5M / 20M budgets at retnet's exact geometry; train forward/backward finite and
+loss moves; eval + bf16-autocast forwards finite; exit-gate skip semantics hold
+by construction (no recurrent state to freeze).
+
+Execute on Kaggle (full families, real T4 numbers):
+`NFRA_CORTEX=1 NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core python -m nfra.benchmark.overnight`
+
+Judge against the retnet baseline at the SAME geometry: nfra@5M loss ≈ 2.04–2.10,
+tok/s ≈ 15k+ (vs 4.3k), RWKV finite.

@@ -76,14 +76,16 @@ ACH_RETAIN = os.environ.get('NFRA_ACH_RETAIN', '0') == '1'
 GAIN_NOV = os.environ.get('NFRA_GAIN_NOV', '0') == '1'
 LORA_RANK = int(os.environ.get('NFRA_LORA_RANK', '0'))     # 0 = off (Space axis)
 BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation knob
-# NFRA 3.3 Cortex: 1 = build NFRA_Cortex_Block (matrix-state mixer + real exit
-# gate) instead of the 3.2 Brain block. Opt-in so 3.2 stays intact for A/B.
+# NFRA 3.3 Cortex: 1 = build NFRA_Cortex_Block (3.3b retention-QK mixer + real
+# exit gate) instead of the 3.2 Brain block. Opt-in so 3.2 stays intact for A/B.
 CORTEX = os.environ.get('NFRA_CORTEX', '0') == '1'
 CORTEX_STATE = int(os.environ.get('NFRA_CORTEX_STATE', '8'))
 EXIT_REG = float(os.environ.get('NFRA_EXIT_REG', '1e-3'))
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
-# model the recompute is pure overhead -> set 0 to raise tok/s.
-CHECKPOINT = os.environ.get('NFRA_CHECKPOINT', '1') == '1'
+# model the recompute is pure overhead -> set 0 to raise tok/s. Off by default
+# for 3.3b: the lean retention block's activations are small (RetNet-shaped),
+# so the recompute cost is pure speed loss.
+CHECKPOINT = os.environ.get('NFRA_CHECKPOINT', '0') == '1'
 # torch.compile(mode='reduce-overhead'): fuses the per-step kernel stream and
 # captures it as CUDA graphs, killing Python/launch overhead (the main reason
 # a small model idles the GPU). Auto-disables checkpointing (recompute conflicts
@@ -215,12 +217,13 @@ def build_family_spec(family, size, vocab):
     keys = sorted(DIM_GRID)
     dims = next((DIM_GRID[k] for k in keys if size <= k), DIM_GRID[keys[-1]])
     if family == 'nfra':
-        # Distinct-layer scaling: match the field's depth (retnet 25, rwkv 24,
+        # Distinct-layer scaling: match the field's depth (retnet ~33, rwkv 24,
         # gpt2 24) instead of the 3.2 depth-shared shallow recurrence, so the
-        # head-to-head measures real per-depth compute. tuner picks U=depth
-        # (plain distinct stack) when params allow; depth-sharing stays an
-        # option for memory-constrained configs via NFRA_DEPTH.
-        depth = max(NFRA_DEPTH, 24)
+        # head-to-head measures real per-depth compute. Cortex depth 33 mirrors
+        # retnet's winning 33-layer build at the same budget. tuner picks
+        # U=depth (plain distinct stack) when params allow; depth-sharing stays
+        # an option for memory-constrained configs via NFRA_DEPTH.
+        depth = max(NFRA_DEPTH, 33)
         U, dim, params = tune_nfra_size(target, vocab, depth, dims)
         spec = dict(builder=build_nfra, dim=dim, extra=dict(unique_blocks=U,
                                                             depth=depth),

@@ -1,31 +1,35 @@
 """
-NFRA 3.3 Cortex-Resonance Block.
+NFRA 3.3b Cortex-Resonance Block.
 
-Addresses the verified overnight gaps (see docs/OVERNIGHT_VERIFIED_RESULTS.md)
-while keeping NFRA's core identity (multi-scale resonance, neuromodulation,
-depth-sharing memory, length generalization, graceful recall):
+Diagnosis that motivated this rewrite (see docs/OVERNIGHT_VERIFIED_RESULTS.md §9):
 
-  LOSS  : state width was 16 heads x 24 = 384 vs mamba's d_state x d_inner
-          ~5632. CortexMixer carries a MATRIX state  [Hd x N] per head
-          (write/read vectors B,C like SSD) -> ~8x the effective state at
-          the same parameter cost (the projections were already dim-sized;
-          the state was just a cheap view).
-  SPEED : the old block ran ~20 small kernels per forward (predictor, gist,
-          thalamus, depth_refine, O(H^2) topk+scatter+einsum, per-forward
-          attention-mask rebuild). The Cortex block removes the redundant
-          linear streams, caches the sliding-window mask, and fuses QKV.
-          The matrix-state mixer now uses CONSTANT multi-scale resonance decay
-          so the recurrence collapses to ONE vectorized two-cumsum closed form
-          (torch.compile-fused, matmul-balanced like RetNet/RWKV instead of a
-          per-token selective-scan kernel). Selectivity moves to the SSD-style
-          write/read (input-dependent B/C + gated value); A stays fixed.
-  ADAPT : dopamine "thinking depth" was decorative (depth_f scaling). It is
-          now a REAL learnable per-pass EXIT GATE (Gumbel straight-through,
-          compute-regularized): easy tokens stop early, hard tokens spend all
-          depth_passes. Inference skips passes for exited tokens.
+  * The 3.3 matrix-state LINEAR-RECURRENCE mixer lost to RetNet by ~0.25 nats
+    (nfra 2.296 vs retnet 2.040 @ 5M). Root cause: a linear recurrence
+    (accumulate gate*value ⊗ B, read with C) has NO query-key interaction —
+    linear attention is fundamentally weaker per layer on language than
+    QK-based mixing, regardless of depth or decay mechanics.
+  * It was also SLOWER (4323 tok/s vs retnet 23338). The recurrence ran as a
+    [B,H,S,Hd,N] 5-D elementwise grid (cumsum + einsum + permutes) — dozens of
+    tiny memory-bound kernels per block, plus 8 components/block. RetNet is
+    fast because each block is ~3 big GEMMs.
 
-Preserved: depth-sharing (sub-GB memory), recurrence core (length
-generalization), local attention (graceful recall), neuromodulation identity.
+The 3.3b block keeps NFRA's identity (multi-scale resonance, neuromodulation,
+adaptive exit) but swaps the weak/slow recurrence for a RETENTION mixer: the
+multi-scale decayed QK^T attention of RetNet, computed as two O(S^2) matmuls
+(parallel training) with an O(1)-per-step recurrent dual for generation.
+
+Preserved identity:
+  * RESONANCE   : per-head exponential decays are init across a multi-scale
+                  grid (log_decay -5..3 → long-range 0.99+ down to local) —
+                  the "multiple timescales" of the brain/cortex framing.
+  * SELECTIVITY : a neuromodulated VALUE gate (ACh → HOLD) + an output
+                  receptance gate (RWKV-style) keep input-dependent routing
+                  without breaking the constant-decay parallel form.
+  * NEUROMOD    : lean causal hormone gland threads ACh/NE/etc across blocks.
+  * ADAPTIVE    : the per-token exit gate (Gumbel ST) stays.
+  * RECURRENCE  : retention = parallel-trainable AND recurrent-inferable
+                  (O(S^2) train, O(1) per token gen), so length generalization
+                  and fast generation survive.
 """
 
 import torch
@@ -34,164 +38,91 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
-from .resonance import ResonanceGuidedLocalAttention
 from .neuro import prefix_pool
 
 
-def _resonance_scan(u: torch.Tensor, a: torch.Tensor, chunk: int = 256):
-    """Stable constant-decay scan: h_t[hd,n] = a[hd,n] * h_{t-1}[hd,n] + u_t.
-
-    With FIXED decay a the recurrence collapses to the vectorized two-cumsum
-    closed form h_t = a^t * cumsum_t(a^-i u_i) — a single pair of cumsums, no
-    per-step alpha materialization and no selective-scan kernel (this is what
-    makes RetNet/RWKV fast in eager torch: matmul/cumsum-shaped ops instead of
-    hundreds of small elementwise kernels).
-
-    For short sequences (the fast path) the whole S collapses to one chunk.
-    a^-t reaches ~1e12 at S=256 and overflows fp32 (~S=1000 for the 0.90
-    scale), so the caller feeds fp32 u and sequences longer than `chunk` are
-    processed chunk-by-chunk: intra-chunk is a SAFE closed form (a^-chunk is
-    tiny) with a cheap sequential combine over the S/chunk boundaries — exact
-    (bit-identical to the recurrence), only used at long-context eval.
-
-    Args:
-        u:     [B, H, S, Hd, N] write contributions (fp32)
-        a:     [H, N] per-(head, state-index) decay in (0, 1)
-        chunk: intra-chunk length for the chunked path (default 256)
-    """
-    B, H, S, Hd, N = u.shape
-    loga = torch.log(a)                                   # [H, N] (< 0)
-    n_chunks = max(1, math.ceil(S / chunk))
-    if n_chunks == 1:
-        pos = torch.arange(1, S + 1, device=u.device).float()
-        di = torch.exp(-pos[:, None, None] * loga[None])   # [S, H, N]
-        df = torch.exp(pos[:, None, None] * loga[None])
-        di = di.permute(1, 0, 2).view(1, H, S, 1, N)
-        df = df.permute(1, 0, 2).view(1, H, S, 1, N)
-        return df * torch.cumsum(di * u, dim=2)
-
-    h_in = torch.zeros(B, H, Hd, N, device=u.device, dtype=u.dtype)
-    outs = []
-    for c in range(n_chunks):
-        uc = u[:, :, c * chunk:(c + 1) * chunk]            # [B,H,C,Hd,N]
-        C = uc.shape[2]
-        pos = torch.arange(1, C + 1, device=u.device).float()
-        di = torch.exp(-pos[:, None, None] * loga[None]).permute(1, 0, 2)
-        df = torch.exp(pos[:, None, None] * loga[None]).permute(1, 0, 2)
-        di = di.view(1, H, C, 1, N)                        # [1,H,C,1,N]
-        df = df.view(1, H, C, 1, N)
-        # NOTE: pos starts at 1, so df[t] = a^{t+1} and di[t] = a^{-(t+1)};
-        # the offsets cancel inside `local` (still the exact zero-state prefix)
-        # and give df[t]*h_in = a^{t+1}*h_in for the incoming state — exactly
-        # the decay from position c*chunk-1 down to c*chunk+t.
-        local = df * torch.cumsum(di * uc, dim=2)          # zero-state prefix
-        true = local + df * h_in.unsqueeze(2)              # + incoming state decay
-        outs.append(true)
-        h_in = true[:, :, -1, :, :]                        # next chunk's input
-    return torch.cat(outs, dim=2)
-
-
 class CortexMixer(nn.Module):
-    """Matrix-state multi-scale resonance mixer (the 3.3 core).
+    """Resonance retention mixer (the 3.3b core).
 
-    Each head carries a matrix state  H_t in R^{Hd x N}  instead of a single
-    vector. The recurrence per (channel, state-index):
+    RetNet-style softmax-free QK retention in NFRA's multi-scale framing.
+    Each head owns a learned exponential decay; the mixing operator is the
+    decayed causal attention
 
-        H_t[hd, n] = a[hd, n] * H_{t-1}[hd, n] + B_t[n] * gate_t[hd] * value_t[hd]
+        y_h = ( (Q_h . K_h^T / sqrt(Hd)) . D_h ) @ V_h,
+        D_h[i, j] = gamma_h^(i - j)   for j <= i, else 0
+        gamma_h = exp(-exp(log_decay_h))
 
-    a is a CONSTANT multi-scale resonance decay (per-scale targets like 3.1:
-    0.90 / 0.95 / 0.98 / 0.995 across head groups). Keeping A fixed lets the
-    whole recurrence run as one vectorized two-cumsum (see _resonance_scan),
-    while selectivity is preserved the SSD way — input-dependent B/C write and
-    read vectors plus a gated value (ACh-modulated). This is the "noble
-    mechanic" for the benchmark: it stays a true linear-recurrence identity
-    (length generalization, O(1) per step) but trains matmul/cumsum-fast in
-    eager torch instead of a per-token selective-scan kernel.
+    computed as two O(S^2) matmuls (GPU-efficient, no per-token scan kernel).
+    Selectivity (the linear-attention advantage) is kept cheaply: a learned
+    VALUE gate per token (ACh/phase-modulated, like 3.1's write gate) and an
+    output receptance gate (RWKV-style) — both input-dependent but applied as
+    plain elementwise multiplies, so the parallel form stays intact.
     """
 
-    def __init__(self, dim: int, n_scales: Tuple[int, ...] = (8, 4, 2, 1),
-                 d_state: int = 8):
+    def __init__(self, dim: int, n_heads: int = 8):
         super().__init__()
         self.dim = dim
-        self.d_state = d_state
-        self.head_counts = list(n_scales)
-        self.n_heads = sum(self.head_counts) + 1          # +1 router head
-        self.head_dim = dim // self.n_heads
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
         if dim != self.n_heads * self.head_dim:
             raise ValueError('dim (%d) must be divisible by %d heads'
                              % (dim, self.n_heads))
 
-        # Fused gate+value (one GEMM, like 3.1) + write/read vectors + out.
-        self.proj_gate_value = nn.Linear(dim, 2 * dim, bias=False)
-        self.B_proj = nn.Linear(dim, self.n_heads * d_state, bias=False)
-        self.C_proj = nn.Linear(dim, self.n_heads * d_state, bias=False)
+        # Fused QKV (one GEMM) + value gate + output receptance gate + out.
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.gate_proj = nn.Linear(dim, dim, bias=False)
+        self.r_proj = nn.Linear(dim, dim, bias=False)
+        self.gn = nn.GroupNorm(n_heads, dim)
         self.proj_out = nn.Linear(dim, dim, bias=False)
 
-        # Multi-scale decay targets (like 3.1's [0.90, 0.95, 0.98, 0.995]),
-        # one per scale group, over the N state indices. log_alpha is a LOGIT:
-        # base_alpha = 0.85 + 0.15*sigmoid(log_alpha) lands on the targets at
-        # init. (Using the logit directly in exp() would give alpha > 1 for the
-        # 0.995 group.)
-        targets = [0.90, 0.95, 0.98, 0.995]
-        log_a = []
-        for n, d in zip(self.head_counts, targets[:len(self.head_counts)]):
-            s = (d - 0.85) / 0.15
-            log_a.append(torch.full((n, d_state), math.log(s / (1.0 - s))))
-        s_router = (0.9 - 0.85) / 0.15
-        log_a.append(torch.full((1, d_state),
-                                math.log(s_router / (1.0 - s_router))))
-        self.log_alpha = nn.Parameter(torch.cat(log_a, dim=0))   # [H, N]
+        # Multi-scale resonance decay: heads spread across timescales. Init
+        # exactly like the proven RetNet grid (log_decay -5 -> gamma ~0.993,
+        # 0.993^255 ~0.17 survives; log_decay +3 -> gamma ~2e-9, local only)
+        # and left trainable.
+        self.log_decay = nn.Parameter(torch.linspace(-5.0, 3.0, n_heads))
 
-        # Resonance phase: fixed per-head frequencies/phase, applied as a
-        # cheap [S, H] modulation on the WRITE gate (multi-scale identity,
-        # without a full 5-D elementwise pass over the hidden grid).
+        # Resonance phase (oscillatory identity, cheap [S, H] gate modulation).
         self.freqs = nn.Parameter(torch.randn(self.n_heads) * 0.5 + 2.0)
         self.phases = nn.Parameter(torch.randn(self.n_heads) * math.pi)
 
-    def alpha(self) -> torch.Tensor:
-        return (0.85 + 0.15 * torch.sigmoid(self.log_alpha)).clamp(0.85, 0.9995)
+    def decay_mask(self, S: int) -> torch.Tensor:
+        """Causal decayed mask D_h[i,j] = gamma_h^(i-j), j <= i. [1,H,S,S]."""
+        rel = (torch.arange(S, device=self.log_decay.device).float().view(S, 1)
+               - torch.arange(S, device=self.log_decay.device).float().view(1, S))
+        rel = rel.clamp(min=0.0)                                 # future -> 0
+        decay = torch.exp(-torch.exp(self.log_decay.view(1, self.n_heads, 1, 1))
+                          * rel.view(1, 1, S, S))                # [1,H,S,S]
+        return decay.masked_fill(torch.triu(
+            torch.ones(S, S, device=decay.device, dtype=torch.bool), 1), 0.0)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        hormones: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor,
+                hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, S, D = x.shape
-        H, Hd, N = self.n_heads, self.head_dim, self.d_state
+        H, Hd = self.n_heads, self.head_dim
 
-        gv = self.proj_gate_value(x)                        # [B, S, 2D]
-        gate = torch.sigmoid(gv[..., :D]).view(B, S, H, Hd)
-        value = gv[..., D:].view(B, S, H, Hd)
+        qkv = self.qkv(x).view(B, S, 3, H, Hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]                         # [B,H,S,Hd]
+
+        # Selectivity: input-dependent value gate (ACh -> HOLD, phase-modulated).
+        gate = torch.sigmoid(self.gate_proj(x)).view(B, S, H, Hd)
         if hormones is not None:
             ach = hormones[:, :, 0:1]
-            gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))    # high ACh -> HOLD
-
-        # Resonance phase modulation on the WRITE gate (cheap [S,H], keeps the
-        # multi-scale phase identity without touching the 5-D hidden grid).
+            gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))        # high ACh -> HOLD
         pos = torch.arange(S, device=x.device).float()
-        phase = torch.sin(
-            2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
-            + self.phases[:, None])                        # [H, S]
+        phase = torch.sin(2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
+                          + self.phases[:, None])                # [H,S]
         gate = gate * (1.0 + 0.05 * phase.t())[None, :, :, None]
+        v = v * gate.permute(0, 2, 1, 3)
 
-        # Write: u = gate*value outer B write vectors -> [B,H,S,Hd,N]
-        Bt = self.B_proj(x).view(B, S, H, N)                # [B,S,H,N]
-        u = (gate * value).unsqueeze(-1) * Bt.unsqueeze(3)  # [B,S,H,Hd,N]
-        u = u.permute(0, 2, 1, 3, 4).float()                # [B,H,S,Hd,N] fp32
+        # Retention (parallel form): decayed QK^T attention, no softmax.
+        scores = torch.matmul(q * (Hd ** -0.5), k.transpose(-2, -1))
+        y = torch.matmul(scores * self.decay_mask(S), v)         # [B,H,S,Hd]
+        y = y.permute(0, 2, 1, 3).reshape(B, S, D)
+        y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
 
-        # Constant multi-scale decay scan (fast two-cumsum; chunked for S>256).
-        h = _resonance_scan(u, self.alpha())
-        h = h.permute(0, 2, 1, 3, 4)                        # [B,S,H,Hd,N]
-
-        # Read: y[hd] = sum_n h[hd,n] * C_t[n]
-        Ct = self.C_proj(x).view(B, S, H, N)                # [B,S,H,N]
-        y = torch.einsum('bshdn,bshn->bshd', h, Ct)         # [B,S,H,Hd]
-        y = y.reshape(B, S, D)
-
-        router_state = y[..., -self.head_dim:]
-        router_score = torch.sigmoid(router_state.mean(dim=-1, keepdim=True))
-
-        return self.proj_out(y), router_score
+        # Output receptance gate (RWKV-style selectivity on the read).
+        r = torch.sigmoid(self.r_proj(x))
+        return self.proj_out(y * r)
 
 
 class CortexExit(nn.Module):
@@ -228,9 +159,77 @@ class CortexExit(nn.Module):
         return cont + (p - p.detach()), p
 
 
+class CortexMLP(nn.Module):
+    """Lean gated MLP (silu(gate) * up -> down) with a cheap NE gain.
+
+    Replaces 3.3's router-based BrainMLP in the Cortex path: the router,
+    cortisol pruning and k-WTA all cost extra kernels that (at small width)
+    make the block launch-bound. A plain SwiGLU gives the same FLOPs at a
+    fraction of the kernels — this is what makes RetNet's block fast.
+
+    hidden_mult=2.0 deliberately rebalances capacity toward the retention
+    mixer: with the 3-proj gated MLP the block becomes (6 mixer + 6 MLP) D^2 —
+    the SAME total as RetNet's (4 + 8) D^2 — so at matched params nfra builds
+    the identical dim/depth geometry as retnet (e.g. 112/33 @ 5M) and the
+    mixer's extra selectivity carries the differentiator.
+    """
+
+    def __init__(self, dim: int, hidden_mult: float = 2.0,
+                 k_wta_frac: float = 0.0):
+        super().__init__()
+        self.dim = dim
+        self.k_wta_frac = k_wta_frac
+        hidden = int(dim * hidden_mult)
+        self.gate_proj = nn.Linear(dim, hidden, bias=False)
+        self.up_proj = nn.Linear(dim, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x: torch.Tensor,
+                hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
+        gate = F.silu(self.gate_proj(x))
+        hidden = gate * self.up_proj(x)
+        if self.k_wta_frac > 0.0:
+            k = max(1, int(math.ceil(self.k_wta_frac * hidden.shape[-1])))
+            thr = hidden.topk(k, dim=-1).values[..., -1:]
+            hidden = hidden * (hidden >= thr).float()
+        if hormones is not None:
+            ne = hormones[:, :, 1:2]
+            hidden = hidden * (1.0 + 0.5 * ne)
+        return self.down_proj(hidden)
+
+
+class CortexNeuromodulator(nn.Module):
+    """Lean neuromodulator: causal prefix gland (ACh/NE/DA/5HT/CORT/OX).
+
+    3.3's NeuroModulator also computed a prefix-variance novelty term (a
+    second cumsum pair per block). For the launch-bound small-width regime
+    that overhead is pure cost — the prefix-mean gland carries the same
+    "slow whole-state mood" identity at half the kernels.
+    """
+
+    def __init__(self, dim: int, n_hormones: int = 6, smoothing: float = 0.9):
+        super().__init__()
+        self.n_hormones = n_hormones
+        self.smoothing = smoothing
+        self.context_gland = nn.Linear(dim, n_hormones, bias=False)
+        self.baseline = nn.Parameter(torch.zeros(n_hormones))
+
+    def forward(self, x: torch.Tensor,
+                prev_hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pooled = prefix_pool(x)                              # causal [B,S,D]
+        raw = torch.sigmoid(self.context_gland(pooled) + self.baseline.unsqueeze(0))
+        if prev_hormones is not None:
+            return self.smoothing * prev_hormones + (1.0 - self.smoothing) * raw
+        return raw
+
+
 class NFRA_Cortex_Block(nn.Module):
-    """NFRA 3.3 Cortex block: neuromodulator + matrix-state mixer +
-    cached-window local attention + fractal MLP + adaptive exit gate."""
+    """NFRA 3.3b Cortex block: lean neuromodulated retention mixer + gated MLP.
+
+    The whole block is ~3 matmuls for the mixer, 3 for the MLP, plus norms,
+    gates and the cheap hormone gland — RetNet-shaped, so it trains at
+    RetNet speed instead of the 5-D-scan 3.3 block (4323 vs 23338 tok/s).
+    """
 
     def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,
                  d_state: int = 8, exit_reg: float = 1e-3,
@@ -239,19 +238,11 @@ class NFRA_Cortex_Block(nn.Module):
         super().__init__()
         self.dim = dim
 
-        from .neuro import NeuroModulator, BrainMLP
-
-        self.neuromodulator = NeuroModulator(dim)
+        self.neuromodulator = CortexNeuromodulator(dim)
         self.ln1 = nn.LayerNorm(dim)
-        self.mixer = CortexMixer(dim, d_state=d_state)
-        self.local_attn = ResonanceGuidedLocalAttention(
-            dim, n_heads=2, head_dim=max(4, dim // 8), window=64)
-        self.attn_gate = nn.Linear(dim, 1, bias=False)
-
+        self.mixer = CortexMixer(dim)
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = BrainMLP(dim, hidden_mult=4.0,
-                            k_wta_frac=k_wta_frac,
-                            local_route=local_route, div_norm=div_norm)
+        self.mlp = CortexMLP(dim, k_wta_frac=k_wta_frac)
 
         self.dropout = nn.Dropout(dropout)
         self.exit_gate = CortexExit(dim, reg=exit_reg)
@@ -271,10 +262,7 @@ class NFRA_Cortex_Block(nn.Module):
 
         residual = x
         n = self.ln1(x)
-        mix_out, router_score = self.mixer(n, hormones=hormones)
-        attn = self.local_attn(n, router_score)
-        attn_gate = torch.sigmoid(self.attn_gate(n)).clamp(0.0, 0.5)
-        mix_out = mix_out + attn_gate * attn
+        mix_out = self.mixer(n, hormones=hormones)
         x = residual + self.dropout(mix_out)
 
         residual = x
