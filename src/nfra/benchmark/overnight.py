@@ -423,7 +423,8 @@ def phase_core(vocab, random_loss):
             params = specs[size][fam]['params']
             row = {
                 'params': params, 'depth': specs[size][fam]['depth'],
-                'spec': specs[size][fam],
+                'spec': {k: v for k, v in specs[size][fam].items()
+                         if k != 'builder'},
                 'final_eval': m_final, 'final_eval_sd': sd_final,
                 'final_eval_n': len(recs),
                 'ppl': math.exp(min(m_final, 30)) if m_final else None,
@@ -944,6 +945,16 @@ def load_state():
     return set(), {}
 
 
+def _json_default(o):
+    if callable(o):
+        return repr(o)
+    if isinstance(o, torch.Tensor):
+        return o.detach().cpu().item()
+    if isinstance(o, np.generic):
+        return o.item()
+    raise TypeError('not JSON serializable: %r' % o)
+
+
 def save_state(completed, data):
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump({'completed': sorted(completed)}, f, indent=2)
@@ -952,7 +963,7 @@ def save_state(completed, data):
                               'seeds': SEEDS, 'phases': PHASES,
                               'data': DATA, 'vocab': VOCAB},
                    'env': _env_snapshot(),
-                   'data': data}, f, indent=2, default=float)
+                   'data': data}, f, indent=2, default=_json_default)
 
 
 def _env_snapshot():
