@@ -151,6 +151,10 @@ Wiring status (this session, not yet validated on Kaggle):
 - Quick sanity: `python -m nfra.benchmark.cortex_smoke` (params ~5M, train
   forward/backward finite, all-exit forward == depth-1 forward bit-exact).
   Parse-only syntax checks pass; **not yet executed** (pending Kaggle run).
+- Fixed before Kaggle (parse-only, discovered by code review): `Bt.unsqueeze(2)`
+  → `unsqueeze(3)` in the CortexMixer write path (broadcast singleton was on
+  the head axis, crashing whenever H ≠ Hd); the sliding-window attention mask is
+  now actually cached per (length, device) as its docstring always claimed.
 
 Next: 5M quick A/B (3.2 vs 3.3) on Kaggle T4, then re-run the live 8-phase
 overnight with the fixed `save_state`/`ablate`/`deploy` bugs.
