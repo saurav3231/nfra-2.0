@@ -717,43 +717,61 @@ def main():
     print(f"  -> {out_md}")
 
 
+def _arg_extreme(fams, key, direction):
+    """argmin/argmax over fams by key(f), skipping None values; None if all
+    None. Short/aborted runs produce None metrics (e.g. sample_auc needs >=2
+    eval points, param_eff needs a final loss) -- a raw min()/max() on those
+    crashed make_verdict and killed the whole phase."""
+    cands = [(f, key(f)) for f in fams if key(f) is not None]
+    if not cands:
+        return None
+    return (min if direction == 'min' else max)(cands, key=lambda t: t[1])[0]
+
+
 def make_verdict(metrics, scores, scaling, primary, random_loss):
     fams = list(metrics[primary])
     m = metrics[primary]
-    by_loss = sorted(fams, key=lambda f: m[f]['final_eval'])
-    best_q = by_loss[0]
+    finite = [f for f in fams if m[f]['final_eval'] is not None]
+    by_loss = sorted(finite, key=lambda f: m[f]['final_eval'])
+    best_q = by_loss[0] if by_loss else None
     second_q = by_loss[1] if len(by_loss) > 1 else None
     q_delta = (m[second_q]['final_eval'] - m[best_q]['final_eval']) if second_q else 0.0
-    best_mem = min(fams, key=lambda f: m[f]['peak_mem'])
-    best_speed = max(fams, key=lambda f: m[f]['tok_s_train'])
-    best_scale = max(fams, key=lambda f: -scaling[f]['slope'])
-    best_score = max(fams, key=lambda f: scores[primary][f])
-    worst_score = min(fams, key=lambda f: scores[primary][f])
+    best_mem = _arg_extreme(fams, lambda f: m[f]['peak_mem'], 'min')
+    worst_mem = _arg_extreme(fams, lambda f: m[f]['peak_mem'], 'max')
+    best_speed = _arg_extreme(fams, lambda f: m[f]['tok_s_train'], 'max')
+    best_scale = _arg_extreme(fams, lambda f: -scaling[f]['slope'], 'max')
+    best_score = _arg_extreme(fams, lambda f: scores[primary][f], 'max')
+    worst_score = _arg_extreme(fams, lambda f: scores[primary][f], 'min')
+    best_eff = _arg_extreme(fams, lambda f: m[f]['param_eff'], 'max')
+    best_sample_eff = _arg_extreme(fams, lambda f: m[f]['sample_auc'], 'min')
+    best_extrap = _arg_extreme(fams, lambda f: m[f].get('extrap_delta'), 'min')
+
+    def _ev(claim, fam, status, evidence):
+        return dict(claim=claim, family=fam,
+                    status='skipped' if fam is None else status,
+                    evidence=evidence)
 
     claims = [
-        dict(claim='lowest eval loss (best quality)', family=best_q,
-             status='confirmed' if q_delta >= 0.02 else 'marginal',
-             evidence=f"Δ{abs(q_delta):.3f} vs runner-up at {primary}M"),
-        dict(claim='most parameter-efficient (loss-gain per M param)',
-             family=max(fams, key=lambda f: m[f]['param_eff']), status='confirmed',
-             evidence=None),
-        dict(claim='most sample-efficient (lowest learning-curve AUC)',
-             family=min(fams, key=lambda f: m[f]['sample_auc']), status='confirmed',
-             evidence=None),
-        dict(claim='lowest peak training memory',
-             family=best_mem, status='confirmed',
-             evidence=f"{m[best_mem]['peak_mem']:.2f} GB vs "
-                      f"{m[max(fams, key=lambda f: m[f]['peak_mem'])]['peak_mem']:.2f} GB"),
-        dict(claim='fastest training throughput',
-             family=best_speed, status='confirmed',
-             evidence=f"{m[best_speed]['tok_s_train']:.0f} tok/s"),
-        dict(claim='best scaling slope (loss per doubling of params)',
-             family=best_scale, status='confirmed',
-             evidence=f"{scaling[best_scale]['slope']:.3f} bits/doubling"),
-        dict(claim='most robust to longer contexts (2× extrapolation)',
-             family=min(fams, key=lambda f: m[f].get('extrap_delta', 0.0)),
-             status='confirmed' if 'extrap_delta' in m[best_q] else 'unmeasured',
-             evidence=None),
+        _ev('lowest eval loss (best quality)', best_q,
+            'confirmed' if q_delta >= 0.02 else 'marginal',
+            f"Δ{abs(q_delta):.3f} vs runner-up at {primary}M"),
+        _ev('most parameter-efficient (loss-gain per M param)', best_eff,
+            'confirmed', None),
+        _ev('most sample-efficient (lowest learning-curve AUC)',
+            best_sample_eff, 'confirmed', None),
+        _ev('lowest peak training memory', best_mem, 'confirmed',
+            f"{m[best_mem]['peak_mem']:.2f} GB vs "
+            f"{m[worst_mem]['peak_mem']:.2f} GB"
+            if best_mem and worst_mem else None),
+        _ev('fastest training throughput', best_speed, 'confirmed',
+            f"{m[best_speed]['tok_s_train']:.0f} tok/s" if best_speed else None),
+        _ev('best scaling slope (loss per doubling of params)', best_scale,
+            'confirmed',
+            f"{scaling[best_scale]['slope']:.3f} bits/doubling"
+            if best_scale else None),
+        _ev('most robust to longer contexts (2× extrapolation)', best_extrap,
+            'confirmed' if (best_extrap and 'extrap_delta' in m[best_extrap])
+            else 'unmeasured', None),
     ]
     for c in claims:
         if c['family'] not in fams:
@@ -767,10 +785,11 @@ def make_verdict(metrics, scores, scaling, primary, random_loss):
         'worst_score': round(scores[primary][worst_score], 1),
     }
     if nfra:
-        revo['nfra_quality_rank'] = '1st' if best_q == nfra else \
-            '2nd' if second_q == nfra else 'last'
+        revo['nfra_quality_rank'] = ('1st' if best_q == nfra else
+                                     '2nd' if second_q == nfra else 'last')
         revo['nfra_quality_gap_to_best'] = round(
-            m[nfra]['final_eval'] - m[best_q]['final_eval'], 3)
+            m[nfra]['final_eval'] - m[best_q]['final_eval'], 3) \
+            if best_q else None
         revo['nfra_mem_gb'] = round(m[nfra]['peak_mem'], 2)
         revo['nfra_speed_tok_s'] = round(m[nfra]['tok_s_train'])
         revo['nfra_is_overall_winner'] = best_score == nfra
