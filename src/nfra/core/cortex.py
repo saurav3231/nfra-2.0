@@ -65,10 +65,13 @@ class CortexMixer(nn.Module):
             raise ValueError('dim (%d) must be divisible by %d heads'
                              % (dim, self.n_heads))
 
-        # Fused QKV (one GEMM) + value gate + output receptance gate + out.
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.gate_proj = nn.Linear(dim, dim, bias=False)
-        self.r_proj = nn.Linear(dim, dim, bias=False)
+        # Fused QKV + value-gate + receptance-gate as ONE GEMM (5*D output).
+        # The three projections retnet needs as 3 separate linears plus the two
+        # selectivity gates are all Linear(dim, dim) on the same input, so
+        # concatenating their weights is bit-identical but cuts 2 kernel
+        # launches per block -- the launch-bound cost that kept nfra ~2x
+        # slower than retnet at identical D^2/block.
+        self.qkvr = nn.Linear(dim, 5 * dim, bias=False)
         self.gn = nn.GroupNorm(n_heads, dim)
         self.proj_out = nn.Linear(dim, dim, bias=False)
 
@@ -109,11 +112,11 @@ class CortexMixer(nn.Module):
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
-        qkv = self.qkv(x).view(B, S, 3, H, Hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]                         # [B,H,S,Hd]
+        t = self.qkvr(x).view(B, S, 5, H, Hd).permute(2, 0, 3, 1, 4)
+        q, k, v, g, r = t[0], t[1], t[2], t[3], t[4]            # [B,H,S,Hd]
 
         # Selectivity: input-dependent value gate (ACh -> HOLD, phase-modulated).
-        gate = torch.sigmoid(self.gate_proj(x)).view(B, S, H, Hd)
+        gate = torch.sigmoid(g).permute(0, 2, 1, 3)             # [B,S,H,Hd]
         if hormones is not None:
             ach = hormones[:, :, 0:1]
             gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))        # high ACh -> HOLD
@@ -130,7 +133,7 @@ class CortexMixer(nn.Module):
         y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
 
         # Output receptance gate (RWKV-style selectivity on the read).
-        r = torch.sigmoid(self.r_proj(x))
+        r = torch.sigmoid(r).permute(0, 2, 1, 3).reshape(B, S, D)
         return self.proj_out(y * r)
 
 
@@ -189,14 +192,14 @@ class CortexMLP(nn.Module):
         self.dim = dim
         self.k_wta_frac = k_wta_frac
         hidden = int(dim * hidden_mult)
-        self.gate_proj = nn.Linear(dim, hidden, bias=False)
-        self.up_proj = nn.Linear(dim, hidden, bias=False)
+        self.gate_up = nn.Linear(dim, 2 * hidden, bias=False)
         self.down_proj = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor,
                 hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
-        gate = F.silu(self.gate_proj(x))
-        hidden = gate * self.up_proj(x)
+        gu = self.gate_up(x)
+        gate, up = gu.chunk(2, dim=-1)
+        hidden = F.silu(gate) * up
         if self.k_wta_frac > 0.0:
             k = max(1, int(math.ceil(self.k_wta_frac * hidden.shape[-1])))
             thr = hidden.topk(k, dim=-1).values[..., -1:]
