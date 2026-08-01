@@ -646,6 +646,11 @@ def phase_ablate(vocab):
     train_loaders, eval_loader, _ext = make_loaders(SIZES.index(PRIMARY))
     results = {}
     for name, build_kw, train_kw, n_seeds in ABLATE:
+        fam = build_kw.get('fam', 'nfra')
+        if fam not in FAMILIES:
+            print('  [skip] %-16s (family %s not in NFRA_OVN_FAMILIES)'
+                  % (name, fam))
+            continue
         seeds = SEEDS[:min(n_seeds, SEED_CNT)]
         recs, params = [], None
         build_kw = dict(build_kw)
