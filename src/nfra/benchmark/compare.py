@@ -379,15 +379,16 @@ class GPT2ForCausalLM(nn.Module):
 
 
 class RWKVBlock(nn.Module):
-    """RWKV-4 style block: token-shift time-mixing (linear attention with a
-    per-channel exponential-decay WKV recurrence + current-token bonus) plus a
-    squared-ReLU channel-mixing. The WKV decay is CONSTANT per channel, so the
-    recurrence reduces to two cumsums — O(S) pure-torch ops, no associative
-    scan — which is why RWKV trains much faster than Mamba's selective SSM here.
+    """RWKV-6 style block: pre-LN token-shift time-mixing (linear attention
+    with a per-channel exponential-decay WKV recurrence + current-token bonus)
+    plus a squared-ReLU channel-mixing over the post-time-mix residual. The
+    WKV decay is CONSTANT per channel, so the recurrence reduces to two
+    cumsums — O(S) pure-torch ops, no associative scan — which is why RWKV
+    trains much faster than Mamba's selective SSM here.
     """
     def __init__(self, dim, dropout=0.1):
         super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
+        self.ln1 = nn.LayerNorm(dim)          # pre-norm: bounds k/v so fp16 AMP linears stay finite
         self.time_mix_k = nn.Parameter(torch.ones(dim))
         self.time_mix_v = nn.Parameter(torch.ones(dim))
         self.time_mix_r = nn.Parameter(torch.ones(dim))
@@ -399,6 +400,7 @@ class RWKVBlock(nn.Module):
         self.time_first = nn.Parameter(torch.randn(dim))   # current-token bonus
         self.ln2 = nn.LayerNorm(dim)
         self.time_mix_cm = nn.Parameter(torch.ones(dim))
+        self.time_mix_r2 = nn.Parameter(torch.ones(dim))
         self.cm_key = nn.Linear(dim, dim, bias=False)
         self.cm_value = nn.Linear(dim, dim, bias=False)
         self.cm_receptance = nn.Linear(dim, dim, bias=False)
@@ -407,31 +409,36 @@ class RWKVBlock(nn.Module):
 
     def forward(self, x):
         B, S, D = x.shape
-        x_shift = F.pad(x[:, :-1, :], (0, 0, 1, 0))
+        xn = self.ln1(x)
+        x_shift = F.pad(xn[:, :-1, :], (0, 0, 1, 0))
         # ── time mixing (linear attention, WKV recurrence)
-        xk = x * self.time_mix_k + x_shift * (1 - self.time_mix_k)
-        xv = x * self.time_mix_v + x_shift * (1 - self.time_mix_v)
-        xr = x * self.time_mix_r + x_shift * (1 - self.time_mix_r)
+        xk = xn * self.time_mix_k + x_shift * (1 - self.time_mix_k)
+        xv = xn * self.time_mix_v + x_shift * (1 - self.time_mix_v)
+        xr = xn * self.time_mix_r + x_shift * (1 - self.time_mix_r)
         k = self.key(xk)
         v = self.value(xv)
         r = torch.sigmoid(self.receptance(xr))
-        w = torch.exp(-torch.exp(self.time_decay)).clamp(max=1.0)     # [D] in (0,1]
+        # WKV recurrence is numerically delicate (exp decay + long cumsum):
+        # cast to fp32 like mamba_scan so fp16 AMP can't overflow to NaN.
+        k = k.float(); v = v.float(); r = r.float()
+        w = torch.exp(-torch.exp(self.time_decay.float())).clamp(max=1.0)  # [D] in (0,1]
         t = torch.arange(S, device=x.device).float()
         wpos = torch.clamp(w.view(1, 1, D) * t.view(1, S, 1), -60, 60)
         e = torch.exp(wpos)
         num = torch.cumsum(k * v * e, dim=1) * torch.exp(-wpos)
         den = torch.cumsum(k * e, dim=1) * torch.exp(-wpos)
-        b = torch.exp(torch.clamp(self.time_first, -10, 10)).view(1, 1, D)
+        b = torch.exp(torch.clamp(self.time_first.float(), -10, 10)).view(1, 1, D)
         wkv = r * ((num + b * k * v) / (den + b * k + 1e-6))
-        y = self.output(wkv)
-        # ── channel mixing (squared ReLU gate)
+        x = x + self.dropout(self.output(wkv))
+        # ── channel mixing (squared ReLU gate, over post-time-mix residual)
         x2 = self.ln2(x)
-        xk2 = x2 * self.time_mix_cm + x_shift * (1 - self.time_mix_cm)
-        xr2 = x2 * self.time_mix_cm + x_shift * (1 - self.time_mix_cm)
+        x2_shift = F.pad(x2[:, :-1, :], (0, 0, 1, 0))
+        xk2 = x2 * self.time_mix_cm + x2_shift * (1 - self.time_mix_cm)
+        xr2 = x2 * self.time_mix_r2 + x2_shift * (1 - self.time_mix_r2)
         kk = self.cm_key(xk2)
         y2 = self.cm_output(torch.sigmoid(self.cm_receptance(xr2))
-                            * (F.relu(kk) ** 2 * self.cm_value(xk2)))
-        return x + self.dropout(y) + self.dropout(y2)
+                            * (F.relu(kk).float() ** 2 * self.cm_value(xk2)))
+        return x + self.dropout(y2)
 
 
 class RWKVLM(nn.Module):
@@ -462,7 +469,11 @@ class RetNetAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.gn = nn.GroupNorm(n_heads, dim)
         self.out = nn.Linear(dim, dim, bias=False)
-        self.log_decay = nn.Parameter(torch.full((n_heads,), -1.0))
+        # gamma = exp(-exp(log_decay)): spread heads from long-range
+        # (log_decay -5 -> gamma ~0.99, 0.99^255 ~0.18 survives) to short-range
+        # (log_decay +3 -> gamma ~2e-9, local only). A uniform -1 gives every
+        # head gamma^255 ~ 1e-42, i.e. no usable long-range memory.
+        self.log_decay = nn.Parameter(torch.linspace(-5.0, 3.0, n_heads))
     def forward(self, x):
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
