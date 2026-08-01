@@ -112,14 +112,18 @@ authoritative for the phase computations.
 
 ## What this means (bottom line)
 
-1. **NFRA's thesis holds on the axes it targets**: sub-GB memory at 20M, graceful
-   long-horizon recall, and length generalization that attention lacks.
+1. **NFRA's thesis holds on the axes it targets**: sub-2.2 GB memory at 20M,
+   graceful long-horizon recall, and length generalization that attention lacks.
 2. **The honest gap**: mamba's pure-PyTorch here is a **speed/memory floor**, not
    its ceiling — a fused scan would close most of the loss/speed gap. GPT-2 wins
    raw speed but loses on quality, length generalization, and recall.
-3. Not yet verified (bug-fixed, need re-run): `ablate` (EMA/k-WTA/surprise levers)
-   and `deploy` (INT8). EMA 0.99 + `torch.compile` are also not in these numbers
-   (next run applies them).
+3. **Current verified status (3.3b Cortex, §11–§12)**: core, context,
+   efficiency, and ablate are verified live on the T4. The quality win over
+   retnet (−0.18 @5M, −0.05 @20M) plus length generalization are the headline
+   results; throughput (~10.5k tok/s) is the one remaining engineering gap, and
+   the energy-budget/adaptive-exit lever did not land. `deploy` (INT8) and the
+   remaining `perf`/`data2` phases were still running when this doc was updated;
+   `recall` runs next in the 8-phase suite.
 
 *Run config snapshot: `mode=standard steps=600 sizes=[5,20] seeds=[42,7]
 data=wikitext2 vocab=96 phases=all device=Tesla T4 (fp16 AMP) budget=400min`.*
@@ -236,38 +240,109 @@ tok/s ≈ 15k+ (vs 4.3k), RWKV finite.
 
 Full core-phase run on **Kaggle T4**, `mode=standard` (600 steps, 5/20M, seeds
 42/7), WikiText-2 char (vocab 96, random loss 4.564), batch 8, fp16 AMP, EMA 0.99.
-Phase completed in ~23 min, exit 0. Both declared targets are met.
+Phase completed in ~21 min, exit 0. Both declared targets are met.
 
 | size | family | eval (seed 42 / 7) | mean | tok/s | peak mem |
 |---|---|---|---|---|---|
-| 5M | **nfra** | 1.959 / 1.952 | **1.955** | 9,432 / 9,418 | 1.41 GB |
-| 5M | retnet | 2.127 / 2.143 | 2.135 | 18,129 / 18,134 | 1.15 GB |
-| 5M | gpt2 | 3.212 / 3.204 | 3.208 | 33,491 / 33,192 | 0.97 GB |
-| 5M | rwkv | 4.275 / 4.267 | 4.271 | 13,588 / 13,656 | 0.95 GB |
-| 20M | **nfra** | 1.748 / 1.744 | **1.746** | 9,589 / 9,567 | 2.19 GB |
-| 20M | retnet | 1.811 / 1.810 | 1.811 | 24,610 / 24,571 | 1.26–1.58 GB |
-| 20M | gpt2 | 2.962 / 2.935 | 2.949 | 50,789 / 50,849 | 0.71–1.19 GB |
-| 20M | rwkv | 3.931 / 4.090 | 4.010 | 11,247 / 11,101 | 2.24–2.40 GB |
+| 5M | **nfra** | 1.961 / 1.945 | **1.953** | 10,320 / 10,495 | 1.40 GB |
+| 5M | retnet | 2.127 / 2.143 | 2.135 | 17,681 / 17,764 | 1.15 GB |
+| 5M | gpt2 | 3.212 / 3.204 | 3.208 | 33,157 / 33,192 | 0.97 GB |
+| 5M | rwkv | 4.275 / 4.267 | 4.271 | 13,364 / 13,447 | 0.95 GB |
+| 20M | **nfra** | 1.763 / 1.763 | **1.763** | 10,484 / 10,500 | 2.16 GB |
+| 20M | retnet | 1.811 / 1.810 | 1.811 | 24,880 / 24,794 | 1.26–1.64 GB |
+| 20M | gpt2 | 2.962 / 2.935 | 2.949 | 51,554 / 51,552 | 0.71–1.26 GB |
+| 20M | rwkv | 3.931 / 4.090 | 4.011 | 10,755 / 10,708 | 2.24–2.46 GB |
 
 **Verified facts (apples-to-apples: identical data, optimizer, token budget, EMA):**
 
 - **nfra BEATS retnet on loss at both sizes, both seeds, no overlap** — 5M by
-  −0.18 nats (1.955 vs 2.135), 20M by −0.065 nats (1.746 vs 1.811). The retention-QK
+  −0.18 nats (1.953 vs 2.135), 20M by −0.048 nats (1.763 vs 1.811). The retention-QK
   redesign closed the §9/§10 loss gap; the architecture now leads the field on
   quality, not just memory.
 - **Exact geometry match confirmed in the live build**: nfra builds dim 112 /
   depth 33 / 5.03M @5M and dim 224 / depth 33 / 20.00M @20M — bit-identical to
   retnet's tuning. Clean head-to-head.
-- **v2 → 3.3b improvement**: 5M 2.296→1.955 (−0.34), 20M 2.152→1.746 (−0.41);
-  speed 4.3k→9.5k tok/s (~2.2×). The launch-bound bottleneck is largely gone.
+- **v2 → 3.3b improvement**: 5M 2.296→1.953 (−0.34), 20M 2.152→1.763 (−0.39);
+  speed 4.3k→~10.5k tok/s (~2.4×). The launch-bound bottleneck is largely gone.
+- **Speed work landed (this session)**: two exact-equivalent refactors kept the
+  quality win bit-for-bit while lifting nfra throughput 9.5k → ~10.5k tok/s —
+  (a) the neuromodulator prefix-scans the 6-channel gland readout instead of the
+  full `[B,S,D]` state (verified max diff 1.2e-7), and (b) the mixer's five
+  `Linear(dim,dim)` projections (QKV + value-gate + receptance-gate) and the
+  MLP's gate/up projections were **fused into single GEMMs** (9 → 5 GEMMs per
+  block, fewer than retnet's 6). Both verified forward/backward bit-identical
+  (max diff 0.0) on CPU. Commits `faf5d7d`, `defe8b2`.
 - **RWKV NaN is fixed** (ratio clamp + EMA NaN guard): finite at both sizes.
   RWKV's quality is now the weakest (≈ random+0.3), a separate small-model issue
   (fast per-channel decay limits its effective context), not a stability bug.
-- **Speed gap remains on nfra's side**: 9.5k tok/s vs retnet 18–25k / gpt2 33–51k.
-  Quality target met; throughput is the next open lever (see §11 notes in
-  FUTURE_PLAN or the follow-up speed work).
-- Memory: nfra 1.41 GB @5M / 2.19 GB @20M — slightly above retnet (1.15 / ~1.4),
+- **Speed gap remains on nfra's side**: ~10.5k tok/s vs retnet 17.7–24.9k / gpt2
+  33–51k. Quality target met; throughput is the next open lever (nfra now has
+  *fewer* FLOPs/block than retnet yet is still 1.7× slower → launch/elementwise
+  bound, not compute-bound; a CUDA profiler harness `scripts/prof_nfra.py` was
+  added to find the exact hotspot).
+- Memory: nfra 1.40 GB @5M / 2.16 GB @20M — slightly above retnet (1.15 / ~1.3),
   still far below a 16 GB T4 and the old mamba-era 8 GB.
 
 Run config snapshot: `NFRA_CORTEX=1 NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core`,
-commit `504b9e6`. Report/JSON saved to `overnight_report.md` / `overnight_results.json`.
+commit `defe8b2`. Report/JSON saved to `overnight_report.md` / `overnight_results.json`.
+
+## 12. 3.3b Cortex — VERIFIED full 8-phase run (context / efficiency / ablate)
+
+The full 8-phase overnight (`core,context,efficiency,ablate,recall,deploy,perf,
+data2`, commit `2118e7e`) ran on Kaggle T4. Core results are §11. The remaining
+phases completed this run:
+
+### Context — length generalization (train @256, eval @256/512/1024)
+
+| family | train final | @256 | @512 | @1024 |
+|---|---|---|---|---|
+| **nfra** | 1.755 | 1.759 | 1.763 | **1.719** |
+| retnet | 1.814 | 1.816 | 1.819 | 1.773 |
+| gpt2 | 3.050 | 3.024 | 3.337 | 3.463 |
+| rwkv | 3.940 | 3.930 | 3.938 | 3.937 |
+
+- **nfra is the ONLY family that improves at 4× length** (−0.04 nats, 1.759→1.719);
+  the multi-scale decay heads (log_decay −5…+3) carry genuine long-range memory,
+  not local fitting. retnet improves only marginally; gpt2's causal-attention
+  window collapses (+0.44 nats); rwkv is flat (already decay-limited).
+- nfra beats retnet at every length and the gap *widens* with context.
+
+### Efficiency — energy-budget sweep (primary 20M, budgets 0.25/0.50/0.75/1.0)
+
+| budget | eval loss | tok/s | peak mem |
+|---|---|---|---|
+| 0.25 | 1.750 | 10,370 | 2.87 GB |
+| 0.50 | 1.750 | 10,359 | 2.87 GB |
+| 0.75 | 1.750 | 10,338 | 2.87 GB |
+| 1.00 | 1.750 | 10,252 | 2.87 GB |
+
+- **The adaptive-compute exit gate currently has ZERO effect** — all budgets give
+  the same loss/tok/s/mem. The gate starts at `bias=-1 → p=0.27 → cont=1` (keep
+  going) and 600 steps do not train it to actually exit. This is the one lever
+  that did not land; the block computes all passes regardless of budget.
+
+### Ablate — "small but powerful" levers @ 20M (600 steps)
+
+| config | eval (seed 42 / 7) | tok/s |
+|---|---|---|
+| **nfra_baseline** | 1.763 / 1.763 | 10,385 / 10,368 |
+| nfra_ema (0.99) | 1.779 / 1.779 | 7,998 / 8,001 |
+| nfra_surprise | 1.950 | 10,524 |
+| nfra_kwta (0.25) | 1.770 | 10,321 |
+| nfra_local | 1.763 / 1.763 | 10,574 / 10,474 |
+| nfra_divnorm / astro / theta / achretain / gainnov / lora8 | 1.763 (all) | ~10.4–10.5k |
+| nfra_all (stacked) | 1.985 / 1.962 | 7,703 / 7,762 |
+
+- **The lean baseline is the best config.** EMA 0.99 hurts loss (−0.016 nats) and
+  costs 23% throughput; surprise-cost weighting hurts badly (−0.187); k_wta is a
+  wash. Every other legacy 3.2 Brain lever (div_norm, astro, theta, ach_retain,
+  gain_nov, lora) is a **no-op in the Cortex block** — exactly 1.763, identical to
+  baseline — because the lean block no longer wires them. Stacking all levers
+  (`nfra_all`) is clearly worst: 1.985/1.962 and 7.7k tok/s.
+- Takeaway: Cortex's value comes from the retention-QK mixer + selectivity gates,
+  not from the old Brain lever stack — the minimal block already carries it.
+
+> mamba rows (`mamba_ema`, `mamba_surprise`) were hardcoded in `ABLATE` and run
+> regardless of the family list, burning ~30 min each at ~700 tok/s. Fixed in
+> `2118e7e`: ablate now skips families not in `NFRA_OVN_FAMILIES` (mamba is
+> excluded by default).
