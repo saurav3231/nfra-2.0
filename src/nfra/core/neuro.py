@@ -426,6 +426,7 @@ class BrainMixer(nn.Module):
         coherence = torch.sigmoid(self.phase_gate_raw) * frac.clamp(-1.0, 1.0)
 
         topk = max(2, H // 4)
+        topk = min(topk, H)
         _, topk_idx = coherence.topk(topk, dim=-1)
         sparse = torch.zeros_like(coherence)
         sparse.scatter_(-1, topk_idx, coherence.gather(-1, topk_idx))
