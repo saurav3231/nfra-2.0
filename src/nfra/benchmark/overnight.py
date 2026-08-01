@@ -204,7 +204,12 @@ def ensure_shakespeare():
     return dst
 
 
+# Print BEFORE any heavy work so a healthy run is never silently dark: the
+# torch/arena/compare imports below take ~20-30s with zero output, and users
+# (rightly) assume a dead cell when nothing appears.
+print('  [overnight] starting - checking data, then importing torch (~20s silent)')
 ensure_wikitext()
+print('  [overnight] wikitext ready - importing torch/arena/compare...')
 
 # Align the shared benchmark modules with this run's config.
 os.environ['NFRA_MODE'] = 'standard'
