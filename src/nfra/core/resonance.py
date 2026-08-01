@@ -343,6 +343,21 @@ class ResonanceGuidedLocalAttention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.router_bias = nn.Parameter(torch.zeros(1))
+        self._mask_cache = {}
+
+    def _get_mask(self, S: int, device: torch.device) -> torch.Tensor:
+        """Return the cached causal sliding-window mask for this sequence
+        length, building it once per (S, device) instead of each forward."""
+        key = (S, str(device))
+        if key not in self._mask_cache:
+            positions = torch.arange(S, device=device)
+            rel_dist = positions[:, None] - positions[None, :]
+            local_mask = (rel_dist.abs() <= self.window // 2) & (rel_dist >= 0)
+            attn_mask = local_mask.float()
+            attn_mask = attn_mask.masked_fill(attn_mask == 0.0, float('-inf'))
+            attn_mask = attn_mask.masked_fill(attn_mask == 1.0, 0.0)
+            self._mask_cache[key] = attn_mask
+        return self._mask_cache[key]
 
     def forward(
         self, x: torch.Tensor, router_score: torch.Tensor
@@ -354,13 +369,8 @@ class ResonanceGuidedLocalAttention(nn.Module):
         k = self.k_proj(x).view(B, S, H, Hd).transpose(1, 2)
         v = self.v_proj(x).view(B, S, H, Hd).transpose(1, 2)
 
-        # Build causal sliding-window mask (recomputed each forward — O(S²) but small)
-        positions = torch.arange(S, device=x.device)
-        rel_dist = positions[:, None] - positions[None, :]
-        local_mask = (rel_dist.abs() <= self.window // 2) & (rel_dist >= 0)
-        attn_mask = local_mask.float()
-        attn_mask = attn_mask.masked_fill(attn_mask == 0.0, float('-inf'))
-        attn_mask = attn_mask.masked_fill(attn_mask == 1.0, 0.0)
+        # Causal sliding-window mask, cached per (length, device).
+        attn_mask = self._get_mask(S, x.device)
 
         # FlashAttention via scaled_dot_product_attention
         if hasattr(F, 'scaled_dot_product_attention'):

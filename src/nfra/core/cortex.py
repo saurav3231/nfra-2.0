@@ -120,7 +120,7 @@ class CortexMixer(nn.Module):
         # Write: u = gate * value (outer) B write vectors -> [B,H,S,Hd,N]
         gv_c = (gate * value).unsqueeze(-1)                 # [B,S,H,Hd,1]
         Bt = self.B_proj(x).view(B, S, H, N)                # [B,S,H,N]
-        u5 = gv_c * Bt.unsqueeze(2)                         # [B,S,H,Hd,N]
+        u5 = gv_c * Bt.unsqueeze(3)                         # [B,S,H,Hd,N]
         u_flat = u5.permute(0, 2, 1, 3, 4).reshape(B, H, S, Hd * N)
 
         h = parallel_scan_time_varying(None, u_flat, a_flat,
