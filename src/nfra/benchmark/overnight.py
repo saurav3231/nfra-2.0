@@ -2,7 +2,8 @@
 OVERNIGHT GRAND ARENA — the final, very big and broad NFRA comparison.
 
 Designed to run for a full Kaggle GPU session (T4/P100, ~9h). It compares
-NFRA Brain  vs  Mamba-SSM  vs  GPT-2 on REAL text only:
+NFRA Brain vs RWKV vs RetNet vs GPT-2 (Mamba-SSM optional, it's slow) on REAL
+text only:
 
   PRIMARY DATA (mandatory):  WikiText-2, character-level (standard, learnable).
                              The synthetic "unlearnable bigram" is intentionally
@@ -30,6 +31,8 @@ Controls (env, all optional):
   NFRA_OVN_SIZES     override sizes (M)
   NFRA_OVN_SEEDS     override seed count
   NFRA_OVN_PHASES    comma list of phases
+  NFRA_OVN_FAMILIES  comma list: nfra,rwkv,retnet,mamba,gpt2 (default nfra,rwkv,
+                     retnet,gpt2 — mamba is slow, add it explicitly if wanted)
   NFRA_OVN_MAX_MIN   time budget in minutes (default 400)
   NFRA_OVN_OUTDIR    output directory (default CWD)
   NFRA_DATA          must be "wikitext2"; anything else exits.
@@ -92,7 +95,9 @@ MAX_MIN = float(os.environ.get('NFRA_OVN_MAX_MIN', '400'))
 OUTDIR = os.environ.get('NFRA_OVN_OUTDIR', os.getcwd())
 os.makedirs(OUTDIR, exist_ok=True)
 
-FAMILIES = ['nfra', 'mamba', 'gpt2']
+FAMILIES = [f.strip().lower() for f in
+            os.environ.get('NFRA_OVN_FAMILIES', 'nfra,rwkv,retnet,gpt2').split(',')
+            if f.strip()]
 ENERGY_BUDGETS = [0.25, 0.5, 0.75, 1.0]
 CONTEXT_LENS = [256, 512, 1024]
 RECALL_KS = [4, 16, 64, 128]
@@ -632,7 +637,8 @@ def phase_recall():
         return {}
     dim = int(os.environ.get('NFRA_OVN_RECALL_DIM', '224'))
     rows = recall_probe._run_all(RECALL_KS, steps=steps, dim=dim, seq_len=256,
-                                 batch=8, unique=4, depth=12, concurrent=True)
+                                 batch=8, unique=4, depth=12, concurrent=True,
+                                 families=tuple(FAMILIES))
     return {'rows': rows, 'vocab': recall_probe.V, 'dim': dim}
 
 
@@ -788,8 +794,8 @@ def build_report(data, env):
       '**Sizes:** %sM  |  **Seeds:** %s  |  **Steps:** %d  |  **Mode:** %s\n'
       % (' + TinyShakespeare' if 'data2' in data else '', VOCAB, SIZES, SEEDS,
          STEPS, MODE))
-    a('**Families:** NFRA Brain vs Mamba-SSM vs GPT-2 (param-matched)  |  '
-      '**Optimizer:** AdamW 3e-4 (warmup+cosine)\n')
+    a('**Families:** %s (param-matched)  |  '
+      '**Optimizer:** AdamW 3e-4 (warmup+cosine)\n' % ' vs '.join(FAMILIES))
     a('**Environment:** ' + ', '.join('%s=%s' % (k, v) for k, v in env.items()
                                       if v) + '\n')
     a('**Random-guess loss:** %.3f (ln vocab)\n\n' % RANDOM_LOSS)
@@ -884,18 +890,21 @@ def build_report(data, env):
 
     if 'recall' in data:
         r = data['recall']
+        fams = [f for f in r['rows'] if f in FAMILIES]
         a('\n## 5. Recall — memory-horizon diagnostic (V=%d, dim=%d, floor %.3f)\n'
           % (r['vocab'], r['dim'], math.log(r['vocab'])))
         a('*Diagnostic on synthetic structured associative recall (learnable); '
           'NOT a language benchmark. A rising span-CE vs k = memory collapse.*\n')
         rows = []
         for k in RECALL_KS:
-            nfra_v = r['rows']['nfra'].get(k, {})
-            mamba_v = r['rows']['mamba'].get(k, {})
-            rows.append([k, nfra_v.get('span_ce'), mamba_v.get('span_ce'),
-                         nfra_v.get('span_acc'), mamba_v.get('span_acc')])
-        a(md_table(['k', 'NFRA span CE', 'Mamba span CE',
-                    'NFRA acc', 'Mamba acc'], rows) + '\n')
+            row = [k]
+            for f in fams:
+                v = r['rows'][f].get(k, {})
+                row += [v.get('span_ce'), v.get('span_acc')]
+            rows.append(row)
+        hdr = ['k'] + [x for f in fams for x in
+                       (f + ' span CE', f + ' acc')]
+        a(md_table(hdr, rows) + '\n')
 
     if 'deploy' in data:
         a('\n## 6. Deploy — INT8 quantization @ %dM\n' % PRIMARY)
@@ -998,7 +1007,8 @@ def main():
 
     print('=' * 72)
     print('  OVERNIGHT GRAND ARENA — final all-axes NFRA comparison')
-    print('  NFRA Brain vs Mamba-SSM vs GPT-2  (param-matched, REAL text)')
+    print('  NFRA Brain vs %s  (param-matched, REAL text)'
+          % ' vs '.join(FAMILIES))
     print('=' * 72)
     print('  mode     : %-8s steps: %d   sizes: %sM   seeds: %s'
           % (MODE, STEPS, SIZES, SEEDS))
@@ -1071,10 +1081,14 @@ def main():
             write_csv('ablate.csv', ['variant', 'eval_loss', 'train_tok_s', 'seeds'],
                       rows)
         if 'recall' in data:
-            rows = [[k, data['recall']['rows']['nfra'].get(k, {}).get('span_ce'),
-                     data['recall']['rows']['mamba'].get(k, {}).get('span_ce')]
-                    for k in RECALL_KS]
-            write_csv('recall.csv', ['k', 'nfra_span_ce', 'mamba_span_ce'], rows)
+            fams = [f for f in data['recall']['rows'] if f in FAMILIES]
+            rows = []
+            for k in RECALL_KS:
+                row = [k]
+                for f in fams:
+                    row.append(data['recall']['rows'][f].get(k, {}).get('span_ce'))
+                rows.append(row)
+            write_csv('recall.csv', ['k'] + [f + '_span_ce' for f in fams], rows)
         if 'deploy' in data:
             rows = [[fam, v['mb_fp32'], v['mb_int8'], v['size_saved_pct'],
                      v['eval_fp32'], v['eval_int8'], v['cpu_prefill_tok_s_int8']]

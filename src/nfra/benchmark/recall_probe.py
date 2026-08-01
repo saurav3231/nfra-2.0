@@ -30,6 +30,7 @@ Env:
   NFRA_RECALL_BATCH      batch size               (default 8)
   NFRA_RECALL_SEQ        sequence length          (default 256)
   NFRA_RECALL_CONCURRENT 1 = train all configs on separate CUDA streams
+  NFRA_RECALL_FAMILIES   comma list: nfra,mamba,rwkv,retnet,gpt2 (default nfra,mamba)
 """
 
 import os
@@ -48,7 +49,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from .arena import build_nfra, build_mamba, train_one, SEED_LIST
+from .arena import build_nfra, build_mamba, build_rwkv, build_retnet, \
+    build_gpt2, train_one, SEED_LIST
 from .compare import (
     count_params, DEVICE, rescale_embed, make_optimizer, compute_loss,
     USE_AMP, HAS_CUDA, SEQ_LEN,
@@ -212,26 +214,30 @@ def _train_concurrent(models, steps, loaders, seq_len=256):
     return recs, wall
 
 
-def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False):
-    """Run NFRA + Mamba across all k, sequentially or concurrently.
+def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False,
+             families=('nfra', 'mamba')):
+    """Run the given families across all k, sequentially or concurrently.
 
-    Returns {'nfra': {k: row, ...}, 'mamba': {k: row, ...}}. In BOTH modes
+    Returns {fam: {k: row, ...}} for each family in `families`. In BOTH modes
     every model is BUILT under a single torch.manual_seed(0) in the same
-    (nfra for every k, then mamba for every k) order, so parameter init
-    matches across sequential and concurrent runs exactly. (Dropout order
-    during training still differs between the two modes — that is honest
+    ((family, k) for every k then family) order, so parameter init matches
+    across sequential and concurrent runs exactly. (Dropout order during
+    training still differs between the two modes — that is honest
     stochasticity, not an init mismatch.)"""
-    def nfra_b(v, d):
-        return build_nfra(v, d, unique, depth=depth)
-
-    def mamba_b(v, d):
-        return build_mamba(v, d, 8)
-
-    rows = {'nfra': {}, 'mamba': {}}
+    builders = {
+        'nfra': lambda v, d: build_nfra(v, d, unique, depth=depth),
+        'mamba': lambda v, d: build_mamba(v, d, 8),
+        'rwkv': lambda v, d: build_rwkv(v, d, 8),
+        'retnet': lambda v, d: build_retnet(v, d, 8, n_heads=8),
+        'gpt2': lambda v, d: build_gpt2(v, d, 8, n_heads=8),
+    }
+    fams = [f for f in families if f in builders]
+    rows = {f: {} for f in fams}
     if concurrent:
         torch.manual_seed(0)
         tasks = []
-        for fam, builder in [('nfra', nfra_b), ('mamba', mamba_b)]:
+        for fam in fams:
+            builder = builders[fam]
             for k in ks:
                 train_loader = make_loader(k, seq_len, batch, seed=42)
                 eval_loader = make_loader(k, seq_len, batch, seed=7)
@@ -264,7 +270,8 @@ def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False):
         # order concurrent mode builds them, so init matches exactly.
         torch.manual_seed(0)
         models = []
-        for fam, builder in [('nfra', nfra_b), ('mamba', mamba_b)]:
+        for fam in fams:
+            builder = builders[fam]
             for k in ks:
                 models.append((fam, k, builder(V, dim).to(DEVICE)))
         for fam, k, model in models:
@@ -302,29 +309,29 @@ def main():
     seq_len = int(os.environ.get('NFRA_RECALL_SEQ', '256'))
     concurrent = os.environ.get('NFRA_RECALL_CONCURRENT', '0') == '1'
     out_json = os.environ.get('NFRA_RECALL_OUT', 'recall_probe.json')
+    families = tuple(f.strip().lower() for f in
+                     os.environ.get('NFRA_RECALL_FAMILIES', 'nfra,mamba').split(',')
+                     if f.strip())
 
-    print('H3 recall probe  |  V=%d ks=%s steps=%d dim=%d seq=%d%s'
-          % (V, ks, steps, dim, seq_len,
+    print('H3 recall probe  |  V=%d ks=%s steps=%d dim=%d seq=%d fam=%s%s'
+          % (V, ks, steps, dim, seq_len, ','.join(families),
              '  [concurrent streams]' if concurrent else ''))
     print('random loss floor ln(%d) = %.3f' % (V, math.log(V)))
 
     rows = _run_all(ks, steps, dim, seq_len, batch, unique, depth,
-                    concurrent=concurrent)
-    nfra_rows = rows['nfra']
-    mamba_rows = rows['mamba']
+                    concurrent=concurrent, families=families)
 
     print('\nresults (span CE, lower is better; floor %.3f):' % math.log(V))
-    print(' k      NFRA      Mamba     | verdict')
+    hdr = ' k     ' + '  '.join('%-8s' % f for f in families)
+    print(hdr)
     for k in ks:
-        a = nfra_rows[k]['span_ce']
-        b = mamba_rows[k]['span_ce']
-        verdict = ('nfra worse' if a - b > 0.1 else
-                   'nfra better' if b - a > 0.1 else 'wash')
-        print(' %-4d   %-8.4f  %-8.4f  | %s' % (k, a, b, verdict))
+        cells = '  '.join('%-8.4f' % rows[f][k]['span_ce'] for f in families)
+        print(' %-4d  %s' % (k, cells))
 
     out = {'vocab': V, 'ks': ks, 'steps': steps, 'dim': dim,
-           'floor': round(math.log(V), 4), 'nfra': nfra_rows,
-           'mamba': mamba_rows}
+           'floor': round(math.log(V), 4), 'families': families}
+    for f in families:
+        out[f] = rows[f]
     with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=True, indent=2)
     print('Wrote %s' % out_json)

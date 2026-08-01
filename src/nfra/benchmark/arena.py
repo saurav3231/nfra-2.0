@@ -21,7 +21,7 @@
 ║     NFRA_MODE       quick(150) | standard(600) | rigorous(1500) steps     ║
 ║     NFRA_SIZES      comma list of target sizes in M (default "5,20")      ║
 ║     NFRA_SEEDS      number of seeds (default 2, rigorous 3)               ║
-║     NFRA_FAMILIES   comma list: nfra,mamba,gpt2 (default all)             ║
+║     NFRA_FAMILIES   comma list: nfra,rwkv,retnet,mamba,gpt2 (default all    ║
 ║     NFRA_DATA       synthetic | wikitext2                                 ║
 ║     NFRA_BATCH      override training batch size                          ║
 ║     NFRA_BANDS      NFRA Brain band count (H8 ablation: 2,4,8,16)         ║
@@ -42,10 +42,10 @@ from torch.utils.data import DataLoader
 
 from nfra import NFRAConfig, NFRAForCausalLM
 from nfra.benchmark.compare import (
-    MambaLM, GPT2ForCausalLM, HierarchicalDataset, WikiText2Dataset,
-    count_params, rescale_embed, compute_loss, evaluate, make_optimizer,
-    EMA, DEVICE, HAS_CUDA, USE_AMP, BATCH, D_STATE, SEQ_LEN, DATA_SOURCE,
-    NFRA_DEPTH, WIKI_PATHS, CHAR_VOCAB,
+    MambaLM, GPT2ForCausalLM, RWKVLM, RetNetLM, HierarchicalDataset,
+    WikiText2Dataset, count_params, rescale_embed, compute_loss, evaluate,
+    make_optimizer, EMA, DEVICE, HAS_CUDA, USE_AMP, BATCH, D_STATE, SEQ_LEN,
+    DATA_SOURCE, NFRA_DEPTH, WIKI_PATHS, CHAR_VOCAB,
 )
 
 # ─────────────────────────── config ───────────────────────────
@@ -61,7 +61,7 @@ if not SIZES:
 SEED_CNT = int(os.environ.get('NFRA_SEEDS', '3' if MODE == 'rigorous' else '2'))
 SEED_LIST = [42, 7, 2026, 1337, 777][:SEED_CNT]
 FAMILIES = [f.strip().lower() for f in
-            os.environ.get('NFRA_FAMILIES', 'nfra,mamba,gpt2').split(',') if f.strip()]
+            os.environ.get('NFRA_FAMILIES', 'nfra,rwkv,retnet,gpt2').split(',') if f.strip()]
 # NFRA 3.2 feature toggles. EMA + surprise-weighted loss apply to ALL families
 # (fair head-to-head); k-WTA is an NFRA architecture change only.
 EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
@@ -162,6 +162,14 @@ def build_gpt2(vocab, dim, n_layers, n_heads=8, pos_len=2048):
     return GPT2ForCausalLM(vocab, dim, n_layers, n_heads, pos_len=pos_len)
 
 
+def build_rwkv(vocab, dim, n_layers, dropout=0.1):
+    return RWKVLM(vocab, dim, n_layers, dropout)
+
+
+def build_retnet(vocab, dim, n_layers, n_heads=8, dropout=0.1):
+    return RetNetLM(vocab, dim, n_layers, n_heads, dropout)
+
+
 def tune_nfra_size(target, vocab, depth, dims):
     best = (float('inf'), None, None, None)
     for U in range(2, min(depth, 8) + 1):
@@ -207,6 +215,15 @@ def build_family_spec(family, size, vocab):
         dim, L, params = tune_layers_size(build_mamba, target, vocab, dims)
         spec = dict(builder=build_mamba, dim=dim,
                     extra=dict(n_layers=L, d_state=D_STATE),
+                    params=params, depth=L)
+    elif family == 'rwkv':
+        dim, L, params = tune_layers_size(build_rwkv, target, vocab, dims)
+        spec = dict(builder=build_rwkv, dim=dim, extra=dict(n_layers=L),
+                    params=params, depth=L)
+    elif family == 'retnet':
+        dim, L, params = tune_layers_size(build_retnet, target, vocab, dims)
+        spec = dict(builder=build_retnet, dim=dim,
+                    extra=dict(n_layers=L, n_heads=8),
                     params=params, depth=L)
     else:
         dim, L, params = tune_layers_size(build_gpt2, target, vocab, dims)
@@ -506,7 +523,7 @@ def main():
     t_all = time.perf_counter()
     print("=" * 72)
     print("  NFRA ARENA - global-standard multi-dimension comparison")
-    print("  NFRA Brain  vs  Mamba-SSM  vs  GPT-2   (param-matched)")
+    print("  NFRA Brain  vs  RWKV  vs  RetNet  vs  GPT-2  vs  Mamba (param-matched)")
     print("=" * 72)
     print(f"  mode     : {MODE} ({STEPS} steps)   data: {label}   vocab: {VOCAB}")
     print(f"  sizes    : {SIZES} M params    seeds: {SEED_LIST}")

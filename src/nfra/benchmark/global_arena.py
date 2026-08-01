@@ -7,8 +7,9 @@ A phased, resumable, all-axes benchmark that answers, with evidence:
   NFRA's "small but powerful" brain-inspired levers actually close the gap.
 
 Methodology (credibility controls, reused from arena.py):
-  • Param-matched families (NFRA Brain / Mamba-SSM / GPT-2), identical data,
-    identical optimizer + schedule, matched token budgets, multiple seeds.
+  • Param-matched families (NFRA Brain / RWKV / RetNet / GPT-2, Mamba optional),
+    identical data, identical optimizer + schedule, matched token budgets,
+    multiple seeds.
   • Multiple sizes -> measured scaling slope (loss per doubling of params).
   • Full dashboard per run; JSON + Markdown report; NaN guard on every step.
 
@@ -60,15 +61,17 @@ os.environ.setdefault('NFRA_SIZES', ','.join(map(str, GA_SIZES)))
 os.environ.setdefault('NFRA_SEEDS', str(GA_SEEDS))
 os.environ.setdefault('NFRA_STEPS', str(GA_STEPS))
 os.environ.setdefault('NFRA_DATA', GA_DATA)
+os.environ.setdefault('NFRA_FAMILIES', 'nfra,rwkv,retnet,gpt2')
 
 import numpy as np
 import torch
 
 from nfra.benchmark import arena
 from nfra.benchmark.arena import (
-    build_nfra, build_mamba, build_gpt2, build_family_spec, train_one,
-    make_loaders, prefill_tok_s, generate_metrics, sample_auc, mean_std,
-    fit_scaling, composite_score, winner_of, make_verdict, EVAL_GAP,
+    build_nfra, build_mamba, build_rwkv, build_retnet, build_gpt2,
+    build_family_spec, train_one, make_loaders, prefill_tok_s,
+    generate_metrics, sample_auc, mean_std, fit_scaling, composite_score,
+    winner_of, make_verdict, EVAL_GAP, FAMILIES,
 )
 from nfra.benchmark.compare import (
     count_params, rescale_embed, evaluate, DEVICE, HAS_CUDA, SEQ_LEN,
@@ -139,6 +142,11 @@ def _build_family(fam, size, vocab, seed, **overrides):
                        depth=spec['depth'], **overrides)
     elif fam == 'mamba':
         m = build_mamba(vocab, spec['dim'], spec['extra']['n_layers'])
+    elif fam == 'rwkv':
+        m = build_rwkv(vocab, spec['dim'], spec['extra']['n_layers'])
+    elif fam == 'retnet':
+        m = build_retnet(vocab, spec['dim'], spec['extra']['n_layers'],
+                         n_heads=spec['extra'].get('n_heads', 8))
     else:
         m = build_gpt2(vocab, spec['dim'], spec['extra']['n_layers'])
     rescale_embed(m)
@@ -152,7 +160,7 @@ def phase_core(data, vocab, random_loss):
     print('=' * 72)
     specs, runs, battery = {}, {}, {}
     for size in GA_SIZES:
-        specs[size] = {f: build_family_spec(f, size, vocab) for f in ('nfra', 'mamba', 'gpt2')}
+        specs[size] = {f: build_family_spec(f, size, vocab) for f in FAMILIES}
         for f, s in specs[size].items():
             print('  [build] %-6s @ %dM: dim %-4d %.2fM depth %d' %
                   (f, size, s['dim'], s['params'] / 1e6, s['depth']))
@@ -162,7 +170,7 @@ def phase_core(data, vocab, random_loss):
         seeds = arena.SEED_LIST[:GA_SEEDS]
         for seed in seeds:
             runs[size][seed] = {}
-            for fam in ('nfra', 'mamba', 'gpt2'):
+            for fam in FAMILIES:
                 t0 = time.perf_counter()
                 m, _ = _build_family(fam, size, vocab, seed)
                 rec = _run(m, vocab, GA_STEPS, train_loaders[seed], eval_loader,
@@ -183,7 +191,7 @@ def phase_core(data, vocab, random_loss):
     metrics = {}
     for size in GA_SIZES:
         metrics[size] = {}
-        for fam in ('nfra', 'mamba', 'gpt2'):
+        for fam in FAMILIES:
             recs = [runs[size][s][fam] for s in arena.SEED_LIST[:GA_SEEDS]]
             row = _agg(recs)
             row['tok_s_train'] = row['tok_s']
@@ -196,8 +204,8 @@ def phase_core(data, vocab, random_loss):
             metrics[size][fam] = row
     scaling = {f: fit_scaling([(metrics[s][f]['params'], metrics[s][f]['final_eval'])
                                for s in GA_SIZES if metrics[s][f]['final_eval']])
-               for f in ('nfra', 'mamba', 'gpt2')}
-    for f in ('nfra', 'mamba', 'gpt2'):
+               for f in FAMILIES}
+    for f in FAMILIES:
         for size in GA_SIZES:
             metrics[size][f]['scaling_gain'] = -scaling[f]['slope']
     primary = max(GA_SIZES)
@@ -259,7 +267,7 @@ def phase_perf(data, vocab):
     print('=' * 72)
     primary = max(GA_SIZES)
     out = {}
-    for fam in ('nfra', 'mamba', 'gpt2'):
+    for fam in FAMILIES:
         torch.manual_seed(0)
         m, _ = _build_family(fam, primary, vocab, 0)
         pre = prefill_tok_s(m, max(arena.PRE_HEAD, 8), SEQ_LEN, vocab)
@@ -292,9 +300,10 @@ def md_table(headers, rows):
 def build_report(all_data, vocab, random_loss):
     L, a = [], L.append
     a('# GLOBAL ARENA — all-axes NFRA comparison (overnight)\n')
-    a('**Families:** NFRA Brain vs Mamba-SSM vs GPT-2 (param-matched)  |  '
+    a('**Families:** %s (param-matched)  |  '
       '**Data:** %s  |  **Vocab:** %d  |  **Steps:** %d  |  **Sizes:** %sM  |  '
-      '**Seeds:** %d\n' % (GA_DATA, vocab, GA_STEPS, GA_SIZES, GA_SEEDS))
+      '**Seeds:** %d\n' % (' vs '.join(FAMILIES), GA_DATA, vocab, GA_STEPS,
+                           GA_SIZES, GA_SEEDS))
     a('**Optimizer:** AdamW 3e-4 (warmup+cosine)  **Device:** %s\n'
       % ('GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'))
 
@@ -304,7 +313,7 @@ def build_report(all_data, vocab, random_loss):
         a('\n### 1a. Eval loss by size (mean ± std over seeds)\n')
         rows = []
         for size in GA_SIZES:
-            for fam in ('nfra', 'mamba', 'gpt2'):
+            for fam in FAMILIES:
                 m = c['metrics'][size][fam]
                 rows.append([f'{size}M', fam, fmt(m['final_eval'], 3),
                              fmt(m['final_eval_sd'], 3), fmt(m['ppl'], 2),
@@ -318,12 +327,12 @@ def build_report(all_data, vocab, random_loss):
                  fmt(c['scaling'][f].get('r2'), 3),
                  fmt(c['scaling'][f].get('loss_100m'), 3),
                  fmt(c['scaling'][f].get('loss_1b'), 3)]
-                for f in ('nfra', 'mamba', 'gpt2')]
+                for f in FAMILIES]
         a(md_table(['family', 'slope', 'R²', 'extrap @100M', '@1B'], rows))
         a('')
         primary = max(GA_SIZES)
         a('\n### 1c. Composite scores @ %dM\n' % primary)
-        rows = [[f, f"{c['scores'][primary][f]:.1f}"] for f in ('nfra', 'mamba', 'gpt2')]
+        rows = [[f, f"{c['scores'][primary][f]:.1f}"] for f in FAMILIES]
         a(md_table(['family', 'score'], rows))
         a('')
         a('\n### 1d. Verdict\n')
@@ -409,7 +418,7 @@ def main():
 
     print('=' * 72)
     print('  GLOBAL ARENA — all-axes global-standard comparison')
-    print('  NFRA Brain  vs  Mamba-SSM  vs  GPT-2   (param-matched)')
+    print('  NFRA Brain  vs  %s  (param-matched)' % ' vs '.join(FAMILIES))
     print('=' * 72)
     print('  data   : %-12s vocab: %d   sizes: %s M' % (GA_DATA, VOCAB, GA_SIZES))
     print('  steps  : %d    seeds: %d    phases: %s'

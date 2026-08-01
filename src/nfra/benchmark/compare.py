@@ -378,6 +378,141 @@ class GPT2ForCausalLM(nn.Module):
         return {'logits': self.lm_head(self.ln_f(x))}
 
 
+class RWKVBlock(nn.Module):
+    """RWKV-4 style block: token-shift time-mixing (linear attention with a
+    per-channel exponential-decay WKV recurrence + current-token bonus) plus a
+    squared-ReLU channel-mixing. The WKV decay is CONSTANT per channel, so the
+    recurrence reduces to two cumsums — O(S) pure-torch ops, no associative
+    scan — which is why RWKV trains much faster than Mamba's selective SSM here.
+    """
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.time_mix_k = nn.Parameter(torch.ones(dim))
+        self.time_mix_v = nn.Parameter(torch.ones(dim))
+        self.time_mix_r = nn.Parameter(torch.ones(dim))
+        self.key = nn.Linear(dim, dim, bias=False)
+        self.value = nn.Linear(dim, dim, bias=False)
+        self.receptance = nn.Linear(dim, dim, bias=False)
+        self.output = nn.Linear(dim, dim, bias=False)
+        self.time_decay = nn.Parameter(torch.zeros(dim))   # w = exp(-exp(lw)) ~ 0.37
+        self.time_first = nn.Parameter(torch.randn(dim))   # current-token bonus
+        self.ln2 = nn.LayerNorm(dim)
+        self.time_mix_cm = nn.Parameter(torch.ones(dim))
+        self.cm_key = nn.Linear(dim, dim, bias=False)
+        self.cm_value = nn.Linear(dim, dim, bias=False)
+        self.cm_receptance = nn.Linear(dim, dim, bias=False)
+        self.cm_output = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, S, D = x.shape
+        x_shift = F.pad(x[:, :-1, :], (0, 0, 1, 0))
+        # ── time mixing (linear attention, WKV recurrence)
+        xk = x * self.time_mix_k + x_shift * (1 - self.time_mix_k)
+        xv = x * self.time_mix_v + x_shift * (1 - self.time_mix_v)
+        xr = x * self.time_mix_r + x_shift * (1 - self.time_mix_r)
+        k = self.key(xk)
+        v = self.value(xv)
+        r = torch.sigmoid(self.receptance(xr))
+        w = torch.exp(-torch.exp(self.time_decay)).clamp(max=1.0)     # [D] in (0,1]
+        t = torch.arange(S, device=x.device).float()
+        wpos = torch.clamp(w.view(1, 1, D) * t.view(1, S, 1), -60, 60)
+        e = torch.exp(wpos)
+        num = torch.cumsum(k * v * e, dim=1) * torch.exp(-wpos)
+        den = torch.cumsum(k * e, dim=1) * torch.exp(-wpos)
+        b = torch.exp(torch.clamp(self.time_first, -10, 10)).view(1, 1, D)
+        wkv = r * ((num + b * k * v) / (den + b * k + 1e-6))
+        y = self.output(wkv)
+        # ── channel mixing (squared ReLU gate)
+        x2 = self.ln2(x)
+        xk2 = x2 * self.time_mix_cm + x_shift * (1 - self.time_mix_cm)
+        xr2 = x2 * self.time_mix_cm + x_shift * (1 - self.time_mix_cm)
+        kk = self.cm_key(xk2)
+        y2 = self.cm_output(torch.sigmoid(self.cm_receptance(xr2))
+                            * (F.relu(kk) ** 2 * self.cm_value(xk2)))
+        return x + self.dropout(y) + self.dropout(y2)
+
+
+class RWKVLM(nn.Module):
+    def __init__(self, vocab_size, dim, n_layers, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.blocks = nn.ModuleList([RWKVBlock(dim, dropout)
+                                     for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(dim)
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+    def forward(self, input_ids, **kw):
+        x = self.embed(input_ids)
+        for blk in self.blocks:
+            x = blk(x)
+        return {'logits': self.lm_head(self.ln_f(x))}
+
+
+class RetNetAttention(nn.Module):
+    """RetNet retention (parallel form): QK^T scores decayed by a learned
+    per-head exponential mask gamma^(i-j) (causal), then projected through a
+    GroupNorm over head groups. O(S^2) matmul like attention but no softmax —
+    fast and stable in pure torch.
+    """
+    def __init__(self, dim, n_heads):
+        super().__init__()
+        self.n_heads, self.head_dim = n_heads, dim // n_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.gn = nn.GroupNorm(n_heads, dim)
+        self.out = nn.Linear(dim, dim, bias=False)
+        self.log_decay = nn.Parameter(torch.full((n_heads,), -1.0))
+    def forward(self, x):
+        B, S, D = x.shape
+        H, Hd = self.n_heads, self.head_dim
+        qkv = self.qkv(x).view(B, S, 3, H, Hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        gamma = torch.exp(-torch.exp(self.log_decay)).view(1, H, 1, 1)
+        rel = (torch.arange(S, device=x.device).float().view(S, 1)
+               - torch.arange(S, device=x.device).float().view(1, S)).clamp(min=0)
+        decay = gamma ** rel
+        decay = decay.masked_fill(torch.triu(
+            torch.ones(S, S, device=x.device, dtype=torch.bool), 1), 0.0)
+        y = torch.matmul((q * Hd ** -0.5), k.transpose(-2, -1))
+        y = torch.matmul(y * decay, v)
+        y = y.permute(0, 2, 1, 3).reshape(B, S, D)
+        y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
+        return self.out(y)
+
+
+class RetNetBlock(nn.Module):
+    def __init__(self, dim, n_heads, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.ret = RetNetAttention(dim, n_heads)
+        self.ln2 = nn.LayerNorm(dim)
+        h = int(dim * 4)
+        self.fc1 = nn.Linear(dim, h, bias=False)
+        self.fc2 = nn.Linear(h, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        x = x + self.dropout(self.ret(self.ln1(x)))
+        x = x + self.dropout(self.fc2(F.silu(self.fc1(self.ln2(x)))))
+        return x
+
+
+class RetNetLM(nn.Module):
+    def __init__(self, vocab_size, dim, n_layers, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.blocks = nn.ModuleList([RetNetBlock(dim, n_heads, dropout)
+                                     for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(dim)
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+    def forward(self, input_ids, **kw):
+        x = self.embed(input_ids)
+        for blk in self.blocks:
+            x = blk(x)
+        return {'logits': self.lm_head(self.ln_f(x))}
+
+
 # ─────────────────────────── helpers ───────────────────────────
 def count_params(m): return sum(p.numel() for p in m.parameters())
 

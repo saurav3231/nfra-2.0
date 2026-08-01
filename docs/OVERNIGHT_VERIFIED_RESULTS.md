@@ -154,3 +154,32 @@ Wiring status (this session, not yet validated on Kaggle):
 
 Next: 5M quick A/B (3.2 vs 3.3) on Kaggle T4, then re-run the live 8-phase
 overnight with the fixed `save_state`/`ablate`/`deploy` bugs.
+
+## 8. Family grid update — RWKV + RetNet, Mamba opt-in
+
+Mamba was dropped from the default overnight/arena family grid (its sequential
+SSM scan is slow on this pure-PyTorch stack and dominates wall-time). Two fast,
+credible attention-alternative families were added instead:
+
+- **RWKV** (`RWKVLM` in `compare.py`): RWKV-4 style time-mixing (token shift,
+  per-channel exponential-decay WKV recurrence + current-token bonus) with
+  squared-ReLU channel mixing. The decay is constant per channel, so the WKV
+  recurrence reduces to **two cumsums** (O(S), no associative scan) → trains far
+  faster than Mamba here.
+- **RetNet** (`RetNetLM` in `compare.py`): retention in parallel form —
+  QK^T scores × learned per-head exponential causal mask `γ^(i−j)`, GroupNorm
+  over head groups, SiLU FFN. O(S²) like attention but softmax-free, stable and
+  fast in pure torch.
+
+Default grid is now `nfra, rwkv, retnet, gpt2`; `mamba` stays available but is
+**opt-in** because it is slow:
+
+- Arena: `NFRA_FAMILIES=nfra,rwkv,retnet,gpt2` (default), add `,mamba` if wanted.
+- Overnight: `NFRA_OVN_FAMILIES=nfra,rwkv,retnet,gpt2` (default); the 8-phase
+  run, the report header/CSVs, and the recall phase all iterate the configured
+  families (recall_probe gained a `NFRA_RECALL_FAMILIES` env + generic builders).
+- Builders/tuning wired into `build_family_spec` (param-matched via
+  `tune_layers_size`); `global_arena.py` uses the same env-driven grid.
+
+Status: parse-only syntax checks pending; execute on Kaggle via
+`NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core python -m nfra.benchmark.overnight`.
