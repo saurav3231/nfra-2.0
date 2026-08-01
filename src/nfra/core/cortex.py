@@ -38,9 +38,6 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
-from .neuro import prefix_pool
-
-
 class CortexMixer(nn.Module):
     """Resonance retention mixer (the 3.3b core).
 
@@ -86,14 +83,26 @@ class CortexMixer(nn.Module):
         self.phases = nn.Parameter(torch.randn(self.n_heads) * math.pi)
 
     def decay_mask(self, S: int) -> torch.Tensor:
-        """Causal decayed mask D_h[i,j] = gamma_h^(i-j), j <= i. [1,H,S,S]."""
-        rel = (torch.arange(S, device=self.log_decay.device).float().view(S, 1)
-               - torch.arange(S, device=self.log_decay.device).float().view(1, S))
-        rel = rel.clamp(min=0.0)                                 # future -> 0
+        """Causal decayed mask D_h[i,j] = gamma_h^(i-j), j <= i. [1,H,S,S].
+
+        The relative-position index and the causal triu are cached per
+        (S, device) -- they are constants -- so each forward only pays the
+        [H,S,S] exp. Called once per block per step; this was the per-forward
+        arange-diff + triu construction that at depth 33 is pure overhead."""
+        cache = getattr(self, '_mask_cache', None)
+        if cache is None:
+            cache = self._mask_cache = {}
+        key = (S, self.log_decay.device)
+        if key not in cache:
+            idx = torch.arange(S, device=self.log_decay.device).float()
+            rel = (idx.view(S, 1) - idx.view(1, S)).clamp(min=0.0)   # [S,S]
+            causal = torch.triu(torch.ones(S, S, device=idx.device,
+                                           dtype=torch.bool), 1)
+            cache[key] = (rel, causal)
+        rel, causal = cache[key]
         decay = torch.exp(-torch.exp(self.log_decay.view(1, self.n_heads, 1, 1))
                           * rel.view(1, 1, S, S))                # [1,H,S,S]
-        return decay.masked_fill(torch.triu(
-            torch.ones(S, S, device=decay.device, dtype=torch.bool), 1), 0.0)
+        return decay.masked_fill(causal, 0.0)
 
     def forward(self, x: torch.Tensor,
                 hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -216,8 +225,16 @@ class CortexNeuromodulator(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 prev_hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
-        pooled = prefix_pool(x)                              # causal [B,S,D]
-        raw = torch.sigmoid(self.context_gland(pooled) + self.baseline.unsqueeze(0))
+        # Prefix-pool the LOW-DIM readout, not the full hidden state. Since
+        # context_gland is linear, cumsum(gland(x))/cnt == gland(cumsum(x)/cnt)
+        # exactly, so this is bit-equivalent to the old prefix_pool(x) -> gland
+        # path but scans [B,S,6] instead of [B,S,D] -- the per-block D-wide
+        # cumsum was pure overhead at depth 33 and dominated the scan cost.
+        proj = self.context_gland(x)                         # [B,S,6]
+        cnt = torch.arange(1, x.shape[1] + 1, device=x.device,
+                           dtype=proj.dtype).view(1, x.shape[1], 1)
+        pooled = proj.cumsum(1) / cnt                        # causal prefix
+        raw = torch.sigmoid(pooled + self.baseline.unsqueeze(0))
         if prev_hormones is not None:
             return self.smoothing * prev_hormones + (1.0 - self.smoothing) * raw
         return raw
