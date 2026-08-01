@@ -44,13 +44,6 @@ In a notebook cell:
 
 `torch` is usually already present on Kaggle; the line is a safety net.
 
-## Step 4 — Run the benchmark
-
-```bash
-!cd /kaggle/working/nfra-2.0 && \
-  python -m nfra.benchmark.overnight
-```
-
 ## Step 3 — Install dependencies
 
 ```bash
@@ -59,10 +52,21 @@ In a notebook cell:
 
 `torch` is usually already present on Kaggle; the line is a safety net.
 
-## Step 4 — Run the benchmark
+## Step 4 — Install the package
+
+The repo uses a `src/` layout, so `nfra` is not importable until installed. In a cell:
 
 ```bash
-!cd /kaggle/working/NFRA-2.0 && \
+!cd /kaggle/working/nfra-2.0 && pip install -e . --quiet
+```
+
+(If you skip this, `python -m nfra.benchmark.overnight` fails with
+`ModuleNotFoundError: No module named 'nfra'`.)
+
+## Step 5 — Run the benchmark
+
+```bash
+!cd /kaggle/working/nfra-2.0 && \
   python -m nfra.benchmark.overnight
 ```
 
@@ -72,7 +76,7 @@ back if the canonical S3 link 301s) and **TinyShakespeare**, then run every phas
 ### Tuning with env vars
 
 ```bash
-!cd /kaggle/working/NFRA-2.0 && \
+!cd /kaggle/working/nfra-2.0 && \
   NFRA_OVN_MODE=big \
   NFRA_OVN_STEPS=600 \
   NFRA_OVN_SIZES=5,20,50 \
@@ -96,14 +100,14 @@ back if the canonical S3 link 301s) and **TinyShakespeare**, then run every phas
 Data guard: if `NFRA_OVN_DATA` is anything but `wikitext2`, the script refuses to run —
 real text only, never the synthetic "unlearnable" set.
 
-## Step 5 — Resume / avoid the 9-hour Kaggle limit
+## Step 6 — Resume / avoid the 9-hour Kaggle limit
 
 Phases checkpoint after each completion into `overnight_state.json`. If the session
 expires, start a new notebook, re-clone the repo, and re-run the same command — it
 will skip completed phases and continue. Keep output in `/kaggle/working/out` and
 re-upload that folder between sessions to preserve resume state.
 
-## Step 6 — Fetch results
+## Step 7 — Fetch results
 
 Add a final cell to package everything as a downloadable archive:
 
