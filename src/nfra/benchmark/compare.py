@@ -430,7 +430,13 @@ class RWKVBlock(nn.Module):
         num = torch.cumsum(k * v * e, dim=1) * torch.exp(-wpos)
         den = torch.cumsum(k * e, dim=1) * torch.exp(-wpos)
         b = torch.exp(torch.clamp(self.time_first.float(), -10, 10)).view(1, 1, D)
-        wkv = r * ((num + b * k * v) / (den + b * k + 1e-6))
+        # The decayed-key denominator (den + b*k) is a random ~N(0, O(1)) sum
+        # that occasionally lands near zero, blowing up the ratio past fp16
+        # range when self.output casts it back to fp16 AMP. Clamp the ratio:
+        # values beyond +-1000 are pure near-zero-division outliers (normal
+        # ratio ~ O(1)), and 1000 << fp16 max (65504) so AMP stays finite.
+        ratio = ((num + b * k * v) / (den + b * k + 1e-6)).clamp(-1000, 1000)
+        wkv = r * ratio
         x = x + self.dropout(self.output(wkv))
         # ── channel mixing (squared ReLU gate, over post-time-mix residual)
         x2 = self.ln2(x)
@@ -606,8 +612,12 @@ class EMA:
     def update(self, model):
         for k, v in model.named_parameters():
             if k in self.shadow:
-                self.shadow[k].mul_(self.decay).add_(v.detach().float(),
-                                                     alpha=1.0 - self.decay)
+                w = v.detach().float()
+                # Never let a NaN/Inf spike permanently infect the shadow:
+                # skip the update for that tensor if it is not finite.
+                if torch.isfinite(w).all():
+                    self.shadow[k].mul_(self.decay).add_(w,
+                                                         alpha=1.0 - self.decay)
 
     @torch.no_grad()
     def apply(self, model):
