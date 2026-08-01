@@ -81,7 +81,18 @@ class NFRAConfig:
     ach_retain: bool = False
     gain_nov: bool = False
     lora_rank: int = 0
-    
+
+    # NFRA 3.3 Cortex (opt-in; NFRA_Brain_Block 3.2 stays intact for A/B).
+    # use_cortex : build NFRA_Cortex_Block (matrix-state mixer + cached-window
+    #              attention + real adaptive-compute exit gate) instead of the
+    #              3.2 Brain block. Set via NFRA_CORTEX=1 in the arena.
+    # cortex_state : matrix-state width N per head (CortexMixer d_state).
+    # exit_reg    : compute regularizer on the exit gate (pulls expected pass
+    #               count down; easy tokens exit early, hard tokens spend all).
+    use_cortex: bool = False
+    cortex_state: int = 8
+    exit_reg: float = 1e-3
+
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
         if self.mode not in valid_modes:
@@ -165,7 +176,7 @@ class NFRAForCausalLM(nn.Module):
         from ..core import (
             FractalResonanceBlock, DynamicEnergyBudgetAllocator,
             SwiGLU_MLP, ParallelGatedRecurrence, NFRA_Max_Block,
-            NFRA_Brain_Block,
+            NFRA_Brain_Block, NFRA_Cortex_Block,
         )
         
         if config.mode == "max":
@@ -174,6 +185,8 @@ class NFRAForCausalLM(nn.Module):
             block = NFRA_Brain_Block
         else:
             block = FractalResonanceBlock
+        if config.use_cortex:
+            block = NFRA_Cortex_Block
 
         # Depth sharing: n_unique unique blocks reused depth_passes times.
         # Effective depth ≈ num_layers, but params only scale with n_unique.
@@ -186,7 +199,13 @@ class NFRAForCausalLM(nn.Module):
 
         block_kwargs = dict(dim=config.hidden_size, n_bands=config.n_bands,
                             dropout=config.dropout)
-        if config.mode == "brain":
+        if config.use_cortex:
+            block_kwargs['d_state'] = config.cortex_state
+            block_kwargs['exit_reg'] = config.exit_reg
+            block_kwargs['k_wta_frac'] = config.k_wta_frac
+            block_kwargs['local_route'] = config.local_route
+            block_kwargs['div_norm'] = config.div_norm
+        elif config.mode == "brain":
             block_kwargs['k_wta_frac'] = config.k_wta_frac
             block_kwargs['local_route'] = config.local_route
             block_kwargs['div_norm'] = config.div_norm
@@ -270,6 +289,7 @@ class NFRAForCausalLM(nn.Module):
         
         hormones = None
         global_state = None
+        exit_aux = None
         use_ckpt = (
             self.config.gradient_checkpointing
             and self.training
@@ -278,7 +298,62 @@ class NFRAForCausalLM(nn.Module):
         if use_ckpt:
             checkpoint = torch.utils.checkpoint.checkpoint
 
-        if self._has_neuromodulator:
+        if self.config.use_cortex:
+            # NFRA 3.3 Cortex: each block returns (out, hormones, exit_logit).
+            # The exit gate gives per-token, per-pass adaptive compute: easy
+            # tokens freeze early (their state is preserved), hard tokens spend
+            # all depth passes. Training uses Gumbel straight-through + a small
+            # compute regularizer; inference hard-masks and skips the remaining
+            # passes when the whole batch has exited.
+            B, S, D = hidden_states.shape
+            active = torch.ones(B, S, 1, dtype=hidden_states.dtype,
+                                device=hidden_states.device)
+            final_states = hidden_states.clone()
+            exit_aux = torch.zeros((), device=hidden_states.device,
+                                   dtype=hidden_states.dtype)
+            for p in range(self.depth_passes):
+                if not self.training and bool((active == 0).all()):
+                    break
+                if self.pass_scale is not None:
+                    hidden_states = (hidden_states * self.pass_scale[p].view(1, 1, -1)
+                                     + self.pass_bias[p].view(1, 1, -1))
+                for i, layer in enumerate(self.layers):
+                    if use_ckpt:
+                        hidden_states, hormones, _el = checkpoint(
+                            self._run_cortex_layer, layer, hidden_states,
+                            budgets[i], hormones, use_reentrant=False,
+                        )
+                    else:
+                        hidden_states, hormones, _el = layer(
+                            hidden_states, hormones=hormones,
+                            energy_budget=budgets[i])
+                if self.pass_lora is not None:
+                    hidden_states = self.pass_lora[p](hidden_states)
+                if self.global_brain is not None:
+                    global_state = self.global_brain(hidden_states, global_state)
+                    hidden_states = self.global_brain.inject(global_state, hidden_states)
+                # Exit decision (last block's gate): continue = gate says keep going.
+                p_exit = self.layers[-1].exit_gate.prob(hidden_states)   # [B,S,1]
+                if self.training:
+                    cont, _ = self.layers[-1].exit_gate.sample_mask(
+                        hidden_states, hard=False)                       # ST 0/1
+                else:
+                    cont = (p_exit < 0.5).float()
+                active_new = active * cont
+                newly_done = active - active_new
+                # Freeze tokens that just exited at their current state.
+                final_states = (final_states * (1 - newly_done)
+                                + hidden_states * newly_done)
+                hidden_states = (hidden_states * active_new
+                                 + final_states * (1 - active_new))
+                # Compute regularizer: penalize CONTINUING (expected pass count).
+                n_active = active.sum().clamp(min=1.0)
+                exit_aux = exit_aux + self.config.exit_reg * (
+                    ((1.0 - p_exit) * active).sum() / n_active)
+                active = active_new.detach()
+            hidden_states = (hidden_states * active
+                             + final_states * (1 - active))
+        elif self._has_neuromodulator:
             for p in range(self.depth_passes):
                 # Per-pass adapter: depth-shared blocks compute a DIFFERENT
                 # function at each pass (breaks symmetry → more capacity).
@@ -322,7 +397,13 @@ class NFRAForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         
         if return_dict:
-            return {"logits": logits}
+            out = {"logits": logits}
+            # Exit-gate compute regularizer is a TRAINING cost only — eval loss
+            # stays pure CE so the 3.2-vs-3.3 head-to-head is not biased by a
+            # fixed additive constant.
+            if exit_aux is not None and self.training:
+                out["exit_aux"] = exit_aux
+            return out
         return logits
 
     @staticmethod
@@ -334,6 +415,14 @@ class NFRAForCausalLM(nn.Module):
             )
             return hidden_states, hormones
         return layer(hidden_states, energy_budget=budget)
+
+    @staticmethod
+    def _run_cortex_layer(layer, hidden_states, budget, hormones):
+        """Checkpoint wrapper for NFRA_Cortex_Block (returns the exit logit too)."""
+        hidden_states, hormones, _el = layer(
+            hidden_states, hormones=hormones, energy_budget=budget
+        )
+        return hidden_states, hormones, _el
 
 
 class NFRAForSequenceClassification(nn.Module):

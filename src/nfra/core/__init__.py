@@ -25,6 +25,11 @@ from .neuro import (
     TemporalGridEncoder,
     GlobalBrainState,
 )
+from .cortex import (
+    CortexMixer,
+    CortexExit,
+    NFRA_Cortex_Block,
+)
 from .predictive import PredictiveGenerator, MultiScalePredictor
 from .energy import DynamicEnergyBudgetAllocator
 
@@ -48,6 +53,9 @@ __all__ = [
     "BrainMLP",
     "TemporalGridEncoder",
     "GlobalBrainState",
+    "CortexMixer",
+    "CortexExit",
+    "NFRA_Cortex_Block",
     "PredictiveGenerator",
     "MultiScalePredictor",
     "DynamicEnergyBudgetAllocator",

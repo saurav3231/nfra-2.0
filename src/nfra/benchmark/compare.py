@@ -480,7 +480,8 @@ class EMA:
 
 
 def compute_loss(model, x, y, surprise: bool = False):
-    logits = model(x)['logits']
+    out = model(x)
+    logits = out['logits']
     logits = logits.view(-1, logits.size(-1))
     targets = y.view(-1)
     logp = logits.log_softmax(-1)
@@ -492,8 +493,15 @@ def compute_loss(model, x, y, surprise: bool = False):
         # learning rate is unchanged (mean-preserving).
         w = 1.0 - torch.exp(-ce)                                # surprise in (0,1)
         w = w / (w.mean() + 1e-6)
-        return (ce * w).mean()
-    return ce.mean()
+        loss = (ce * w).mean()
+    else:
+        loss = ce.mean()
+    # NFRA 3.3 Cortex: additive adaptive-compute regularizer from the exit gate
+    # (easy tokens exit early, hard tokens spend all depth passes). None for
+    # every other family, so the head-to-head cost is unchanged.
+    if 'exit_aux' in out:
+        loss = loss + out['exit_aux']
+    return loss
 
 @torch.no_grad()
 def evaluate(model, loader, max_batches=15):

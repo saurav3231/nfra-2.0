@@ -123,3 +123,34 @@ authoritative for the phase computations.
 
 *Run config snapshot: `mode=standard steps=600 sizes=[5,20] seeds=[42,7]
 data=wikitext2 vocab=96 phases=all device=Tesla T4 (fp16 AMP) budget=400min`.*
+
+---
+
+## 7. NFRA 3.3 Cortex — status (in progress)
+
+The 3.2 Brain gaps verified above (mamba −0.45 nats loss, gpt2 ~9× train / ~16×
+gen speed, only ~1.4× lighter than gpt2) are addressed by a new **opt-in** block,
+`NFRA_Cortex_Block` (`src/nfra/core/cortex.py`), built on three diagnosis→design
+mappings (3.2 Brain stays intact for A/B):
+
+| verified gap | root cause | 3.3 Cortex fix |
+|---|---|---|
+| Loss: state width 384 vs mamba ~5632 | state was a single vector per head | **CortexMixer**: matrix state `[Hd × N]` per head (write/read vectors B/C, SSD-style), ~8× state capacity at same params |
+| Speed: ~20 kernels/block, 9–16× slower | predictor/gist/thalamus/depth_refine streams, O(H²) topk+scatter, per-forward mask rebuild | **Kernel-Armistice**: redundant linear streams dropped, mask cached, fused QKV, fixed sparse pattern |
+| Adaptive "depth" was decorative | dopamine `depth_f` scaling did nothing | **CortexExit**: real Gumbel straight-through per-token per-pass exit gate + compute regularizer; inference skips passes hard |
+
+Wiring status (this session, not yet validated on Kaggle):
+- `NFRA_Cortex_Block` exported from `nfra.core`; `use_cortex`/`cortex_state`/
+  `exit_reg` on `NFRAConfig`; `NFRAForCausalLM` selects the Cortex block and
+  threads the exit gate through depth passes (freeze exited tokens, skip the
+  pass loop at inference when the whole batch has exited; exit regularizer added
+  to train loss only).
+- Arena toggle: `NFRA_CORTEX=1` (+ `NFRA_CORTEX_STATE`, `NFRA_EXIT_REG`).
+  A/B harness: `NFRA_CORTEX=1 python -m nfra.benchmark.compare_versions`
+  (nfra32 Brain vs nfra33 Cortex, matched seeds/steps/data).
+- Quick sanity: `python -m nfra.benchmark.cortex_smoke` (params ~5M, train
+  forward/backward finite, all-exit forward == depth-1 forward bit-exact).
+  Parse-only syntax checks pass; **not yet executed** (pending Kaggle run).
+
+Next: 5M quick A/B (3.2 vs 3.3) on Kaggle T4, then re-run the live 8-phase
+overnight with the fixed `save_state`/`ablate`/`deploy` bugs.

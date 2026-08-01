@@ -76,6 +76,11 @@ ACH_RETAIN = os.environ.get('NFRA_ACH_RETAIN', '0') == '1'
 GAIN_NOV = os.environ.get('NFRA_GAIN_NOV', '0') == '1'
 LORA_RANK = int(os.environ.get('NFRA_LORA_RANK', '0'))     # 0 = off (Space axis)
 BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation knob
+# NFRA 3.3 Cortex: 1 = build NFRA_Cortex_Block (matrix-state mixer + real exit
+# gate) instead of the 3.2 Brain block. Opt-in so 3.2 stays intact for A/B.
+CORTEX = os.environ.get('NFRA_CORTEX', '0') == '1'
+CORTEX_STATE = int(os.environ.get('NFRA_CORTEX_STATE', '8'))
+EXIT_REG = float(os.environ.get('NFRA_EXIT_REG', '1e-3'))
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
 # model the recompute is pure overhead -> set 0 to raise tok/s.
 CHECKPOINT = os.environ.get('NFRA_CHECKPOINT', '1') == '1'
@@ -114,7 +119,8 @@ METRIC_SPEC = [
 # ─────────────────────────── builders ───────────────────────────
 def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
                local_route=None, div_norm=None, astro=None, theta=None,
-               ach_retain=None, gain_nov=None, lora_rank=0):
+               ach_retain=None, gain_nov=None, lora_rank=0, use_cortex=None,
+               cortex_state=None, exit_reg=None):
     if k_wta is None:
         k_wta = KWTA
     if local_route is None:
@@ -131,13 +137,20 @@ def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
         gain_nov = GAIN_NOV
     if not lora_rank:
         lora_rank = LORA_RANK
+    if use_cortex is None:
+        use_cortex = CORTEX
+    if cortex_state is None:
+        cortex_state = CORTEX_STATE
+    if exit_reg is None:
+        exit_reg = EXIT_REG
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=depth, n_bands=BANDS, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
                      gradient_checkpointing=CHECKPOINT, k_wta_frac=k_wta,
                      local_route=local_route, div_norm=div_norm, astro=astro,
                      theta=theta, ach_retain=ach_retain, gain_nov=gain_nov,
-                     lora_rank=lora_rank)
+                     lora_rank=lora_rank, use_cortex=use_cortex,
+                     cortex_state=cortex_state, exit_reg=exit_reg)
     return NFRAForCausalLM(cfg)
 
 
@@ -188,6 +201,8 @@ def build_family_spec(family, size, vocab):
         spec = dict(builder=build_nfra, dim=dim, extra=dict(unique_blocks=U,
                                                             depth=NFRA_DEPTH),
                     params=params, depth=NFRA_DEPTH)
+        if CORTEX:
+            spec['cortex'] = True
     elif family == 'mamba':
         dim, L, params = tune_layers_size(build_mamba, target, vocab, dims)
         spec = dict(builder=build_mamba, dim=dim,
