@@ -114,8 +114,18 @@ SHAKES_URL = ('https://raw.githubusercontent.com/karpathy/char-rnn/master/'
 
 
 def _fetch(url, dest, timeout=120):
+    """Download with a HARD timeout. urlretrieve accepts no timeout and can
+    hang forever on a stalled connection, which previously froze the whole
+    benchmark with no output. Stream via urlopen (which honors timeout) and
+    copy in chunks."""
     print('  [fetch] %s -> %s' % (url, dest))
-    urllib.request.urlretrieve(url, dest)
+    with urllib.request.urlopen(url, timeout=timeout) as resp, \
+            open(dest, 'wb') as out:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
 
 
 # compare.py's WIKI_PATHS (hardcoded here so we do NOT import compare before
@@ -155,10 +165,29 @@ def ensure_wikitext():
             except OSError:
                 pass
     else:
-        raise SystemExit(
-            '[data] could not download WikiText-2 (%r). Place the two raw .txt '
-            'files (%s) in the working directory and re-run.'
-            % (last_err, list(WIKI_FILES.values())))
+        # Both zip mirrors failed. HF no longer serves the raw .txt files, but
+        # the dataset still ships as parquet; huggingface_hub handles the signed
+        # CDN redirects that plain urllib/wget often miss. Fall back to that.
+        print('  [warn] zip mirrors failed (%r) - trying parquet via '
+              'huggingface_hub' % last_err)
+        try:
+            from huggingface_hub import hf_hub_download
+            import pandas as pd
+            for split, out in [('train', WIKI_FILES['train']),
+                               ('validation', WIKI_FILES['validation'])]:
+                path = hf_hub_download(
+                    'Salesforce/wikitext',
+                    'wikitext-2-raw-v1/%s-00000-of-00001.parquet' % split,
+                    repo_type='dataset')
+                df = pd.read_parquet(path)
+                with open(out, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(str(t) for t in df['text']))
+        except Exception as pe:
+            raise SystemExit(
+                '[data] could not download WikiText-2 (zip: %r; parquet: %r). '
+                'Place the two raw .txt files (%s) in the working directory '
+                'and re-run.'
+                % (last_err, pe, list(WIKI_FILES.values())))
     for f in WIKI_FILES.values():
         assert os.path.exists(f), 'missing %s' % f
         print('  [ok] %s (%d KB)' % (f, os.path.getsize(f) // 1024))
