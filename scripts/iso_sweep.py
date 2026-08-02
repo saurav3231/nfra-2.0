@@ -44,6 +44,55 @@ os.environ['NFRA_SCAN_KERNEL'] = '0'
 os.environ['NFRA_CHECKPOINT'] = '0'
 os.environ['NFRA_CORTEX'] = '1'
 
+# WikiText-2 MUST exist BEFORE compare/arena are imported: DATA_SOURCE is decided
+# at import time from the files' presence, and a missing dataset silently falls
+# back to synthetic (different loader shape/quality than the verified board).
+# Mirror overnight.ensure_wikitext (streaming, mirror fallback, hard timeout) so
+# the sweep is self-sufficient on a fresh clone.
+_WIKI_FILES = ['wikitext-train-raw-v1.txt', 'wikitext-valid-raw-v1.txt']
+_WIKI_URLS = [
+    'https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip',
+    'https://huggingface.co/datasets/ggml-org/ci/resolve/927b3642933080f1b0e811e2f916e14c292992f9/wikitext-2-raw-v1.zip',
+]
+
+
+def _ensure_wikitext():
+    import urllib.request
+    import zipfile
+    if all(os.path.exists(f) for f in _WIKI_FILES):
+        return
+    print('  [iso] WikiText-2 missing, downloading...')
+    tmp = 'wikitext-2-raw-v1.zip'
+    for url in _WIKI_URLS:
+        try:
+            with urllib.request.urlopen(url, timeout=120) as resp, \
+                    open(tmp, 'wb') as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            if os.path.getsize(tmp) < 1024 * 1024:
+                raise ValueError('download too small')
+            with zipfile.ZipFile(tmp) as z:
+                for src, dst in [('wikitext-2-raw/wiki.train.raw', _WIKI_FILES[0]),
+                                 ('wikitext-2-raw/wiki.valid.raw', _WIKI_FILES[1])]:
+                    with z.open(src) as f, open(dst, 'wb') as o:
+                        o.write(f.read())
+            os.remove(tmp)
+            print('  [iso] WikiText-2 ready')
+            return
+        except Exception as e:
+            print('  [warn] mirror failed (%r), trying next...' % e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    raise SystemExit('[iso] could not download WikiText-2')
+
+
+_ensure_wikitext()
+
 import numpy as np
 import torch
 
@@ -77,7 +126,8 @@ def main():
     print('protocol: %d steps, batch 8, seq 256, fp16 AMP, EMA 0.99, '
           'torch.compile' % STEPS)
 
-    tr, ev, _ = make_loaders(0)
+    train_loaders, ev, _ = make_loaders(0)
+    tr = train_loaders[SEED]
     print('train %d/256  eval %d/256' % (len(tr.dataset), len(ev.dataset)))
 
     rows = []
