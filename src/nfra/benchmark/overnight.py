@@ -254,20 +254,28 @@ for k in (
 ):
     os.environ.setdefault(k, "0")
 os.environ.setdefault("NFRA_LORA_RANK", "0")
-# ── NFRA speed knobs (both are exact-math, zero-tradeoff, and only touch NFRA).
+# ── NFRA speed/memory knobs (all exact-math, zero-tradeoff, and only touch NFRA).
 # 1) NFRA_CHECKPOINT=0: the NFRA 5M model needs 0.2 GB and 50M ~1 GB, so there is
 #    no memory pressure on a 16 GB T4 — gradient checkpointing only ADDED recompute
 #    cost in backward (~+30-50% train time). Off = same results, strictly faster.
 # 2) NFRA_COMPILE=1 + NFRA_SCAN_KERNEL=0: torch.compile fuses the model's hundreds
-#    of small per-block ops (neuromodulator cumsums, scan, local attention, routing
-#    MLP) into a handful of kernels — the exact reason NFRA is launch-bound slow.
-#    The scan must stay traceable, so force the pure-torch closed-form scan (the
-#    custom ScanFunction autograd.Function would break the compiled graph). Same
-#    numerics, 1.5-3x fewer launches. train_one already falls back to eager on any
-#    compile error, so this is safe.
+#    of small per-block ops into a handful of kernels — the exact reason NFRA is
+#    launch-bound slow. Same numerics, 1.5-3x fewer launches. train_one already
+#    falls back to eager on any compile error, so this is safe.
+# 3) NFRA_CHUNK_SIZE=64: the CortexMixer retention runs as EXACT chunked retention
+#    (within-chunk quadratic + cross-chunk linear state) — the same decayed-QK^T
+#    operator with ~4-8x fewer attention FLOPs and a fraction of the O(S^2)
+#    parallel form's memory. Verified loss unchanged (bit-identical math); this is
+#    the lever that closes the 20M tok/s and peak-memory gaps to RetNet.
+# 4) NFRA_CKPT_GEMM=0 (default): recompute the two biggest GEMM activations in
+#    backward instead of storing them — the memory path. Off by default because
+#    compile is on (checkpointed recompute breaks graph capture); set
+#    NFRA_COMPILE=0 NFRA_CKPT_GEMM=1 to trade ~20% speed for ~0.3 GB.
 os.environ.setdefault("NFRA_CHECKPOINT", "0")
 os.environ.setdefault("NFRA_COMPILE", "1")
 os.environ.setdefault("NFRA_SCAN_KERNEL", "0")
+os.environ.setdefault("NFRA_CHUNK_SIZE", "64")
+os.environ.setdefault("NFRA_CKPT_GEMM", "0")
 
 # Loss-focus lever: EMA (weight averaging) applied to ALL families during
 # training — a near-free loss gain (~-0.1..-0.3 nats at these sizes) for

@@ -148,6 +148,18 @@ CHECKPOINT = os.environ.get("NFRA_CHECKPOINT", "0") == "1"
 # with graph capture). Best combined with NFRA_SCAN_KERNEL=0 so the scan is
 # plain torch and fuses into the same graph instead of forcing a graph break.
 COMPILE = os.environ.get("NFRA_COMPILE", "0") == "1"
+# Chunked retention: exact-equivalent reformulation of the decayed-QK^T mixer
+# (within-chunk quadratic attention + cross-chunk linear state). Same math,
+# ~C/S of the attention FLOPs and a fraction of the O(S^2) parallel form's
+# memory — the Tier-1 lever to reach retnet-class tok/s AND retnet-class peak
+# memory at 20M (verified loss 1.710 unchanged; the operator is identical).
+# NFRA_CHUNK_SIZE=0 reproduces the verified parallel path bit-for-bit.
+CHUNK_SIZE = int(os.environ.get("NFRA_CHUNK_SIZE", "64"))
+# Recompute the two biggest GEMM activations (qkvr, MLP gate_up) in backward
+# instead of storing them (~8 MB/layer saved, ~0.3 GB at depth 33). Trade
+# compute for memory; forced OFF under torch.compile (checkpointed recompute
+# breaks graph capture — pick one: speed via compile, or memory via ckpt).
+CKPT_GEMM = os.environ.get("NFRA_CKPT_GEMM", "0") == "1" and not COMPILE
 EVAL_GAP = max(50, STEPS // 6)
 EXT_FACTOR = 2  # extrapolation test: eval at SEQ_LEN * EXT_FACTOR
 GEN_LEN = 16
@@ -201,6 +213,8 @@ def build_nfra(
     iso_rgate=None,
     iso_phase=None,
     iso_exit=None,
+    chunk_size=None,
+    ckpt_gems=None,
 ):
     if k_wta is None:
         k_wta = KWTA
@@ -234,6 +248,10 @@ def build_nfra(
         iso_phase = ISO_PHASE
     if iso_exit is None:
         iso_exit = ISO_EXIT
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if ckpt_gems is None:
+        ckpt_gems = CKPT_GEMM
     cfg = NFRAConfig(
         mode="brain",
         vocab_size=vocab,
@@ -260,6 +278,8 @@ def build_nfra(
         iso_rgate=iso_rgate,
         iso_phase=iso_phase,
         iso_exit=iso_exit,
+        cortex_chunk_size=chunk_size,
+        ckpt_gems=ckpt_gems,
     )
     return NFRAForCausalLM(cfg)
 

@@ -271,3 +271,73 @@ def test_energy_allocator_no_graph_leak():
     assert not a.current_budget.requires_grad
     assert b2.requires_grad
     assert torch.isfinite(a.current_budget).all()
+
+
+def test_cortex_chunked_retention_equals_parallel():
+    """The chunked retention mixer (cortex_chunk_size>0) must be EXACTLY
+    equivalent to the O(S^2) parallel form — same decayed-QK^T operator, only a
+    different summation order — including on sequence lengths that need padding
+    to a chunk multiple. This is the load-bearing speed/memory lever of Tier 1:
+    it must not move the verified loss even by a hair."""
+    from nfra.core.cortex import CortexMixer
+
+    torch.manual_seed(0)
+    kwargs = dict(dim=64, n_heads=8, iso_vgate=True, iso_rgate=False, iso_phase=True)
+    par = CortexMixer(chunk_size=0, **kwargs)
+    chu = CortexMixer(chunk_size=16, **kwargs)
+    with torch.no_grad():
+        for p, q in zip(par.parameters(), chu.parameters()):
+            q.copy_(p)
+    par.eval()
+    chu.eval()
+    for S in (50, 64, 256):
+        x = torch.randn(2, S, 64)
+        with torch.no_grad():
+            a = par(x)
+            b = chu(x)
+        err = (a - b).abs().max().item()
+        assert torch.allclose(a, b, atol=1e-4), f"S={S} max err {err:.2e}"
+
+
+def test_cortex_chunked_retention_grads_finite():
+    """Chunked retention must backprop (the cross-chunk state is a sequential
+    recurrence — a common source of vanishing/NaN gradients) and produce the
+    same gradient as the parallel form."""
+    from nfra.core.cortex import CortexMixer
+
+    torch.manual_seed(0)
+    kwargs = dict(dim=64, n_heads=8, iso_vgate=True, iso_rgate=False, iso_phase=True)
+    par = CortexMixer(chunk_size=0, **kwargs)
+    chu = CortexMixer(chunk_size=16, **kwargs)
+    with torch.no_grad():
+        for p, q in zip(par.parameters(), chu.parameters()):
+            q.copy_(p)
+    x = torch.randn(2, 80, 64)
+    a = par(x).pow(2).mean()
+    b = chu(x).pow(2).mean()
+    a.backward()
+    b.backward()
+    for p, q in zip(par.parameters(), chu.parameters()):
+        assert q.grad is not None and torch.isfinite(q.grad).all()
+        assert torch.allclose(p.grad, q.grad, atol=1e-3), \
+            f"{p.shape}: {p.grad.abs().max().item()} vs {q.grad.abs().max().item()}"
+
+
+def test_cortex_chunked_model_train_smoke():
+    """Full NFRAForCausalLM with the chunked cortex mixer: builds, forwards,
+    backward, finite grads (CPU smoke — guards config plumbing)."""
+    torch.manual_seed(0)
+    cfg = NFRAConfig(
+        mode="brain", vocab_size=32, hidden_size=64, num_layers=4,
+        use_cortex=True, cortex_chunk_size=16, dropout=0.0,
+        iso_gland=True, iso_vgate=True, iso_rgate=False,
+        iso_phase=True, iso_exit=True,
+    )
+    model = NFRAForCausalLM(cfg)
+    x = torch.randint(0, 32, (2, 40))
+    out = model(x)
+    assert out["logits"].shape == (2, 40, 32)
+    out["logits"].float().mean().backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)

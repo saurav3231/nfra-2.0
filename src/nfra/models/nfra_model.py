@@ -103,6 +103,18 @@ class NFRAConfig:
     iso_phase: bool = False  # OFF -> no resonance phase modulation
     iso_exit: bool = False  # OFF -> no adaptive-compute exit gate
 
+    # cortex_chunk_size : >0 computes the CortexMixer retention as EXACT
+    #                     chunked retention (within-chunk quadratic attention +
+    #                     cross-chunk linear state) — the same decayed-QK^T
+    #                     operator with ~C/S of the FLOPs and a fraction of the
+    #                     O(S^2) parallel form's memory. 0 = parallel (the
+    #                     verified board path). Tier-1 speed/memory lever.
+    cortex_chunk_size: int = 0
+    # ckpt_gems : recompute the two biggest GEMM activations (qkvr, MLP gate_up)
+    #             in backward instead of storing them. Trade compute for ~8 MB/
+    #             layer of memory. Do NOT combine with torch.compile.
+    ckpt_gems: bool = False
+
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
         if self.mode not in valid_modes:
@@ -225,6 +237,8 @@ class NFRAForCausalLM(nn.Module):
             block_kwargs["iso_rgate"] = config.iso_rgate
             block_kwargs["iso_phase"] = config.iso_phase
             block_kwargs["iso_exit"] = config.iso_exit
+            block_kwargs["chunk_size"] = config.cortex_chunk_size
+            block_kwargs["ckpt_gems"] = config.ckpt_gems
         elif config.mode == "brain":
             block_kwargs["k_wta_frac"] = config.k_wta_frac
             block_kwargs["local_route"] = config.local_route
