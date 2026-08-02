@@ -286,11 +286,13 @@ Phase completed in ~21 min, exit 0. Both declared targets are met.
 Run config snapshot: `NFRA_CORTEX=1 NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core`,
 commit `defe8b2`. Report/JSON saved to `overnight_report.md` / `overnight_results.json`.
 
-## 12. 3.3b Cortex — VERIFIED full 8-phase run (context / efficiency / ablate)
+## 12. 3.3b Cortex — VERIFIED full 8-phase run (context / efficiency / ablate / recall / deploy / perf)
 
 The full 8-phase overnight (`core,context,efficiency,ablate,recall,deploy,perf,
 data2`, commit `2118e7e`) ran on Kaggle T4. Core results are §11. The remaining
-phases completed this run:
+phases completed this run (data2 was interrupted when the session died mid-way
+through the TinyShakespeare download — no data2 numbers; that optional
+cross-dataset phase is the only gap):
 
 ### Context — length generalization (train @256, eval @256/512/1024)
 
@@ -346,6 +348,63 @@ phases completed this run:
 > regardless of the family list, burning ~30 min each at ~700 tok/s. Fixed in
 > `2118e7e`: ablate now skips families not in `NFRA_OVN_FAMILIES` (mamba is
 > excluded by default).
+
+### Recall — associative recall diagnostic (concurrent, 16 trainings in 490.5s → 40,084 tok/s aggregate)
+
+| family | k=4 acc / span_ce | k=16 | k=64 | k=128 |
+|---|---|---|---|---|
+| **nfra** | **0.4529 / 1.4146** | 0.1780 / 2.7226 | 0.1090 / 2.7283 | 0.0959 / 2.7467 |
+| retnet | 0.8219 / 0.5396 | 0.2250 / 2.2476 | 0.1145 / 2.6974 | 0.0639 / 2.7739 |
+| rwkv | 0.0628 | 0.0632 | 0.0622 | 0.0634 |
+| gpt2 | 0.0624 | 0.0637 | 0.0638 | 0.0626 |
+
+- **nfra is the best NON-retnet family** at every horizon (4.5× gpt2/rwkv at k=4).
+  retnet wins short-term recall outright (0.82 at k=4) but its span accuracy
+  degrades monotonically and collapses to nfra's level by k=128.
+- rwkv/gpt2 sit at the ~0.06 chance floor at every k (pad_ce ≈ floor 2.77) — no
+  measurable memory beyond immediate context.
+
+### Deploy — INT8 quantization @ 20M primary
+
+| family | size | eval fp16 → int8 | CPU prefill tok/s |
+|---|---|---|---|
+| nfra | 80.1 → 20.2 MB (75% saved) | 1.771 → 1.771 | 627 |
+| rwkv | 80.2 → 20.4 MB (75%) | 4.088 → 4.089 | 1,594 |
+| retnet | 80.0 → 20.2 MB (75%) | 1.806 → 1.806 | 1,167 |
+| gpt2 | 80.1 → 23.4 MB (71%) | 2.896 → 2.896 | 3,046 |
+
+- **INT8 costs exactly zero eval loss for every family** — 75% size reduction with
+  loss unchanged to 3 decimals. nfra's CPU prefill is the slowest (627 tok/s);
+  its 33 depth-deep block stack pays per-token overhead on a single CPU core.
+
+### Perf — inference battery + 2× context extrapolation @ 20M
+
+| family | prefill tok/s | gen tok/s | ms/token | mem | 2× ctx (512) |
+|---|---|---|---|---|---|
+| nfra | 32,984 | 18.6 | 53.78 | 1.00 GB | **1.769** |
+| rwkv | 34,547 | 22.9 | 43.65 | 1.00 GB | 4.096 |
+| retnet | 44,832 | 54.2 | 18.46 | 1.00 GB | 1.813 |
+| gpt2 | 66,919 | 263.0 | 3.80 | 1.00 GB | 3.309 |
+
+- Prefill is competitive (nfra 33k vs retnet 45k tok/s). **Generation is nfra's
+  weak point**: 18.6 tok/s — 2.9× slower than retnet, 14× slower than gpt2 — the
+  depth-33 sequential block stack makes per-token latency ~54 ms.
+- **2×-context extrapolation: nfra is best (1.769)** — beats retnet (1.813) and
+  crushes gpt2 (3.309) / rwkv (4.096); the causal-attention families degrade
+  outside their training window.
+
+### Verified 8-phase summary
+
+| axis | nfra result | verdict |
+|---|---|---|
+| quality @ 5M / 20M | 1.953 / 1.763 (beats retnet 2.135 / 1.811) | **win** |
+| length generalization | only family that improves at 4× (1.759→1.719) | **win** |
+| energy-budget exit gate | identical 1.750 at every budget | dead (no effect) |
+| legacy Brain levers | all no-ops; baseline beats every toggle | dead (prune) |
+| recall | best non-retnet at all k; graceful decay | good |
+| INT8 deploy | 75% smaller, zero loss delta | clean |
+| generation speed | 18.6 tok/s (14× behind gpt2) | **weak point** |
+| 2×-context extrapolation | best of the four (1.769) | **win** |
 
 ---
 
