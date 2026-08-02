@@ -83,13 +83,27 @@ CORTEX_STATE = int(os.environ.get('NFRA_CORTEX_STATE', '8'))
 EXIT_REG = float(os.environ.get('NFRA_EXIT_REG', '1e-3'))
 # Isolation ablations (FUTURE_PLAN Part 11): NFRA_ISO=vgate,rgate,phase,gland,exit
 # turns each 3.3b mechanism OFF (others stay on) to attribute the quality win.
-# Empty -> the exact verified architecture.
+# Empty -> the default architecture (see NFRA_LEAN below).
 _ISO = frozenset(s.strip() for s in os.environ.get('NFRA_ISO', '').split(',') if s.strip())
-ISO_GLAND = 'gland' in _ISO
-ISO_VGATE = 'vgate' in _ISO
-ISO_RGATE = 'rgate' in _ISO
-ISO_PHASE = 'phase' in _ISO
-ISO_EXIT = 'exit' in _ISO
+# 3.3c LEAN (default, NFRA_LEAN=1): the post-prune architecture. The isolation
+# sweep (b868477) proved ONLY the receptance gate carries the quality win
+# (+0.038); the gland (+0.014), value gate (+0.006), phase (+0.005) and exit
+# (+0.006) are within seed noise and all slow training 6-25%. Prune them, keep
+# receptance. NFRA_LEAN=0 reproduces the full verified 3.3b block for A/B.
+if _ISO:
+    ISO_GLAND = 'gland' in _ISO
+    ISO_VGATE = 'vgate' in _ISO
+    ISO_RGATE = 'rgate' in _ISO
+    ISO_PHASE = 'phase' in _ISO
+    ISO_EXIT = 'exit' in _ISO
+elif os.environ.get('NFRA_LEAN', '1') == '1':
+    ISO_GLAND = True      # neuromodulator pruned
+    ISO_VGATE = True      # value gate pruned
+    ISO_RGATE = False     # receptance gate KEPT (verified differentiator)
+    ISO_PHASE = True      # phase modulation pruned
+    ISO_EXIT = True       # adaptive-exit gate pruned
+else:
+    ISO_GLAND = ISO_VGATE = ISO_RGATE = ISO_PHASE = ISO_EXIT = False  # full 3.3b
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
 # model the recompute is pure overhead -> set 0 to raise tok/s. Off by default
 # for 3.3b: the lean retention block's activations are small (RetNet-shaped),

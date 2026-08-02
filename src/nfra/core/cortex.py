@@ -70,13 +70,13 @@ class CortexMixer(nn.Module):
         self.iso_rgate = iso_rgate
         self.iso_phase = iso_phase
 
-        # Fused QKV + value-gate + receptance-gate as ONE GEMM (5*D output).
-        # The three projections retnet needs as 3 separate linears plus the two
-        # selectivity gates are all Linear(dim, dim) on the same input, so
-        # concatenating their weights is bit-identical but cuts 2 kernel
-        # launches per block -- the launch-bound cost that kept nfra ~2x
-        # slower than retnet at identical D^2/block.
-        self.qkvr = nn.Linear(dim, 5 * dim, bias=False)
+        # Fused Q/K/V + gates as ONE GEMM. Width shrinks with pruned gates so
+        # dead channels leave the block entirely (3.3c lean = 4*D: q,k,v,r):
+        #   5*D full 3.3b (q,k,v, value-gate g, receptance r)
+        #   4*D lean   (q,k,v,r)                -- value gate pruned
+        #   3*D        (q,k,v)                  -- receptance pruned too
+        self.n_gates = 2 - int(iso_vgate) - int(iso_rgate)
+        self.qkvr = nn.Linear(dim, (3 + self.n_gates) * dim, bias=False)
         self.gn = nn.GroupNorm(n_heads, dim)
         self.proj_out = nn.Linear(dim, dim, bias=False)
 
@@ -87,8 +87,12 @@ class CortexMixer(nn.Module):
         self.log_decay = nn.Parameter(torch.linspace(-5.0, 3.0, n_heads))
 
         # Resonance phase (oscillatory identity, cheap [S, H] gate modulation).
+        # Only exists when the value gate it modulates is also present.
         self.freqs = nn.Parameter(torch.randn(self.n_heads) * 0.5 + 2.0)
         self.phases = nn.Parameter(torch.randn(self.n_heads) * math.pi)
+        if iso_vgate or iso_phase:
+            del self.freqs
+            del self.phases
 
     def decay_mask(self, S: int) -> torch.Tensor:
         """Causal decayed mask D_h[i,j] = gamma_h^(i-j), j <= i. [1,H,S,S].
@@ -117,8 +121,12 @@ class CortexMixer(nn.Module):
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
-        t = self.qkvr(x).view(B, S, 5, H, Hd).permute(2, 0, 3, 1, 4)
-        q, k, v, g, r = t[0], t[1], t[2], t[3], t[4]            # [B,H,S,Hd]
+        t = self.qkvr(x).view(B, S, 3 + self.n_gates, H, Hd).permute(2, 0, 3, 1, 4)
+        q, k, v = t[0], t[1], t[2]                              # [B,H,S,Hd]
+        if not self.iso_vgate:
+            g = t[3]
+        if not self.iso_rgate:
+            r = t[-1]
 
         # Selectivity: input-dependent value gate (ACh -> HOLD, phase-modulated).
         if not self.iso_vgate:

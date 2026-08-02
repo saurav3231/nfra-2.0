@@ -22,6 +22,9 @@ import torch
 
 os.environ.setdefault('NFRA_SEEDS', '1')
 os.environ.setdefault('NFRA_SIZES', '5')
+# Test the FULL 3.3b block (gland + gates + exit): the default 3.3c build is the
+# pruned lean block, which has no exit_gate for this diagnostic to poke.
+os.environ.setdefault('NFRA_LEAN', '0')
 
 from .arena import build_nfra, NFRA_DEPTH
 from .compare import count_params, DEVICE, rescale_embed
