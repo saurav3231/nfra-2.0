@@ -102,8 +102,14 @@ GAIN_NOV = os.environ.get("NFRA_GAIN_NOV", "0") == "1"
 LORA_RANK = int(os.environ.get("NFRA_LORA_RANK", "0"))  # 0 = off (Space axis)
 BANDS = int(os.environ.get("NFRA_BANDS", "16"))  # H8 band-count ablation knob
 # NFRA 3.3 Cortex: 1 = build NFRA_Cortex_Block (3.3b retention-QK mixer + real
-# exit gate) instead of the 3.2 Brain block. Opt-in so 3.2 stays intact for A/B.
-CORTEX = os.environ.get("NFRA_CORTEX", "0") == "1"
+# exit gate) instead of the 3.2 Brain block. DEFAULT ON: the verified board
+# (5.03M @ dim112/33, 20.00M @ dim224/33; losses 1.953/1.763 @ ~10.5k tok/s)
+# and the isolation sweep were both measured on the Cortex block, and the
+# NFRA_LEAN=1 / NFRA_ISO pruning flags only exist inside it. NFRA_CORTEX=0 is
+# the legacy escape hatch that selects the old Brain block for A/B — it is NOT
+# the default, otherwise a fresh clone silently ignores the lean pruning and
+# regresses (5M: 2.140 @ 3.5k tok/s 3.77GB vs verified 1.953 @ 10.3k 1.40GB).
+CORTEX = os.environ.get("NFRA_CORTEX", "1") == "1"
 CORTEX_STATE = int(os.environ.get("NFRA_CORTEX_STATE", "8"))
 EXIT_REG = float(os.environ.get("NFRA_EXIT_REG", "1e-3"))
 # Isolation ablations (FUTURE_PLAN Part 11): NFRA_ISO=vgate,rgate,phase,gland,exit

@@ -149,7 +149,9 @@ Wiring status (this session, not yet validated on Kaggle):
   threads the exit gate through depth passes (freeze exited tokens, skip the
   pass loop at inference when the whole batch has exited; exit regularizer added
   to train loss only).
-- Arena toggle: `NFRA_CORTEX=1` (+ `NFRA_CORTEX_STATE`, `NFRA_EXIT_REG`).
+- Arena toggle: `NFRA_CORTEX` (default `1` = Cortex block, the verified
+  architecture; `NFRA_CORTEX_STATE`, `NFRA_EXIT_REG`). `NFRA_CORTEX=0` selects
+  the legacy Brain block for A/B.
   A/B harness: `NFRA_CORTEX=1 python -m nfra.benchmark.compare_versions`
   (nfra32 Brain vs nfra33 Cortex, matched seeds/steps/data).
 - Quick sanity: `python -m nfra.benchmark.cortex_smoke` (params ~5M, train

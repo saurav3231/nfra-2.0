@@ -229,6 +229,7 @@ inference latency, memory, and long-context extrapolation.
 | `NFRA_OVN_PHASES` | all | Comma list of phases: `core,context,efficiency,ablate,recall,deploy,perf,data2` |
 | `NFRA_OVN_DATA` | `wikitext2` | Data source (only `wikitext2` is allowed for the headline run) |
 | `NFRA_LEAN` | `1` | `0` = full 3.3b block (all gates), `1` = lean (receptance gate only) |
+| `NFRA_CORTEX` | `1` | `1` = Cortex block (verified architecture, default), `0` = legacy Brain block A/B |
 | `NFRA_COMPILE` | `1` | `1` = `torch.compile(mode='reduce-overhead')` (auto-disables when unstable) |
 
 #### Outputs
