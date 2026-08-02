@@ -39,7 +39,13 @@ os.environ['NFRA_SIZES'] = '5'
 os.environ['NFRA_SEEDS'] = '1'
 os.environ['NFRA_DATA'] = 'wikitext2'
 os.environ['NFRA_EMA'] = '0.99'
-os.environ['NFRA_COMPILE'] = '1'
+# Eager (no torch.compile): fresh Kaggle images carry a torch whose Inductor
+# crashes in codegen on the neuromodulator's cumsum/arange division
+# (TypeError in TritonSymbols.get_block_shape) -- dies on FIRST forward, which
+# train_one's compile fallback cannot catch. torch.compile is exact-math, so
+# eager gives the SAME loss as the compiled board; only tok/s is lower (still
+# comparable across configs, which is what the cost side of the rule needs).
+os.environ['NFRA_COMPILE'] = '0'
 os.environ['NFRA_SCAN_KERNEL'] = '0'
 os.environ['NFRA_CHECKPOINT'] = '0'
 os.environ['NFRA_CORTEX'] = '1'
@@ -124,7 +130,7 @@ def main():
     print('nfra 5M cortex geometry: dim %d, depth %d, unique %d, %.2fM params'
           % (dim, depth, U, spec['params'] / 1e6))
     print('protocol: %d steps, batch 8, seq 256, fp16 AMP, EMA 0.99, '
-          'torch.compile' % STEPS)
+          'eager (compile exact-math)' % STEPS)
 
     train_loaders, ev, _ = make_loaders(0)
     tr = train_loaders[SEED]
