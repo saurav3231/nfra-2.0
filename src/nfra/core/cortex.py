@@ -56,7 +56,9 @@ class CortexMixer(nn.Module):
     plain elementwise multiplies, so the parallel form stays intact.
     """
 
-    def __init__(self, dim: int, n_heads: int = 8):
+    def __init__(self, dim: int, n_heads: int = 8,
+                 iso_vgate: bool = False, iso_rgate: bool = False,
+                 iso_phase: bool = False):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -64,6 +66,9 @@ class CortexMixer(nn.Module):
         if dim != self.n_heads * self.head_dim:
             raise ValueError('dim (%d) must be divisible by %d heads'
                              % (dim, self.n_heads))
+        self.iso_vgate = iso_vgate
+        self.iso_rgate = iso_rgate
+        self.iso_phase = iso_phase
 
         # Fused QKV + value-gate + receptance-gate as ONE GEMM (5*D output).
         # The three projections retnet needs as 3 separate linears plus the two
@@ -116,15 +121,17 @@ class CortexMixer(nn.Module):
         q, k, v, g, r = t[0], t[1], t[2], t[3], t[4]            # [B,H,S,Hd]
 
         # Selectivity: input-dependent value gate (ACh -> HOLD, phase-modulated).
-        gate = torch.sigmoid(g).permute(0, 2, 1, 3)             # [B,S,H,Hd]
-        if hormones is not None:
-            ach = hormones[:, :, 0:1]
-            gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))        # high ACh -> HOLD
-        pos = torch.arange(S, device=x.device).float()
-        phase = torch.sin(2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
-                          + self.phases[:, None])                # [H,S]
-        gate = gate * (1.0 + 0.05 * phase.t())[None, :, :, None]
-        v = v * gate.permute(0, 2, 1, 3)
+        if not self.iso_vgate:
+            gate = torch.sigmoid(g).permute(0, 2, 1, 3)            # [B,S,H,Hd]
+            if hormones is not None:
+                ach = hormones[:, :, 0:1]
+                gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))       # high ACh -> HOLD
+            if not self.iso_phase:
+                pos = torch.arange(S, device=x.device).float()
+                phase = torch.sin(2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
+                                  + self.phases[:, None])           # [H,S]
+                gate = gate * (1.0 + 0.05 * phase.t())[None, :, :, None]
+            v = v * gate.permute(0, 2, 1, 3)
 
         # Retention (parallel form): decayed QK^T attention, no softmax.
         scores = torch.matmul(q * (Hd ** -0.5), k.transpose(-2, -1))
@@ -133,8 +140,10 @@ class CortexMixer(nn.Module):
         y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
 
         # Output receptance gate (RWKV-style selectivity on the read).
-        r = torch.sigmoid(r).permute(0, 2, 1, 3).reshape(B, S, D)
-        return self.proj_out(y * r)
+        if not self.iso_rgate:
+            r = torch.sigmoid(r).permute(0, 2, 1, 3).reshape(B, S, D)
+            y = y * r
+        return self.proj_out(y)
 
 
 class CortexExit(nn.Module):
@@ -254,18 +263,25 @@ class NFRA_Cortex_Block(nn.Module):
     def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,
                  d_state: int = 8, exit_reg: float = 1e-3,
                  k_wta_frac: float = 0.0, local_route: bool = False,
-                 div_norm: bool = False):
+                 div_norm: bool = False,
+                 iso_gland: bool = False, iso_vgate: bool = False,
+                 iso_rgate: bool = False, iso_phase: bool = False,
+                 iso_exit: bool = False):
         super().__init__()
         self.dim = dim
+        self.iso_gland = iso_gland
+        self.iso_exit = iso_exit
 
-        self.neuromodulator = CortexNeuromodulator(dim)
+        self.neuromodulator = (None if iso_gland
+                               else CortexNeuromodulator(dim))
         self.ln1 = nn.LayerNorm(dim)
-        self.mixer = CortexMixer(dim)
+        self.mixer = CortexMixer(dim, iso_vgate=iso_vgate,
+                                 iso_rgate=iso_rgate, iso_phase=iso_phase)
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = CortexMLP(dim, k_wta_frac=k_wta_frac)
 
         self.dropout = nn.Dropout(dropout)
-        self.exit_gate = CortexExit(dim, reg=exit_reg)
+        self.exit_gate = None if iso_exit else CortexExit(dim, reg=exit_reg)
 
     def forward(
         self,
@@ -278,7 +294,8 @@ class NFRA_Cortex_Block(nn.Module):
         compatible signature with depth-pass threading)."""
         B, S, D = x.shape
 
-        hormones = self.neuromodulator(x, prev_hormones=hormones)
+        if self.neuromodulator is not None:
+            hormones = self.neuromodulator(x, prev_hormones=hormones)
 
         residual = x
         n = self.ln1(x)
@@ -290,11 +307,14 @@ class NFRA_Cortex_Block(nn.Module):
         n = self.mlp(n, hormones=hormones)
         x = residual + self.dropout(n)
 
-        exit_logit = self.exit_gate.gate(x)
-        return x, hormones.detach(), exit_logit
+        if self.exit_gate is not None:
+            exit_logit = self.exit_gate.gate(x)
+        else:
+            exit_logit = x.new_zeros(B, S, 1)
+        return x, (hormones.detach() if hormones is not None else None), exit_logit
 
     def exit_prob(self, x: torch.Tensor) -> torch.Tensor:
-        return self.exit_gate.prob(x)
+        return self.exit_gate.prob(x) if self.exit_gate is not None else x.new_zeros(x.shape[0], x.shape[1], 1)
 
     def get_sparsity(self) -> float:
         return 0.0

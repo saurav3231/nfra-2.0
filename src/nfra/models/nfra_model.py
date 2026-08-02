@@ -93,6 +93,15 @@ class NFRAConfig:
     cortex_state: int = 8
     exit_reg: float = 1e-3
 
+    # Isolation-ablation switches (FUTURE_PLAN Part 11): each turns ONE 3.3b
+    # mechanism OFF to attribute the verified quality win. All default False =
+    # the exact verified architecture. Set via NFRA_ISO=<list> in the arena.
+    iso_gland: bool = False    # OFF -> drop neuromodulator (no ACh/NE)
+    iso_vgate: bool = False    # OFF -> no input-dependent value gate
+    iso_rgate: bool = False    # OFF -> no output receptance gate
+    iso_phase: bool = False    # OFF -> no resonance phase modulation
+    iso_exit: bool = False     # OFF -> no adaptive-compute exit gate
+
     def __post_init__(self):
         valid_modes = ["lite", "mid", "max", "brain"]
         if self.mode not in valid_modes:
@@ -205,6 +214,11 @@ class NFRAForCausalLM(nn.Module):
             block_kwargs['k_wta_frac'] = config.k_wta_frac
             block_kwargs['local_route'] = config.local_route
             block_kwargs['div_norm'] = config.div_norm
+            block_kwargs['iso_gland'] = config.iso_gland
+            block_kwargs['iso_vgate'] = config.iso_vgate
+            block_kwargs['iso_rgate'] = config.iso_rgate
+            block_kwargs['iso_phase'] = config.iso_phase
+            block_kwargs['iso_exit'] = config.iso_exit
         elif config.mode == "brain":
             block_kwargs['k_wta_frac'] = config.k_wta_frac
             block_kwargs['local_route'] = config.local_route
@@ -299,60 +313,83 @@ class NFRAForCausalLM(nn.Module):
             checkpoint = torch.utils.checkpoint.checkpoint
 
         if self.config.use_cortex:
-            # NFRA 3.3 Cortex: each block returns (out, hormones, exit_logit).
-            # The exit gate gives per-token, per-pass adaptive compute: easy
-            # tokens freeze early (their state is preserved), hard tokens spend
-            # all depth passes. Training uses Gumbel straight-through + a small
-            # compute regularizer; inference hard-masks and skips the remaining
-            # passes when the whole batch has exited.
-            B, S, D = hidden_states.shape
-            active = torch.ones(B, S, 1, dtype=hidden_states.dtype,
-                                device=hidden_states.device)
-            final_states = hidden_states.clone()
-            exit_aux = torch.zeros((), device=hidden_states.device,
-                                   dtype=hidden_states.dtype)
-            for p in range(self.depth_passes):
-                if not self.training and bool((active == 0).all()):
-                    break
-                if self.pass_scale is not None:
-                    hidden_states = (hidden_states * self.pass_scale[p].view(1, 1, -1)
-                                     + self.pass_bias[p].view(1, 1, -1))
-                for i, layer in enumerate(self.layers):
-                    if use_ckpt:
-                        hidden_states, hormones, _el = checkpoint(
-                            self._run_cortex_layer, layer, hidden_states,
-                            budgets[i], hormones, use_reentrant=False,
-                        )
+            if self.config.iso_exit:
+                # Isolation ablation: no adaptive-compute exit gate -- plain
+                # full-depth forward, no freezing, no compute regularizer.
+                for p in range(self.depth_passes):
+                    if self.pass_scale is not None:
+                        hidden_states = (hidden_states * self.pass_scale[p].view(1, 1, -1)
+                                         + self.pass_bias[p].view(1, 1, -1))
+                    for i, layer in enumerate(self.layers):
+                        if use_ckpt:
+                            hidden_states, hormones, _el = checkpoint(
+                                self._run_cortex_layer, layer, hidden_states,
+                                budgets[i], hormones, use_reentrant=False,
+                            )
+                        else:
+                            hidden_states, hormones, _el = layer(
+                                hidden_states, hormones=hormones,
+                                energy_budget=budgets[i])
+                    if self.pass_lora is not None:
+                        hidden_states = self.pass_lora[p](hidden_states)
+                    if self.global_brain is not None:
+                        global_state = self.global_brain(hidden_states, global_state)
+                        hidden_states = self.global_brain.inject(global_state, hidden_states)
+            else:
+                # NFRA 3.3 Cortex: each block returns (out, hormones, exit_logit).
+                # The exit gate gives per-token, per-pass adaptive compute: easy
+                # tokens freeze early (their state is preserved), hard tokens spend
+                # all depth passes. Training uses Gumbel straight-through + a small
+                # compute regularizer; inference hard-masks and skips the remaining
+                # passes when the whole batch has exited.
+                B, S, D = hidden_states.shape
+                active = torch.ones(B, S, 1, dtype=hidden_states.dtype,
+                                    device=hidden_states.device)
+                final_states = hidden_states.clone()
+                exit_aux = torch.zeros((), device=hidden_states.device,
+                                       dtype=hidden_states.dtype)
+                for p in range(self.depth_passes):
+                    if not self.training and bool((active == 0).all()):
+                        break
+                    if self.pass_scale is not None:
+                        hidden_states = (hidden_states * self.pass_scale[p].view(1, 1, -1)
+                                         + self.pass_bias[p].view(1, 1, -1))
+                    for i, layer in enumerate(self.layers):
+                        if use_ckpt:
+                            hidden_states, hormones, _el = checkpoint(
+                                self._run_cortex_layer, layer, hidden_states,
+                                budgets[i], hormones, use_reentrant=False,
+                            )
+                        else:
+                            hidden_states, hormones, _el = layer(
+                                hidden_states, hormones=hormones,
+                                energy_budget=budgets[i])
+                    if self.pass_lora is not None:
+                        hidden_states = self.pass_lora[p](hidden_states)
+                    if self.global_brain is not None:
+                        global_state = self.global_brain(hidden_states, global_state)
+                        hidden_states = self.global_brain.inject(global_state, hidden_states)
+                    # Exit decision (last block's gate): continue = keep going.
+                    p_exit = self.layers[-1].exit_gate.prob(hidden_states)   # [B,S,1]
+                    if self.training:
+                        cont, _ = self.layers[-1].exit_gate.sample_mask(
+                            hidden_states, hard=False)                       # ST 0/1
                     else:
-                        hidden_states, hormones, _el = layer(
-                            hidden_states, hormones=hormones,
-                            energy_budget=budgets[i])
-                if self.pass_lora is not None:
-                    hidden_states = self.pass_lora[p](hidden_states)
-                if self.global_brain is not None:
-                    global_state = self.global_brain(hidden_states, global_state)
-                    hidden_states = self.global_brain.inject(global_state, hidden_states)
-                # Exit decision (last block's gate): continue = gate says keep going.
-                p_exit = self.layers[-1].exit_gate.prob(hidden_states)   # [B,S,1]
-                if self.training:
-                    cont, _ = self.layers[-1].exit_gate.sample_mask(
-                        hidden_states, hard=False)                       # ST 0/1
-                else:
-                    cont = (p_exit < 0.5).float()
-                active_new = active * cont
-                newly_done = active - active_new
-                # Freeze tokens that just exited at their current state.
-                final_states = (final_states * (1 - newly_done)
-                                + hidden_states * newly_done)
-                hidden_states = (hidden_states * active_new
-                                 + final_states * (1 - active_new))
-                # Compute regularizer: penalize CONTINUING (expected pass count).
-                n_active = active.sum().clamp(min=1.0)
-                exit_aux = exit_aux + self.config.exit_reg * (
-                    ((1.0 - p_exit) * active).sum() / n_active)
-                active = active_new.detach()
-            hidden_states = (hidden_states * active
-                             + final_states * (1 - active))
+                        cont = (p_exit < 0.5).float()
+                    active_new = active * cont
+                    newly_done = active - active_new
+                    # Freeze tokens that just exited at their current state.
+                    final_states = (final_states * (1 - newly_done)
+                                    + hidden_states * newly_done)
+                    hidden_states = (hidden_states * active_new
+                                     + final_states * (1 - active_new))
+                    # Compute regularizer: penalize CONTINUING (expected pass count).
+                    n_active = active.sum().clamp(min=1.0)
+                    exit_aux = exit_aux + self.config.exit_reg * (
+                        ((1.0 - p_exit) * active).sum() / n_active)
+                    active = active_new.detach()
+                hidden_states = (hidden_states * active
+                                 + final_states * (1 - active))
         elif self._has_neuromodulator:
             for p in range(self.depth_passes):
                 # Per-pass adapter: depth-shared blocks compute a DIFFERENT

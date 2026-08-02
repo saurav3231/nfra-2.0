@@ -81,6 +81,15 @@ BANDS = int(os.environ.get('NFRA_BANDS', '16'))     # H8 band-count ablation kno
 CORTEX = os.environ.get('NFRA_CORTEX', '0') == '1'
 CORTEX_STATE = int(os.environ.get('NFRA_CORTEX_STATE', '8'))
 EXIT_REG = float(os.environ.get('NFRA_EXIT_REG', '1e-3'))
+# Isolation ablations (FUTURE_PLAN Part 11): NFRA_ISO=vgate,rgate,phase,gland,exit
+# turns each 3.3b mechanism OFF (others stay on) to attribute the quality win.
+# Empty -> the exact verified architecture.
+_ISO = frozenset(s.strip() for s in os.environ.get('NFRA_ISO', '').split(',') if s.strip())
+ISO_GLAND = 'gland' in _ISO
+ISO_VGATE = 'vgate' in _ISO
+ISO_RGATE = 'rgate' in _ISO
+ISO_PHASE = 'phase' in _ISO
+ISO_EXIT = 'exit' in _ISO
 # Gradient checkpointing trades compute for memory; on a big GPU with a small
 # model the recompute is pure overhead -> set 0 to raise tok/s. Off by default
 # for 3.3b: the lean retention block's activations are small (RetNet-shaped),
@@ -122,7 +131,9 @@ METRIC_SPEC = [
 def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
                local_route=None, div_norm=None, astro=None, theta=None,
                ach_retain=None, gain_nov=None, lora_rank=0, use_cortex=None,
-               cortex_state=None, exit_reg=None):
+               cortex_state=None, exit_reg=None,
+               iso_gland=None, iso_vgate=None, iso_rgate=None,
+               iso_phase=None, iso_exit=None):
     if k_wta is None:
         k_wta = KWTA
     if local_route is None:
@@ -145,6 +156,16 @@ def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
         cortex_state = CORTEX_STATE
     if exit_reg is None:
         exit_reg = EXIT_REG
+    if iso_gland is None:
+        iso_gland = ISO_GLAND
+    if iso_vgate is None:
+        iso_vgate = ISO_VGATE
+    if iso_rgate is None:
+        iso_rgate = ISO_RGATE
+    if iso_phase is None:
+        iso_phase = ISO_PHASE
+    if iso_exit is None:
+        iso_exit = ISO_EXIT
     cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
                      num_layers=depth, n_bands=BANDS, dropout=0.1,
                      depth_shared=True, unique_blocks=unique_blocks,
@@ -152,7 +173,10 @@ def build_nfra(vocab, dim, unique_blocks, depth=NFRA_DEPTH, k_wta=None,
                      local_route=local_route, div_norm=div_norm, astro=astro,
                      theta=theta, ach_retain=ach_retain, gain_nov=gain_nov,
                      lora_rank=lora_rank, use_cortex=use_cortex,
-                     cortex_state=cortex_state, exit_reg=exit_reg)
+                     cortex_state=cortex_state, exit_reg=exit_reg,
+                     iso_gland=iso_gland, iso_vgate=iso_vgate,
+                     iso_rgate=iso_rgate, iso_phase=iso_phase,
+                     iso_exit=iso_exit)
     return NFRAForCausalLM(cfg)
 
 
