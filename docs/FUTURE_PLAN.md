@@ -339,30 +339,35 @@ Config: `NFRA_RECALL_KS=4,16,64,128 NFRA_RECALL_DIM=224 NFRA_RECALL_CONCURRENT=1
 
 | idea | status | verified evidence |
 |---|---|---|
-| Neuromodulated retention (ACh→HOLD value gate, NE→MLP gain gland) | **KEEP — likely the differentiator** | nfra beats retnet at bit-identical geometry (−0.18 @5M, −0.048 @20M, both seeds); the only family that improves at 4× length |
+| Receptance gate (RWKV-style read gate) | **KEEP — the actual differentiator** | isolation sweep: removing it costs **+0.038** nats (the only gate > the +0.02 bar), at only +3.5% tok/s |
 | Retention-QK mixer (multi-scale decay −5…+3) | **KEEP** | the operator that finally closed the §9/§10 loss gap |
 | GEMM fusion (qkvr 5D, gate_up 2h) | **KEEP** | 9→5 GEMMs/block, +10% tok/s, bit-identical fwd/bwd (0.0 diff) |
-| Low-dim neuromodulator scan | **KEEP** | +3% tok/s, exact (1.2e-7) |
+| Neuromodulator gland (ACh→value, NE→MLP) | **DECISION NEEDED** | isolation: only +0.014 (≈ seed noise) yet +25% tok/s when removed — identity vs speed tradeoff |
+| Value gate (ACh/phase write gate) | **REMOVE** | isolation: +0.006 (noise), +17% tok/s when removed |
+| Phase modulation | **REMOVE** | isolation: +0.005 (noise), +9% tok/s when removed |
+| Energy-budget / adaptive-exit gate | **REMOVE** | efficiency: zero effect at every budget; isolation: +0.006 (noise), +6% tok/s when removed |
 | EMA 0.99 | **REMOVE** | ablate: 1.779 vs 1.763 baseline, −23% tok/s |
 | Surprise-weighted (dopamine-RPE) loss | **REMOVE** | ablate: 1.950 vs 1.763 (−0.19 nats) — actively harmful |
 | k-WTA (0.25) | **REMOVE** | 1.770 — a wash, costs kernels |
 | local_route / div_norm / astro / theta / ach_retain / gain_nov / lora8 | **REMOVE (dead weight)** | ablate: all exactly 1.763 = no-ops in the Cortex block |
 | nfra_all (stacked levers) | **REMOVE** | clearly worst: 1.985/1.962, 7.7k tok/s |
-| Energy-budget / adaptive-exit gate | **FIX OR REMOVE** | efficiency: zero effect across all budgets (gate never learns to exit) |
 | Mamba in default grid | **REMOVE (done in `2118e7e`)** | ~700 tok/s, burns 30 min/run in ablate |
 
-### The open question this plan answers
+### The open question this plan answers — RESOLVED (isolation sweep, commit `b868477`)
 
-The ablate proved *baseline > stacked levers*, but it **never removed the neuromodulator or the gates themselves**. So "the gated block wins" is verified; *which* gate carries it is not. The prune needs an **isolation ablation** before deleting anything:
+The ablate proved *baseline > stacked levers*, and the isolation sweep now proves
+*which* gate carries it:
 
-1. **Isolation sweep @5M, ~2 min/config** (dim 112, depth 33, 600 steps):
-   - baseline (all on)
-   - neuromodulator gland OFF (hormones=None path)
-   - value gate OFF (v unmodulated)
-   - receptance gate OFF
-   - phase modulation OFF
-   - exit gate OFF
-2. **Decision rule:** keep a component iff loss gain ≥ ~0.02 at ≤5% tok/s cost; otherwise remove it and its params. Pre-committed negative result: if the gland itself contributes nothing, drop it and shrink the block further.
+1. **Isolation sweep ran @5M, ~12 min total** (6 configs × 600 steps; eager due to
+   a fresh-Kaggle-torch Inductor crash on the neuromodulator cumsum — exact-math,
+   loss comparable to the compiled board):
+   - baseline 1.966 · gland OFF 1.980 (+0.014) · value-gate OFF 1.971 (+0.006) ·
+     **receptance OFF 2.004 (+0.038)** · phase OFF 1.971 (+0.005) · exit OFF 1.972 (+0.006)
+2. **Decision rule applied:** only the **receptance gate** clears +0.02. Every
+   "brain" gate individually is within seed noise (~±0.01) and removing any of
+   them speeds training up 6–25%. The gland is the one borderline case (+0.014)
+   — it is also the single biggest per-block speed cost, so it is a genuine
+   identity-vs-speed decision for the user.
 
 ### Follow-up targets (from the user's stated goals)
 
@@ -372,7 +377,7 @@ The ablate proved *baseline > stacked levers*, but it **never removed the neurom
 
 ### Order of operations (after this run ends)
 
-1. Post the full-run tail (recall/deploy/perf/data2 results) → document remaining phases.
-2. Run the isolation sweep above → prune to the verified keep-list.
+1. Post the full-run tail (recall/deploy/perf/data2 results) → document remaining phases. **DONE** (`28821bb`; data2 interrupted — session died mid-download).
+2. Run the isolation sweep above → prune to the verified keep-list. **DONE** (`b868477`): only the receptance gate is a verified keeper; gland is the user decision; everything else prunes.
 3. Profile (`PROF_ARCH=nfra` then `retnet`) → attack the actual tok/s hotspot.
 4. Optional: 3000-step nfra@20M probe to establish the real loss ceiling at this size.

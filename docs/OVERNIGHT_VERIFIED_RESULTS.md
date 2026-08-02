@@ -446,3 +446,49 @@ What is defensibly ours:
 
 The ablate phase (§12) additionally proves the win comes from these gates, not
 from stacking more levers: baseline beats every single legacy toggle.
+
+---
+
+## 14. Isolation sweep — which mechanism actually carries the win (commit `b868477`)
+
+Per FUTURE_PLAN Part 11, one 3.3b mechanism was turned OFF at a time (everything
+else at the exact verified build) and trained at 5M / 600 steps / seed 42.
+Eager (not compiled): torch.compile on the current Kaggle torch crashes in
+Inductor codegen on the neuromodulator cumsum — exact-math, so loss is
+board-comparable; tok/s is relative (all configs equally eager).
+
+| config | loss | Δ loss | tok/s | Δ tok/s | verdict |
+|---|---|---|---|---|---|
+| baseline | 1.966 | +0.000 | 8,059 | — | — |
+| neuromodulator gland OFF | 1.980 | +0.014 | 10,041 | +25% | wash (~seed noise) |
+| value gate OFF (ACh/phase write gate) | 1.971 | +0.006 | 9,469 | +17% | wash |
+| **receptance gate OFF** | **2.004** | **+0.038** | 8,341 | +3.5% | **KEEP — carries the win** |
+| phase modulation OFF | 1.971 | +0.005 | 8,759 | +9% | wash |
+| exit gate OFF | 1.972 | +0.006 | 8,539 | +6% | wash |
+
+Seed noise at 5M/600 steps is ~±0.01 (board: 1.961/1.945), so:
+
+- **The receptance gate (RWKV-style read gate, `y = proj_out(retention · σ(r))`)
+  is the single mechanism that clears the +0.02 bar (+0.038).** It is also cheap
+  (+3.5% tok/s). This is the real differentiator.
+- **Every "brain" gate individually is noise-level** — the neuromodulator
+  (ACh→value + NE→MLP, +0.014), the value gate (+0.006), phase (+0.005), and the
+  adaptive exit (+0.006) each cost meaningful speed (6–25%) for ~no quality.
+- **Identity revision vs §13:** the verified quality edge is NOT carried by the
+  neuromodulated value gate — it is carried by the receptance gate (a borrowed
+  RWKV atom applied to RetNet retention). The gland is at most a borderline
+  contributor and the biggest per-block speed cost. The honest core is
+  **RetNet retention + receptance gate**; the brain framing adds cost, not
+  quality, at this budget.
+- Caveat: isolation is individual and at 5M/600 steps; gates may interact and
+  effects can differ at scale or with more training. The 4×-length win (§12) is
+  attributed to the multi-scale decay heads, not the gates — pruning the gates
+  should not touch context behavior, but a re-check is warranted.
+
+### Prune decision (per Part 11 rule)
+
+- **KEEP:** retention-QK mixer, **receptance gate**, GEMM fusion.
+- **REMOVE (decoration, all speed-positive when removed):** value gate, phase
+  modulation, adaptive exit gate (params + kernels), and — pending a user call
+  on the identity/speed tradeoff — the neuromodulator gland (+0.014 at +25%
+  speed).
