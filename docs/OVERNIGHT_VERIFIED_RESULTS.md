@@ -420,7 +420,7 @@ is verified — the measured effect of that synthesis.
 
 | claim | mechanism | evidence it is real |
 |---|---|---|
-| **Neuromodulated retention** | a 6-channel causal prefix gland (ACh/NE/DA/5HT/CORT/OX) pools to hormones per token; ACh gates the mixer's value-write (ACh→HOLD) and NE gates the MLP gain; smoothed across blocks | nfra beats retnet at **bit-identical geometry** (dim 112/33 @5M, dim 224/33 @20M): −0.18 nats @5M, −0.048 nats @20M, both seeds. If the gland were decorative, losses would be equal |
+| **Retention + receptance-gate synthesis** | a RetNet retention-QK mixer closed by an RWKV-style input-dependent receptance read-gate `y = proj_out(retention · σ(r))` | nfra beats retnet at **bit-identical geometry** (dim 112/33 @5M, dim 224/33 @20M): −0.18 nats @5M, −0.048 nats @20M, both seeds; the isolation sweep (§14) shows the receptance gate is the **single mechanism** that carries that win (+0.038 when removed; every other gate is within seed noise). Re-verified from a fresh clone (§15) |
 | **Resonance identity** | multi-scale decay heads (log_decay −5…+3) + sin-phase-modulated selectivity gates as one framing | the only family that **improves** at 4× length (1.759→1.719 @1024) while gpt2 collapses (+0.44) and retnet barely moves |
 | **Verified long-horizon memory** | the combination above, measured | recall + context phases (§12); graceful span degradation 62%→11% with usable memory far beyond mamba's k≥16 collapse |
 
@@ -442,12 +442,14 @@ No component is atomically novel — but that is true of essentially every moder
 architecture (Transformer = pre-existing attention + norms + MLP + positions).
 What is defensibly ours:
 
-1. The **neuromodulated-gate synthesis applied to retention**, and
+1. The **receptance-gate-closed retention** synthesis (RetNet retention-QK +
+   RWKV-style read gate), and
 2. The only claim this repo asserts: it **wins quality at matched params**, verified
    on identical data/optimizer/token-budget across two sizes and two seeds.
 
-The ablate phase (§12) additionally proves the win comes from these gates, not
-from stacking more levers: baseline beats every single legacy toggle.
+The isolation sweep (§14) proves the win comes from the receptance gate, not
+from stacking more levers: the legacy "brain" gates are individually at seed
+noise, and baseline beats every toggle.
 
 ---
 
@@ -494,3 +496,50 @@ Seed noise at 5M/600 steps is ~±0.01 (board: 1.961/1.945), so:
   modulation, adaptive exit gate (params + kernels), and — pending a user call
   on the identity/speed tradeoff — the neuromodulator gland (+0.014 at +25%
   speed).
+
+---
+
+## 15. Fresh-clone re-verification of the lean default (commit `38a3f20`)
+
+### The regression that made a fresh clone fail
+
+Commit `87cdfac` made `NFRA_LEAN=1` the default (prune all gates except the
+receptance gate) but left `NFRA_CORTEX` defaulting to `0`. `overnight.py` never
+sets `NFRA_CORTEX`, so a **fresh clone** built the legacy **Brain block**
+(thalamus / local-attn / router MLP), silently ignoring the lean pruning. The
+Brain block is ~2× heavier per layer, so the tuner collapsed to a degenerate
+`U=3 / dim256` config (4.26M params, only 3 unique blocks), and nfra regressed:
+
+| size | broken fresh clone | verified board |
+|---|---|---|
+| 5M | 2.140 / 2.141 @ 3,504 tok/s, 3.77 GB | 1.953 @ 10,320 tok/s, 1.40 GB |
+| 20M | 2.142 / 2.143 @ 3,078 tok/s, 2.73 GB | 1.763 @ 10,484 tok/s, 2.16 GB |
+
+retnet reproduced its board numbers (2.135 / 1.800 — harness/data were fine);
+only nfra collapsed, because only nfra was on the wrong block.
+
+### The fix
+
+`src/nfra/benchmark/arena.py` now defaults `NFRA_CORTEX` to `1` (the Cortex
+block is the verified architecture — the board AND the isolation sweep were
+both measured on it). `NFRA_CORTEX=0` remains the documented legacy Brain
+escape hatch for A/B. When the lean/iso pruning flags are active, the arena
+must build the Cortex block; otherwise the pruning is silently ignored.
+
+### Fresh-clone re-run (post-fix, commit `38a3f20`)
+
+A **fresh `git clone`** on a Kaggle T4, `NFRA_OVN_PHASES=core`, standard 600
+steps, sizes 5/20M, seeds 42/7, param-matched nfra vs retnet:
+
+| size | seed | nfra | retnet | board nfra ref |
+|---|---|---|---|---|
+| 5M | 42 | **1.923** | 2.134 | 1.953 |
+| 5M | 7 | **1.936** | 2.120 | 1.945 |
+| 20M | 42 | **1.715** | 1.802 | 1.763 |
+| 20M | 7 | **1.710** | 1.816 | 1.763 |
+
+nfra beats retnet at both sizes, both seeds, no overlap — the verified win
+**reproduces from a fresh clone and slightly beats the board**. tok/s restored
+to 17.1–17.5k @5M / 15.2k @20M (vs 3.5k regression), memory 1.26 / 1.92 GB.
+The lean build lands slightly larger (5.99M / 23.88M) because the tuner prefers
+max distinct blocks (U=33) over exact param match.

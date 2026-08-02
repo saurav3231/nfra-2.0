@@ -212,6 +212,15 @@ The **receptance gate** is the single mechanism clearing the +0.02 bar. The
 lean block (retention + receptance gate + SwiGLU) is therefore the default
 architecture.
 
+**Reproducibility addendum (commit `38a3f20`):** the lean default was re-run
+from a **fresh `git clone`** on a Kaggle T4 (core phase, 600 steps, seeds
+42/7). It reproduces and slightly beats the board: nfra 1.923/1.936 @5M and
+1.715/1.710 @20M vs retnet 2.134/2.120 and 1.802/1.816 — the win holds at both
+sizes, both seeds. (This re-verification also caught and fixed a default-block
+bug: the arena previously built the legacy Brain block unless `NFRA_CORTEX=1`,
+so a fresh clone silently ignored the lean pruning and regressed to ~2.14 @
+3.5k tok/s. The Cortex block is now the default.)
+
 ### 5.4 Honest limitations
 
 - **Throughput** is ~1.7× lower than RetNet at matched quality; NFRA does not

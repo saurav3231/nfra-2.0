@@ -79,6 +79,26 @@ EMA, and schedule** (600 steps, seeds 42/7, fp16 AMP). Full log:
 | 20M | gpt2 | 2.962 / 2.935 | 2.949 | 51,554 / 51,552 |
 | 20M | rwkv | 3.931 / 4.090 | 4.011 | 10,755 / 10,708 |
 
+### Fresh-clone re-verification of the lean default (commit `38a3f20`)
+
+The lean 3.3c default (Cortex block, `NFRA_CORTEX=1` by default) was re-run
+from a **fresh `git clone`** on a Kaggle T4 — the exact path a new user hits.
+It **reproduces and slightly beats the board**, confirming the `38a3f20` fix
+(arena previously defaulted to the legacy Brain block, silently ignoring the
+lean pruning; see `git log 38a3f20`):
+
+| size | seed | nfra | retnet | board nfra ref |
+|------|------|-----:|-------:|---------------:|
+| 5M | 42 | **1.923** | 2.134 | 1.953 |
+| 5M | 7 | **1.936** | 2.120 | 1.945 |
+| 20M | 42 | **1.715** | 1.802 | 1.763 |
+| 20M | 7 | **1.710** | 1.816 | 1.763 |
+
+nfra beats retnet at both sizes, both seeds, no overlap; tok/s restored to
+17.1–17.5k @5M / 15.2k @20M (vs the 3.5k regression) and memory to 1.26 /
+1.92 GB. The lean build lands slightly larger (5.99M / 23.88M params) because
+the tuner prefers max distinct blocks (U=33) over exact param match.
+
 **Verified facts:**
 
 - **nfra beats retnet on loss at both sizes, both seeds, no overlap** — by
