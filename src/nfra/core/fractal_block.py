@@ -1,14 +1,16 @@
 """
-Fractal Resonance Block (FRB) - Core computational unit of NFRA 3.1
+Fractal Resonance Block (FRB) - a legacy multi-scale mixer block.
 
 Pre-LN with CausalResonanceMixer + FractalGatedMLP.
 Energy budget controls both mixer decay and MLP sparsity.
 """
 
-import torch
-import torch.nn as nn
-from typing import List, Optional, Tuple
+from __future__ import annotations
+
 import math
+
+import torch
+from torch import nn
 
 
 class FractalGatedMLP(nn.Module):
@@ -19,8 +21,9 @@ class FractalGatedMLP(nn.Module):
     Energy budget controls number of active sub-experts and threshold.
     """
 
-    def __init__(self, dim: int, hidden_mult: float = 8.0 / 3.0,
-                 scales: Optional[List[int]] = None):
+    def __init__(
+        self, dim: int, hidden_mult: float = 8.0 / 3.0, scales: list[int] | None = None
+    ):
         super().__init__()
         self.dim = dim
         scales = [1, 2] if scales is None else scales
@@ -31,22 +34,24 @@ class FractalGatedMLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
-        self.sub_experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // s, bias=False),
-                nn.GELU(),
-                nn.Linear(hidden_dim // s, hidden_dim, bias=False),
-            )
-            for s in scales
-        ])
+        self.sub_experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim // s, bias=False),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim // s, hidden_dim, bias=False),
+                )
+                for s in scales
+            ]
+        )
 
         self.coarse_router = nn.Linear(dim, 1, bias=False)
         self.fine_router = nn.Linear(dim, len(scales), bias=False)
 
     def forward(
-        self, x: torch.Tensor, energy_budget: Optional[float] = None
+        self, x: torch.Tensor, energy_budget: float | None = None
     ) -> torch.Tensor:
-        B, S, D = x.shape
+        _B, _S, _D = x.shape
 
         gate = self.gate_proj(x)
         gate = nn.functional.silu(gate)
@@ -56,6 +61,7 @@ class FractalGatedMLP(nn.Module):
         # Causal per-token routing context (autoregressive-safe). The old
         # x.mean(dim=1) leaked FUTURE tokens into every position's routing.
         from .neuro import prefix_pool
+
         pooled = prefix_pool(x)
 
         coarse = torch.sigmoid(self.coarse_router(pooled))
@@ -76,8 +82,8 @@ class FractalGatedMLP(nn.Module):
             coarse = coarse * 1.0
 
         output = torch.zeros_like(hidden)
-        coarse_w = coarse.squeeze(-1)                # [B, S]
-        fine_w = fine                               # [B, S, n_scales]
+        coarse_w = coarse.squeeze(-1)  # [B, S]
+        fine_w = fine  # [B, S, n_scales]
         # Record which experts are meaningfully active as a tensor of flags
         # instead of a Python int: `if w.mean() > 0.01` on a CUDA tensor is an
         # implicit .item() sync (one GPU->CPU stall per expert per forward).
@@ -85,7 +91,7 @@ class FractalGatedMLP(nn.Module):
         # free of device syncs.
         active = []
         for i, expert in enumerate(self.sub_experts):
-            w = (coarse_w * fine_w[:, :, i]).unsqueeze(-1)   # [B, S, 1]
+            w = (coarse_w * fine_w[:, :, i]).unsqueeze(-1)  # [B, S, 1]
             active.append((w.mean() > 0.01).reshape(-1))
             output = output + w * expert(hidden)
 
@@ -95,7 +101,7 @@ class FractalGatedMLP(nn.Module):
 
 class FractalResonanceBlock(nn.Module):
     """
-    NFRA 3.1 Core Block: Pre-LN with CausalResonanceMixer + FractalGatedMLP.
+    Legacy NFRA block: Pre-LN with CausalResonanceMixer + FractalGatedMLP.
 
     Architecture:
         x → LN → Mixer → dropout → + residual
@@ -107,7 +113,7 @@ class FractalResonanceBlock(nn.Module):
     def __init__(
         self,
         dim: int,
-        scales: Optional[List[int]] = None,
+        scales: list[int] | None = None,
         n_bands: int = 4,
         dropout: float = 0.1,
         use_residual: bool = True,
@@ -128,15 +134,15 @@ class FractalResonanceBlock(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        self.register_buffer('activation_count', torch.zeros(1))
-        self.register_buffer('total_count', torch.zeros(1))
+        self.register_buffer("activation_count", torch.zeros(1))
+        self.register_buffer("total_count", torch.zeros(1))
         self._current_budget = 1.0
 
     def forward(
         self,
         x: torch.Tensor,
-        energy_budget: Optional[float] = None,
-        return_stats: bool = False
+        energy_budget: float | None = None,
+        return_stats: bool = False,
     ) -> torch.Tensor:
         budget = energy_budget if energy_budget is not None else 1.0
         self._current_budget = budget
@@ -153,7 +159,7 @@ class FractalResonanceBlock(nn.Module):
         x = self.dropout(x)
         x = residual + x
 
-        flags = getattr(self.mlp, '_n_active_flags', None)
+        flags = getattr(self.mlp, "_n_active_flags", None)
         # Per-forward (not cumulative) stats: overwrite so get_sparsity reflects
         # the LAST forward and gradient-checkpointing recompute can't double
         # count. (The old += made the numbers depend on how many forwards —
@@ -164,8 +170,8 @@ class FractalResonanceBlock(nn.Module):
 
         if return_stats:
             return x, {
-                'sparsity': self.get_sparsity(),
-                'budget': budget,
+                "sparsity": self.get_sparsity(),
+                "budget": budget,
             }
 
         return x
@@ -246,9 +252,7 @@ class FractalSwiGLU(nn.Module):
             n_total += level_dim
             remaining_groups -= n_g
         last_end = group_slices[-1][1]
-        if last_end < hidden_dim:
-            group_slices[-1] = (group_slices[-1][0], hidden_dim)
-        elif last_end > hidden_dim:
+        if last_end < hidden_dim or last_end > hidden_dim:
             group_slices[-1] = (group_slices[-1][0], hidden_dim)
 
         routing_idx = torch.zeros(hidden_dim, dtype=torch.long)
@@ -263,7 +267,7 @@ class FractalSwiGLU(nn.Module):
                     break
                 routing_idx[g_start:g_end] = group_idx
                 group_idx += 1
-        self.register_buffer('routing_idx', routing_idx, persistent=False)
+        self.register_buffer("routing_idx", routing_idx, persistent=False)
 
         self.router = nn.Sequential(
             nn.Linear(dim, 64, bias=False),
@@ -272,7 +276,7 @@ class FractalSwiGLU(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, D = x.shape
+        _B, _S, _D = x.shape
 
         gate = nn.functional.silu(self.gate_proj(x))
         up = self.up_proj(x)
@@ -281,6 +285,7 @@ class FractalSwiGLU(nn.Module):
         # Causal per-token routing context (the old x.mean(dim=1) leaked the
         # future into every position's MLP routing in an autoregressive LM).
         from .neuro import prefix_pool
+
         pooled = prefix_pool(x)
         routing = torch.softmax(self.router(pooled), dim=-1)
         weight_map = routing[:, :, self.routing_idx]
@@ -338,7 +343,9 @@ class NFRA_Max_Block(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, energy_budget: Optional[float] = None, **kwargs) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, energy_budget: float | None = None, **kwargs
+    ) -> torch.Tensor:
         residual = x
         x = self.ln1(x)
         recurrence_out, router_score = self.mixer(x)
@@ -422,16 +429,25 @@ class NFRA_Brain_Block(nn.Module):
         parameters). Off by default.
     """
 
-    def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,
-                 max_thinking_depth: int = 3, k_wta_frac: float = 0.0,
-                 local_route: bool = False, div_norm: bool = False,
-                 astro: bool = False, theta: bool = False,
-                 ach_retain: bool = False, gain_nov: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        n_bands: int = 16,
+        dropout: float = 0.1,
+        max_thinking_depth: int = 3,
+        k_wta_frac: float = 0.0,
+        local_route: bool = False,
+        div_norm: bool = False,
+        astro: bool = False,
+        theta: bool = False,
+        ach_retain: bool = False,
+        gain_nov: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.max_thinking_depth = max_thinking_depth
 
-        from .neuro import NeuroModulator, ThalamicGate, BrainMixer, BrainMLP
+        from .neuro import BrainMixer, BrainMLP, NeuroModulator, ThalamicGate
         from .resonance import ResonanceGuidedLocalAttention
 
         self.neuromodulator = NeuroModulator(dim)
@@ -439,16 +455,22 @@ class NFRA_Brain_Block(nn.Module):
         self.predictor = nn.Linear(dim, dim, bias=False)
 
         self.ln1 = nn.LayerNorm(dim)
-        self.mixer = BrainMixer(dim, n_heads=n_bands, astro=astro,
-                                theta=theta, ach_retain=ach_retain,
-                                gain_nov=gain_nov)
+        self.mixer = BrainMixer(
+            dim,
+            n_heads=n_bands,
+            astro=astro,
+            theta=theta,
+            ach_retain=ach_retain,
+            gain_nov=gain_nov,
+        )
         self.thalamus = ThalamicGate(dim)
 
         # Lightweight sliding-window attention for content-addressable retrieval
         # (exact recall of recent tokens — spelling/character context that pure
         # recurrence handles poorly). Gated by the mixer's router score.
         self.local_attn = ResonanceGuidedLocalAttention(
-            dim, n_heads=2, head_dim=dim // 8, window=64)
+            dim, n_heads=2, head_dim=dim // 8, window=64
+        )
         self.attn_gate = nn.Linear(dim, 1, bias=False)
 
         self.gist_proj = nn.Linear(dim, dim, bias=False)
@@ -462,29 +484,37 @@ class NFRA_Brain_Block(nn.Module):
         )
 
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = BrainMLP(dim, hidden_mult=4.0, k_wta_frac=k_wta_frac,
-                            local_route=local_route, div_norm=div_norm)
+        self.mlp = BrainMLP(
+            dim,
+            hidden_mult=4.0,
+            k_wta_frac=k_wta_frac,
+            local_route=local_route,
+            div_norm=div_norm,
+        )
 
         self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
         x: torch.Tensor,
-        hormones: Optional[torch.Tensor] = None,
-        energy_budget: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, S, D = x.shape
+        hormones: torch.Tensor | None = None,
+        energy_budget: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _B, _S, D = x.shape
 
         hormones = self.neuromodulator(x, prev_hormones=hormones)
 
         if energy_budget is not None:
             budget_factor = 1.0 - energy_budget
             cort = hormones[:, :, 4:5]
-            hormones = torch.cat([
-                hormones[:, :, :4],
-                cort + budget_factor * (1.0 - cort),
-                hormones[:, :, 5:],
-            ], dim=-1)
+            hormones = torch.cat(
+                [
+                    hormones[:, :, :4],
+                    cort + budget_factor * (1.0 - cort),
+                    hormones[:, :, 5:],
+                ],
+                dim=-1,
+            )
 
         # Per-token thinking depth: dopamine → per-token depth factor [B,S,1]
         da = hormones[:, :, 2:3]
@@ -509,12 +539,13 @@ class NFRA_Brain_Block(nn.Module):
         # Surprise-gated routing: surprising tokens take the deep stream,
         # well-predicted tokens take the cheap gist stream (one matmul).
         surprise = error.norm(dim=-1, keepdim=True) / math.sqrt(D)
-        gate = (0.7 * torch.sigmoid(self.gist_gate(error))
-                + 0.3 * torch.sigmoid(surprise)).clamp(0.05, 0.95)
+        gate = (
+            0.7 * torch.sigmoid(self.gist_gate(error)) + 0.3 * torch.sigmoid(surprise)
+        ).clamp(0.05, 0.95)
         if energy_budget is not None:
             gate = gate * (0.3 + 0.7 * energy_budget)  # low budget → prefer gist
 
-        gist = self.gist_proj(n)                       # cheap intuition stream
+        gist = self.gist_proj(n)  # cheap intuition stream
 
         # Deep stream: single parallel-scan mixer pass (no sequential loop)
         recurrence_out, router_score = self.mixer(n, hormones=hormones)

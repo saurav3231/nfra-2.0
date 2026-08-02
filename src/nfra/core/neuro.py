@@ -11,10 +11,12 @@ Six principles from human brain neuroscience translated into GPU-efficient code:
 6. PREDICTION ERROR : Dopaminergic surprise signal drives plasticity-like routing
 """
 
-import torch
-import torch.nn as nn
-from typing import Optional, Tuple
+from __future__ import annotations
+
 import math
+
+import torch
+from torch import nn
 
 from .resonance import parallel_scan_time_varying
 
@@ -26,9 +28,9 @@ def prefix_pool(x: torch.Tensor) -> torch.Tensor:
     whole-sequence pool (which leaks the future). Shared by every
     neuromodulatory component so the reduction is computed once and the
     causality rule lives in one place."""
-    B, S, D = x.shape
+    _B, S, _D = x.shape
     cnt = torch.arange(1, S + 1, device=x.device, dtype=x.dtype).view(1, S, 1)
-    return x.cumsum(1) / cnt                                # [B, S, D]
+    return x.cumsum(1) / cnt  # [B, S, D]
 
 
 def prefix_var(x: torch.Tensor) -> torch.Tensor:
@@ -37,10 +39,11 @@ def prefix_var(x: torch.Tensor) -> torch.Tensor:
     E[x²]-minus-mean² over the prefix — a causal novelty/contrast signal.
     A second cumsum pair; still O(S·D), no extra sequence state."""
     pooled = prefix_pool(x)
-    cnt = torch.arange(1, x.shape[1] + 1, device=x.device,
-                       dtype=x.dtype).view(1, x.shape[1], 1)
+    cnt = torch.arange(1, x.shape[1] + 1, device=x.device, dtype=x.dtype).view(
+        1, x.shape[1], 1
+    )
     cum2 = (x * x).cumsum(1)
-    return (cum2 / cnt - pooled * pooled).clamp(min=0.0)    # [B, S, D]
+    return (cum2 / cnt - pooled * pooled).clamp(min=0.0)  # [B, S, D]
 
 
 class NeuroModulator(nn.Module):
@@ -77,19 +80,19 @@ class NeuroModulator(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        prev_hormones: Optional[torch.Tensor] = None,
+        prev_hormones: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B, S, D = x.shape
+        _B, _S, _D = x.shape
 
         # Causal (prefix) pooling: hormone_t reads only x[0..t]. The old
         # x.mean(dim=1) leaked FUTURE tokens into every position's hormones
         # (an autoregressive LM may not look ahead) — with a per-token prefix
         # mean each position gets its own honestly-causal "mood".
-        pooled = prefix_pool(x)                              # [B, S, D]
-        delta = self.context_gland(pooled)                   # [B, S, n_hormones]
+        pooled = prefix_pool(x)  # [B, S, D]
+        delta = self.context_gland(pooled)  # [B, S, n_hormones]
 
-        novelty = prefix_var(x).mean(dim=-1, keepdim=True)   # [B, S, 1]
-        delta = delta + self.novelty_gland(novelty)          # [B, S, n_hormones]
+        novelty = prefix_var(x).mean(dim=-1, keepdim=True)  # [B, S, 1]
+        delta = delta + self.novelty_gland(novelty)  # [B, S, n_hormones]
 
         raw = torch.sigmoid(delta + self.baseline.unsqueeze(0))
 
@@ -132,7 +135,7 @@ class ThalamicGate(nn.Module):
         hormones: torch.Tensor,
         slow_out: torch.Tensor,
     ) -> torch.Tensor:
-        B, S, D = x.shape
+        B, S, _D = x.shape
 
         uncertainty = torch.sigmoid(self.uncertainty_proj(x))
 
@@ -211,7 +214,7 @@ class GlobalBrainState(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        state: Optional[torch.Tensor] = None,
+        state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Causal global-state aggregation: a per-token prefix summary.
 
@@ -221,9 +224,9 @@ class GlobalBrainState(nn.Module):
         state (if given) is carried in as a per-position slow top-down prior
         (state_t from the prev pass only saw tokens <= t), preserving the
         cross-pass neuromodulatory loop without leaking the future."""
-        B, S, D = x.shape
-        pooled = prefix_pool(x)                              # [B, S, D]
-        h = torch.tanh(self.pool_proj(pooled))               # [B, S, state_dim]
+        _B, _S, _D = x.shape
+        pooled = prefix_pool(x)  # [B, S, D]
+        h = torch.tanh(self.pool_proj(pooled))  # [B, S, state_dim]
         if state is not None and state.ndim == 3:
             # Per-position slow prior: state_t from the previous pass only saw
             # tokens <= t, so summing keeps the whole forward causal. (The old
@@ -238,8 +241,8 @@ class GlobalBrainState(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
         """Inject the causal global state top-down into every token (per token)."""
-        proj = self.inject_proj(states)                      # [B, S, dim]
-        gain = torch.sigmoid(self.gate(states))              # [B, S, 1]
+        proj = self.inject_proj(states)  # [B, S, dim]
+        gain = torch.sigmoid(self.gate(states))  # [B, S, 1]
         return x + gain * proj
 
 
@@ -259,9 +262,15 @@ class BrainMixer(nn.Module):
     coherent heads gate each other, computed once before the scan.
     """
 
-    def __init__(self, dim: int, n_heads: Optional[int] = None,
-                 astro: bool = False, theta: bool = False,
-                 ach_retain: bool = False, gain_nov: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int | None = None,
+        astro: bool = False,
+        theta: bool = False,
+        ach_retain: bool = False,
+        gain_nov: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.astro = astro
@@ -299,12 +308,16 @@ class BrainMixer(nn.Module):
             log_a = torch.full((n, self.head_dim), math.log(s / (1.0 - s)))
             log_alphas.append(log_a)
         s_router = (0.9 - 0.85) / 0.15
-        log_alphas.append(torch.full((1, self.head_dim), math.log(s_router / (1.0 - s_router))))
+        log_alphas.append(
+            torch.full((1, self.head_dim), math.log(s_router / (1.0 - s_router)))
+        )
         self.log_alpha = nn.Parameter(torch.cat(log_alphas, dim=0))
 
         self.frequencies = nn.Parameter(torch.randn(self.n_heads) * 0.5 + 2.0)
         self.phases = nn.Parameter(torch.randn(self.n_heads) * math.pi)
-        self.phase_gate_raw = nn.Parameter(torch.randn(self.n_heads, self.n_heads) * 0.1)
+        self.phase_gate_raw = nn.Parameter(
+            torch.randn(self.n_heads, self.n_heads) * 0.1
+        )
 
         self.grid_encoder = TemporalGridEncoder(dim)
 
@@ -344,15 +357,15 @@ class BrainMixer(nn.Module):
         if gain_nov:
             self.gain_nov_w = nn.Parameter(torch.tensor(0.0))
         else:
-            self.register_parameter('gain_nov_w', None)
+            self.register_parameter("gain_nov_w", None)
 
         self._dim = dim
 
     def forward(
         self,
         x: torch.Tensor,
-        hormones: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hormones: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
@@ -362,7 +375,7 @@ class BrainMixer(nn.Module):
         # gate/value share the same input -> fused into ONE linear (concat of
         # weights). gate_value = [x@W_gate^T, x@W_value^T] elementwise-identical
         # to two separate GEMMs, but one launch + one intermediate tensor.
-        gate_value = self.proj_gate_value(x_grid)      # [B, S, 2D]
+        gate_value = self.proj_gate_value(x_grid)  # [B, S, 2D]
         gate = torch.sigmoid(gate_value[..., :D])
         value = gate_value[..., D:]
 
@@ -374,24 +387,25 @@ class BrainMixer(nn.Module):
         # The network learns WHEN to remember (small dt) vs forget (large dt),
         # per head — Mamba-style selectivity within a bounded (numerically safe)
         # range so the parallel closed-form scan never overflows.
-        base_alpha = 0.85 + 0.15 * torch.sigmoid(self.log_alpha)     # [H, Hd]
-        base_log = torch.log(base_alpha.clamp(min=1e-4))             # [H, Hd] (<0)
+        base_alpha = 0.85 + 0.15 * torch.sigmoid(self.log_alpha)  # [H, Hd]
+        base_log = torch.log(base_alpha.clamp(min=1e-4))  # [H, Hd] (<0)
 
-        dt = torch.sigmoid(self.dt_proj(x_grid)) * 2.0               # [B, S, H]
+        dt = torch.sigmoid(self.dt_proj(x_grid)) * 2.0  # [B, S, H]
         if hormones is not None:
-            ach = hormones[:, :, 0:1]                            # ACh per token
+            ach = hormones[:, :, 0:1]  # ACh per token
             if self.ach_retain:
-                dt = dt / (1.0 + 0.5 * ach)               # high ACh → HOLD
+                dt = dt / (1.0 + 0.5 * ach)  # high ACh → HOLD
             else:
-                dt = dt * (1.0 + 0.5 * ach)                # legacy: high ACh → forget
-        alpha = torch.exp(base_log.view(1, H, 1, Hd)
-                          * dt.permute(0, 2, 1).view(B, H, S, 1))    # [B, H, S, Hd]
+                dt = dt * (1.0 + 0.5 * ach)  # legacy: high ACh → forget
+        alpha = torch.exp(
+            base_log.view(1, H, 1, Hd) * dt.permute(0, 2, 1).view(B, H, S, 1)
+        )  # [B, H, S, Hd]
 
         # Astrocytic homeostat: a slow per-token causal signal (prefix mean of
         # x) scales ALL band decays together (global memory-horizon shift).
         # Causal so position t never sees future tokens. The scan then clamps.
         if self.astro_proj is not None:
-            astro = torch.tanh(self.astro_proj(prefix_pool(x)))   # [B, S, 1]
+            astro = torch.tanh(self.astro_proj(prefix_pool(x)))  # [B, S, 1]
             alpha = alpha * (1.0 + 0.2 * astro.view(B, 1, S, 1))
 
         # Theta-gamma rhythmic decay (TIME axis): each band's decay rhythmically
@@ -401,28 +415,32 @@ class BrainMixer(nn.Module):
             rhythm = torch.sin(
                 2.0 * math.pi * self.theta_freq[:, None] * tpos[None, :] / S
                 + self.theta_phase[:, None]
-            )                                                  # [H, S]
-            alpha = alpha * (1.0 + self.theta_amp.view(1, H, 1, 1)
-                             * rhythm.view(1, H, S, 1))
+            )  # [H, S]
+            alpha = alpha * (
+                1.0 + self.theta_amp.view(1, H, 1, 1) * rhythm.view(1, H, S, 1)
+            )
 
         # Novelty gain on write-in (GAIN axis): causal prefix-variance scales
         # the recurrence write. Identity-init (gain_nov_w = 0) at baseline.
         if self.gain_nov:
-            nov = prefix_var(x).mean(dim=-1, keepdim=True)       # [B, S, 1]
+            nov = prefix_var(x).mean(dim=-1, keepdim=True)  # [B, S, 1]
             value = value * (1.0 + self.gain_nov_w * nov.view(B, 1, S, 1))
 
         # Parallel closed-form time-varying scan —
         # h_t = alpha_t*h_{t-1} + gate_t*value_t (one vectorized cumsum pair)
-        h = parallel_scan_time_varying(gate, value, alpha,
-                                       alpha_min=0.75, alpha_max=0.9995)
+        h = parallel_scan_time_varying(
+            gate, value, alpha, alpha_min=0.75, alpha_max=0.9995
+        )
 
         # Cross-head coherence via CLOSED-FORM oscillatory similarity (O(H²)).
         # Coherence of two oscillators over S steps = |(1/S) sum_t e^{i 2π Δf t/S}|
         # has a geometric-series closed form → no [S,S] tensor materialized.
-        df = self.frequencies[:, None] - self.frequencies[None, :]          # [H,H]
+        df = self.frequencies[:, None] - self.frequencies[None, :]  # [H,H]
         num = torch.sin(math.pi * df)
         den = S * torch.sin(math.pi * df / S)
-        frac = torch.where(torch.abs(df) < 1e-3, torch.ones_like(df), num / (den + 1e-9))
+        frac = torch.where(
+            torch.abs(df) < 1e-3, torch.ones_like(df), num / (den + 1e-9)
+        )
         coherence = torch.sigmoid(self.phase_gate_raw) * frac.clamp(-1.0, 1.0)
 
         topk = max(2, H // 4)
@@ -433,7 +451,7 @@ class BrainMixer(nn.Module):
 
         # Cross-head injection: each head gets 0.05 * weighted sum of its top-K
         # coherent heads. One einsum over H (H small → cheap), not per-timestep.
-        cross = torch.einsum('bhsd,gh->bgsd', h, sparse)
+        cross = torch.einsum("bhsd,gh->bgsd", h, sparse)
         h = h + 0.05 * cross
 
         # Phase amplitude modulation (O(H*S))
@@ -446,7 +464,7 @@ class BrainMixer(nn.Module):
 
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
 
-        router_state = out[..., -self.head_dim:]
+        router_state = out[..., -self.head_dim :]
         router_score = torch.sigmoid(router_state.mean(dim=-1, keepdim=True))
 
         return self.proj_out(out), router_score
@@ -474,9 +492,14 @@ class BrainMLP(nn.Module):
     compute, just capacity placement focused on the winning dimensions.
     """
 
-    def __init__(self, dim: int, hidden_mult: float = 4.0,
-                 k_wta_frac: float = 0.0, local_route: bool = False,
-                 div_norm: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        hidden_mult: float = 4.0,
+        k_wta_frac: float = 0.0,
+        local_route: bool = False,
+        div_norm: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.k_wta_frac = k_wta_frac
@@ -494,7 +517,9 @@ class BrainMLP(nn.Module):
         n_total = 0
         group_slices = []
         for lvl, n_g in enumerate(n_groups_per_level):
-            group_dim = max(1, (hidden_dim - n_total) // (n_total_groups - len(group_slices)))
+            group_dim = max(
+                1, (hidden_dim - n_total) // (n_total_groups - len(group_slices))
+            )
             level_dim = group_dim * n_g
             group_slices.append((n_total, n_total + level_dim))
             n_total += level_dim
@@ -511,7 +536,7 @@ class BrainMLP(nn.Module):
                 g_end = g_start + group_dim
                 routing_idx[g_start:g_end] = group_idx
                 group_idx += 1
-        self.register_buffer('routing_idx', routing_idx, persistent=False)
+        self.register_buffer("routing_idx", routing_idx, persistent=False)
 
         self.router = nn.Sequential(
             nn.Linear(dim, 64, bias=False),
@@ -528,19 +553,20 @@ class BrainMLP(nn.Module):
         the window at sequence start (fewer than `local_win` tokens seen)."""
         B, S, D = x.shape
         w = min(self.local_win, S)
-        cum = x.cumsum(1)                                        # [B, S, D]
-        left = torch.cat([torch.zeros(B, w, D, device=x.device, dtype=x.dtype),
-                          cum[:, :-w]], dim=1)                   # [B, S, D]
-        wsum = cum - left                                        # sum [t-w+1 .. t]
+        cum = x.cumsum(1)  # [B, S, D]
+        left = torch.cat(
+            [torch.zeros(B, w, D, device=x.device, dtype=x.dtype), cum[:, :-w]], dim=1
+        )  # [B, S, D]
+        wsum = cum - left  # sum [t-w+1 .. t]
         cnt = torch.arange(1, S + 1, device=x.device).clamp(max=w).float()
         return wsum / cnt.view(1, S, 1)
 
     def forward(
         self,
         x: torch.Tensor,
-        hormones: Optional[torch.Tensor] = None,
+        hormones: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B, S, D = x.shape
+        _B, S, _D = x.shape
 
         gate = nn.functional.silu(self.gate_proj(x))
         up = self.up_proj(x)
@@ -559,8 +585,8 @@ class BrainMLP(nn.Module):
         # pool. Both are per-token causal (the router at t must not see future
         # tokens); local + global keeps the stable coarse prior while adding
         # input-dependent per-token capacity.
-        cnt = torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
-        pooled = prefix_pool(x)                              # [B, S, D]
+        torch.arange(1, S + 1, device=x.device).float().view(1, S, 1)
+        pooled = prefix_pool(x)  # [B, S, D]
         if self.local_route:
             pooled = pooled + self._local_pool(x)
         routing = self.router(pooled)
@@ -593,7 +619,7 @@ class BrainMLP(nn.Module):
         # per token. The threshold comes from the k-th largest value, so the
         # mask is data-dependent (input-dependent sparsity).
         if self.k_wta_frac > 0.0:
-            k = max(1, int(math.ceil(self.k_wta_frac * hidden.shape[-1])))
+            k = max(1, math.ceil(self.k_wta_frac * hidden.shape[-1]))
             thr = hidden.topk(k, dim=-1).values[..., -1:]
             hidden = hidden * (hidden >= thr).float()
 

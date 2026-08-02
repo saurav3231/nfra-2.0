@@ -1,17 +1,19 @@
 """
-Resonance-based sparse activation mechanisms for NFRA 3.1
+Resonance-based sparse activation mechanisms (legacy; the verified architecture is the Cortex block).
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, Optional
+from __future__ import annotations
+
 import math
 import os
 
+import torch
+import torch.nn.functional as F
+from torch import nn
+
 
 def parallel_gated_scan(
-    gate: Optional[torch.Tensor],
+    gate: torch.Tensor | None,
     value: torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
@@ -37,13 +39,13 @@ def parallel_gated_scan(
     w = torch.log(alpha.clamp(min=0.85, max=0.9995))
     S = u.shape[2]
     pos = torch.arange(1, S + 1, device=u.device).float().view(1, 1, S, 1)
-    decay_inv = torch.exp(-w * pos)                   # alpha^{-t}  (<= 1e18 at S=256)
-    decay_fwd = torch.exp(w * pos)                    # alpha^{t}
+    decay_inv = torch.exp(-w * pos)  # alpha^{-t}  (<= 1e18 at S=256)
+    decay_fwd = torch.exp(w * pos)  # alpha^{t}
     return decay_fwd * torch.cumsum(decay_inv * u, dim=2)
 
 
 def parallel_scan_time_varying(
-    gate: Optional[torch.Tensor],
+    gate: torch.Tensor | None,
     value: torch.Tensor,
     alpha: torch.Tensor,
     alpha_min: float = 0.85,
@@ -71,9 +73,9 @@ def parallel_scan_time_varying(
     Returns:
         [B, H, S, Hd] hidden states for every timestep (parallel)
     """
-    from ..kernels.scan import selective_scan, _scan_torch
+    from ..kernels.scan import _scan_torch, selective_scan
 
-    if os.environ.get('NFRA_SCAN_KERNEL', '1') == '0':
+    if os.environ.get("NFRA_SCAN_KERNEL", "1") == "0":
         # Plain torch closed-form, NO custom autograd.Function wrapper. This
         # keeps the scan traceable by torch.compile so it fuses into the rest
         # of the graph instead of forcing a per-layer graph break. Training
@@ -88,7 +90,7 @@ class ResonanceSignature:
         self.frequency = frequency
         self.phase = phase
 
-    def similarity(self, other: 'ResonanceSignature') -> float:
+    def similarity(self, other: ResonanceSignature) -> float:
         freq_diff = abs(self.frequency - other.frequency)
         phase_diff = min(abs(self.phase - other.phase), math.pi)
         return math.exp(-freq_diff) * (1.0 + math.cos(phase_diff)) / 2.0
@@ -103,11 +105,10 @@ class ResonanceRouter(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_paths),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
         self.register_parameter(
-            'frequencies',
-            nn.Parameter(torch.randn(num_paths) * 0.1 + 1.0)
+            "frequencies", nn.Parameter(torch.randn(num_paths) * 0.1 + 1.0)
         )
 
     def forward(self, x: torch.Tensor, threshold: float = 0.1) -> torch.Tensor:
@@ -171,9 +172,13 @@ class CausalResonanceMixer(nn.Module):
 
         self.band_gate_logits = nn.Parameter(torch.zeros(n_bands))
 
-        self.register_buffer('freq_scale', torch.tensor(2.0 * math.pi), persistent=False)
+        self.register_buffer(
+            "freq_scale", torch.tensor(2.0 * math.pi), persistent=False
+        )
 
-    def forward(self, x: torch.Tensor, energy_budget: Optional[float] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, energy_budget: float | None = None
+    ) -> torch.Tensor:
         B, S, D = x.shape
 
         gated = self.proj_in(x)
@@ -188,7 +193,7 @@ class CausalResonanceMixer(nn.Module):
 
         if energy_budget is not None:
             scale = 1.5 - 0.5 * energy_budget
-            decay = decay ** scale
+            decay = decay**scale
 
         positions = torch.arange(S, device=x.device).float()
         pos_mod = torch.sin(
@@ -256,7 +261,7 @@ class MultiScaleGatedRecurrence(nn.Module):
     Uses preallocated buffer for torch.compile fusion.
     """
 
-    def __init__(self, dim: int, n_heads: Optional[int] = 16):
+    def __init__(self, dim: int, n_heads: int | None = 16):
         super().__init__()
         target = n_heads - 1 if (n_heads is not None and n_heads > 1) else 15
         ratios = [8, 4, 2, 1]
@@ -300,7 +305,7 @@ class MultiScaleGatedRecurrence(nn.Module):
 
         self._dim = dim
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
@@ -316,7 +321,7 @@ class MultiScaleGatedRecurrence(nn.Module):
         out = parallel_gated_scan(gate, value, alpha)
         out = out.permute(0, 2, 1, 3).contiguous().view(B, S, D)
 
-        router_state = out[..., -self.head_dim:]
+        router_state = out[..., -self.head_dim :]
         router_score = torch.sigmoid(router_state.mean(dim=-1, keepdim=True))
 
         return self.proj_out(out), router_score
@@ -330,7 +335,9 @@ class ResonanceGuidedLocalAttention(nn.Module):
     and caches the sliding-window mask to avoid recomputation.
     """
 
-    def __init__(self, dim: int, n_heads: int = 2, head_dim: int = 64, window: int = 64):
+    def __init__(
+        self, dim: int, n_heads: int = 2, head_dim: int = 64, window: int = 64
+    ):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -354,15 +361,13 @@ class ResonanceGuidedLocalAttention(nn.Module):
             rel_dist = positions[:, None] - positions[None, :]
             local_mask = (rel_dist.abs() <= self.window // 2) & (rel_dist >= 0)
             attn_mask = local_mask.float()
-            attn_mask = attn_mask.masked_fill(attn_mask == 0.0, float('-inf'))
+            attn_mask = attn_mask.masked_fill(attn_mask == 0.0, float("-inf"))
             attn_mask = attn_mask.masked_fill(attn_mask == 1.0, 0.0)
             self._mask_cache[key] = attn_mask
         return self._mask_cache[key]
 
-    def forward(
-        self, x: torch.Tensor, router_score: torch.Tensor
-    ) -> torch.Tensor:
-        B, S, D = x.shape
+    def forward(self, x: torch.Tensor, router_score: torch.Tensor) -> torch.Tensor:
+        B, S, _D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
         q = self.q_proj(x).view(B, S, H, Hd).transpose(1, 2)
@@ -373,12 +378,12 @@ class ResonanceGuidedLocalAttention(nn.Module):
         attn_mask = self._get_mask(S, x.device)
 
         # FlashAttention via scaled_dot_product_attention
-        if hasattr(F, 'scaled_dot_product_attention'):
+        if hasattr(F, "scaled_dot_product_attention"):
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
             )
         else:
-            scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd ** 0.5)
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd**0.5)
             scores = scores + attn_mask[None, None, :, :]
             attn_weights = torch.softmax(scores, dim=-1)
             out = torch.matmul(attn_weights, v)

@@ -1,62 +1,62 @@
-"""Core building blocks of NFRA 3.1 Brain"""
+"""Core building blocks of NFRA (Nonlinear Factorized Recurrent Attention)."""
 
-from .fractal_block import (
-    FractalResonanceBlock,
-    FractalGatedMLP,
-    SwiGLU_MLP,
-    FractalSwiGLU,
-    NFRA_Max_Block,
-    NFRA_Brain_Block,
+from .cortex import (
+    CortexExit,
+    CortexMixer,
+    NFRA_Cortex_Block,
 )
+from .energy import DynamicEnergyBudgetAllocator
+from .fractal_block import (
+    FractalGatedMLP,
+    FractalResonanceBlock,
+    FractalSwiGLU,
+    NFRA_Brain_Block,
+    NFRA_Max_Block,
+    SwiGLU_MLP,
+)
+from .neuro import (
+    BrainMixer,
+    BrainMLP,
+    GlobalBrainState,
+    NeuroModulator,
+    TemporalGridEncoder,
+    ThalamicGate,
+)
+from .predictive import MultiScalePredictor, PredictiveGenerator
 from .resonance import (
+    CausalResonanceMixer,
+    MultiScaleGatedRecurrence,
+    ParallelGatedRecurrence,
+    ResonanceGuidedLocalAttention,
     ResonanceRouter,
     ResonanceSignature,
     SpikeResonanceLayer,
-    CausalResonanceMixer,
-    ParallelGatedRecurrence,
-    MultiScaleGatedRecurrence,
-    ResonanceGuidedLocalAttention,
 )
-from .neuro import (
-    NeuroModulator,
-    ThalamicGate,
-    BrainMixer,
-    BrainMLP,
-    TemporalGridEncoder,
-    GlobalBrainState,
-)
-from .cortex import (
-    CortexMixer,
-    CortexExit,
-    NFRA_Cortex_Block,
-)
-from .predictive import PredictiveGenerator, MultiScalePredictor
-from .energy import DynamicEnergyBudgetAllocator
 
 __all__ = [
-    "FractalResonanceBlock",
+    "BrainMLP",
+    "BrainMixer",
+    "CausalResonanceMixer",
+    "CortexExit",
+    "CortexMixer",
+    "DynamicEnergyBudgetAllocator",
     "FractalGatedMLP",
-    "SwiGLU_MLP",
+    "FractalResonanceBlock",
     "FractalSwiGLU",
-    "NFRA_Max_Block",
+    "GlobalBrainState",
+    "MultiScaleGatedRecurrence",
+    "MultiScalePredictor",
     "NFRA_Brain_Block",
+    "NFRA_Cortex_Block",
+    "NFRA_Max_Block",
+    "NeuroModulator",
+    "ParallelGatedRecurrence",
+    "PredictiveGenerator",
+    "ResonanceGuidedLocalAttention",
     "ResonanceRouter",
     "ResonanceSignature",
     "SpikeResonanceLayer",
-    "CausalResonanceMixer",
-    "ParallelGatedRecurrence",
-    "MultiScaleGatedRecurrence",
-    "ResonanceGuidedLocalAttention",
-    "NeuroModulator",
-    "ThalamicGate",
-    "BrainMixer",
-    "BrainMLP",
+    "SwiGLU_MLP",
     "TemporalGridEncoder",
-    "GlobalBrainState",
-    "CortexMixer",
-    "CortexExit",
-    "NFRA_Cortex_Block",
-    "PredictiveGenerator",
-    "MultiScalePredictor",
-    "DynamicEnergyBudgetAllocator",
+    "ThalamicGate",
 ]

@@ -1,4 +1,4 @@
-# NFRA 2.0 — Future Plan (Theory, Critique, Roadmap)
+# NFRA — Future Plan (Theory, Critique, Roadmap)
 
 **Status:** working plan — updated through 5 criticism rounds
 **Motive anchor:** *quality AI on modest hardware* — every idea must keep **latency, peak memory, and training speed low**, and keep the benchmark **credible**.
@@ -342,7 +342,7 @@ Config: `NFRA_RECALL_KS=4,16,64,128 NFRA_RECALL_DIM=224 NFRA_RECALL_CONCURRENT=1
 | Receptance gate (RWKV-style read gate) | **KEEP — the actual differentiator** | isolation sweep: removing it costs **+0.038** nats (the only gate > the +0.02 bar), at only +3.5% tok/s |
 | Retention-QK mixer (multi-scale decay −5…+3) | **KEEP** | the operator that finally closed the §9/§10 loss gap |
 | GEMM fusion (qkvr 5D, gate_up 2h) | **KEEP** | 9→5 GEMMs/block, +10% tok/s, bit-identical fwd/bwd (0.0 diff) |
-| Neuromodulator gland (ACh→value, NE→MLP) | **DECISION NEEDED** | isolation: only +0.014 (≈ seed noise) yet +25% tok/s when removed — identity vs speed tradeoff |
+| Neuromodulator gland (ACh→value, NE→MLP) | **REMOVE (user decision, 2026-08-02)** | isolation: only +0.014 (≈ seed noise) yet +25% tok/s when removed — identity-vs-speed call, user chose max speed |
 | Value gate (ACh/phase write gate) | **REMOVE** | isolation: +0.006 (noise), +17% tok/s when removed |
 | Phase modulation | **REMOVE** | isolation: +0.005 (noise), +9% tok/s when removed |
 | Energy-budget / adaptive-exit gate | **REMOVE** | efficiency: zero effect at every budget; isolation: +0.006 (noise), +6% tok/s when removed |
@@ -365,9 +365,9 @@ The ablate proved *baseline > stacked levers*, and the isolation sweep now prove
      **receptance OFF 2.004 (+0.038)** · phase OFF 1.971 (+0.005) · exit OFF 1.972 (+0.006)
 2. **Decision rule applied:** only the **receptance gate** clears +0.02. Every
    "brain" gate individually is within seed noise (~±0.01) and removing any of
-   them speeds training up 6–25%. The gland is the one borderline case (+0.014)
-   — it is also the single biggest per-block speed cost, so it is a genuine
-   identity-vs-speed decision for the user.
+   them speeds training up 6–25%. **User decision (2026-08-02):** prune the
+   gland too for max speed — `NFRA_LEAN=1` is now the default architecture
+   (retention + receptance gate + SwiGLU), implemented in commit `87cdfac`.
 
 ### Follow-up targets (from the user's stated goals)
 
@@ -378,6 +378,7 @@ The ablate proved *baseline > stacked levers*, and the isolation sweep now prove
 ### Order of operations (after this run ends)
 
 1. Post the full-run tail (recall/deploy/perf/data2 results) → document remaining phases. **DONE** (`28821bb`; data2 interrupted — session died mid-download).
-2. Run the isolation sweep above → prune to the verified keep-list. **DONE** (`b868477`): only the receptance gate is a verified keeper; gland is the user decision; everything else prunes.
-3. Profile (`PROF_ARCH=nfra` then `retnet`) → attack the actual tok/s hotspot.
-4. Optional: 3000-step nfra@20M probe to establish the real loss ceiling at this size.
+2. Run the isolation sweep above → prune to the verified keep-list. **DONE** (`b868477` + `87cdfac`): only the receptance gate is a verified keeper; gland pruned by user decision (max speed); everything else pruned. Lean block (`NFRA_LEAN=1`) is the default architecture.
+3. Verify the lean block head-to-head vs retnet at 5M/20M on Kaggle (`NFRA_OVN_PHASES=core NFRA_OVN_SIZES=5,20 NFRA_OVN_FAMILIES=nfra,retnet`) — confirm the loss edge is retained and tok/s improves with the gates removed.
+4. Profile (`PROF_ARCH=nfra` then `retnet`) → attack the actual tok/s hotspot.
+5. Optional: 3000-step nfra@20M probe to establish the real loss ceiling at this size.

@@ -1,27 +1,34 @@
 # NFRA Benchmark Guide
 
-How to run credible, reproducible, apples-to-apples comparisons of **NFRA Brain vs Mamba-SSM vs GPT-2** — on a Kaggle T4 GPU.
+How to run credible, reproducible, apples-to-apples comparisons of **NFRA vs
+RetNet vs RWKV vs GPT-2** — on a Kaggle T4 GPU.
 
-Two benchmarks ship inside the package:
+Three benchmark tools ship inside the package:
 
 | Tool | Command | Purpose |
 |------|---------|---------|
 | **compare** | `python -m nfra.benchmark.compare` | Quick head-to-head at ~20M params (eval loss, ppl, tok/s, memory) |
-| **arena** | `python -m nfra.benchmark.arena` | Global-standard multi-dimension comparison (scaling, seeds, latency, verdict) |
+| **arena** | `python -m nfra.benchmark.arena` | Multi-dimension comparison (scaling, seeds, latency, verdict) |
+| **overnight** | `python -m nfra.benchmark.overnight` | **The verified phased run** (`core,context,efficiency,ablate,recall,deploy,perf`) |
 
 ---
 
 ## 1. Method (credibility controls)
 
-Both benchmarks enforce the same fairness rules:
+All benchmarks enforce the same fairness rules:
 
-- **Param-matched models** — every architecture is tuned (layers / unique-blocks / dim) to land on the same parameter budget.
-- **Identical data** — all models train on the *same* token streams.
-- **Identical optimizer & schedule** — AdamW (lr 3e-4, β=(0.9, 0.95)), warmup + cosine.
+- **Param-matched models** — every architecture is tuned (layers / unique-blocks
+  / dim) to land on the same parameter budget; nfra builds bit-identical
+  geometry to RetNet at each size.
+- **Identical data** — all models train on the *same* character streams
+  (WikiText-2, vocab 96), so token budgets are exactly equal.
+- **Identical optimizer & schedule** — AdamW, warmup + cosine.
 - **Matched token budgets** — same steps × batch × sequence length per family.
-- **GPT-2-style init** — every model starts near `ln(vocab)` (random-guess loss), so final loss is comparable.
-- **Multiple seeds** (arena) — quality reported as **mean ± std**, never a single lucky run.
-- **Multiple sizes** (arena) — a measured scaling slope, not a guess.
+- **GPT-2-style init** — every model starts near `ln(vocab)` (random-guess
+  loss), so final loss is comparable.
+- **Multiple seeds** — quality reported as per-seed values and mean, never a
+  single lucky run.
+- **Multiple sizes** — a measured scaling slope, not a guess.
 
 ---
 
@@ -29,7 +36,8 @@ Both benchmarks enforce the same fairness rules:
 
 Create a **New Notebook** → Accelerator: **GPU T4** → Internet: **On**.
 
-**Cell 1 — install from GitHub** (use `--no-deps` so the preinstalled CUDA torch is not replaced):
+**Cell 1 — install from GitHub** (use `--no-deps` so the preinstalled CUDA
+torch is not replaced):
 
 ```python
 !pip install -q --no-deps git+https://github.com/saurav3231/nfra-2.0.git
@@ -38,7 +46,9 @@ Create a **New Notebook** → Accelerator: **GPU T4** → Internet: **On**.
 
 **Cell 2 — download WikiText-2 data**
 
-The official `wikitext/wikitext-2-raw-v1` dataset is now private (HTTP 401). Use the `Salesforce/wikitext` mirror and convert the Parquet files to plain text in the working directory:
+The official `wikitext/wikitext-2-raw-v1` dataset is now private (HTTP 401).
+Use the `Salesforce/wikitext` mirror and convert the Parquet files to plain
+text in the working directory:
 
 ```python
 import os
@@ -62,80 +72,85 @@ Both files must sit in the notebook's current working directory.
 ### 3a. Quick head-to-head (compare)
 
 ```bash
-!NFRA_MODE=standard NFRA_DATA=wikitext2 python -m nfra.benchmark.compare
+!NFRA_DATA=wikitext2 python -m nfra.benchmark.compare
 ```
 
 Output: console summary + `nfra_vs_mamba_vs_gpt2_results.json`.
 
-### 3b. Global-standard multi-dimension (arena)
+### 3b. Multi-dimension (arena)
 
-**Sanity check first** (fast, verifies the pipeline):
+Sanity check first (fast, verifies the pipeline):
 
 ```bash
 !NFRA_MODE=quick NFRA_DATA=wikitext2 python -m nfra.benchmark.arena
 ```
 
-**Credible run** (~3–3.5 h on T4; Mamba's pure-PyTorch fp32 scan is the bottleneck):
+### 3c. The verified phased run (overnight) — RECOMMENDED
+
+This is the run that produced the numbers in the README and
+`docs/OVERNIGHT_VERIFIED_RESULTS.md`:
 
 ```bash
-!NFRA_MODE=standard NFRA_DATA=wikitext2 NFRA_SIZES=5,20 NFRA_SEEDS=2 python -m nfra.benchmark.arena
+!NFRA_OVN_MODE=standard NFRA_OVN_PHASES=core NFRA_OVN_FAMILIES=nfra,retnet python -m nfra.benchmark.overnight
 ```
 
-**Gold-standard headline run** (~8 h; 3 sizes for a real scaling fit, 3 seeds for tight stats):
+To run the full verified 8-phase suite:
 
 ```bash
-!NFRA_MODE=rigorous NFRA_DATA=wikitext2 NFRA_SIZES=5,20,50 NFRA_SEEDS=3 python -m nfra.benchmark.arena
+!NFRA_OVN_MODE=standard python -m nfra.benchmark.overnight
 ```
+
+Phases are resumable via `overnight_state.json`. Outputs:
+`overnight_results.json` and `overnight_report.md`.
 
 ---
 
-## 4. Env reference (arena)
+## 4. Env reference (overnight)
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `NFRA_OVN_MODE` | `standard` | `quick`=300, `standard`=600, `big`=1500 steps |
+| `NFRA_OVN_SIZES` | `5,20` | target model sizes in millions of params |
+| `NFRA_OVN_SEEDS` | `2` | independent seeds → mean ± std |
+| `NFRA_OVN_FAMILIES` | `nfra,rwkv,retnet,gpt2` | architectures to compare |
+| `NFRA_OVN_PHASES` | all | `core,context,efficiency,ablate,recall,deploy,perf,data2` |
+| `NFRA_OVN_DATA` | `wikitext2` | data source (only `wikitext2` allowed) |
+| `NFRA_LEAN` | `1` | `1` = lean block (verified default); `0` = full 3.3b |
+| `NFRA_COMPILE` | `1` | `1` = `torch.compile` (auto-disables when unstable) |
+
+### Env reference (arena)
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `NFRA_MODE` | `standard` | `quick`=150, `standard`=600, `rigorous`=1500 steps |
 | `NFRA_SIZES` | `5,20` | target model sizes in millions of params |
-| `NFRA_SEEDS` | `2` (3 for rigorous) | independent seeds → mean ± std |
-| `NFRA_FAMILIES` | `nfra,mamba,gpt2` | architectures to compare |
+| `NFRA_SEEDS` | `2` | independent seeds |
+| `NFRA_FAMILIES` | all | `nfra,rwkv,retnet,mamba,gpt2` |
 | `NFRA_DATA` | `synthetic` | `synthetic` or `wikitext2` |
-| `NFRA_BATCH` | auto (4 on T4 wikitext2) | override batch size |
+| `NFRA_BATCH` | auto | override batch size |
 
 ---
 
 ## 5. Outputs & interpretation
 
-`arena` writes two files into the working directory:
+`overnight` writes two files into the working directory:
 
-- **`nfra_arena_results.json`** — full per-seed history, config/env fingerprint, per-size metrics, scaling fit, composite scores, structured verdict.
-- **`nfra_arena_report.md`** — a publishable report with:
+- **`overnight_results.json`** — full per-seed history, config/env fingerprint,
+  per-size metrics, scaling fit, composite scores, structured verdict.
+- **`overnight_report.md`** — a publishable report with:
 
   1. **Model builds** — params, dim, depth per family (verifies param-matching).
-  2. **Scaling behaviour** — OLS fit of eval loss vs `log2(params)`; slope = bits of loss gained per doubling (more negative = better scaling) + extrapolated loss @100M.
-  3. **Head-to-head per size** — eval loss (mean ± std), ppl, sample-efficiency AUC, train tok/s, ms/step, peak memory, NaN steps.
-  4. **Inference battery** — prefill tok/s, autoregressive gen tok/s, ms/token, peak inference memory, eval at 2× context (extrapolation).
+  2. **Head-to-head per size** — eval loss (per-seed + mean), ppl, train tok/s,
+     ms/step, peak memory, NaN steps.
+  3. **Context extrapolation** — eval at 256/512/1024 (train @256).
+  4. **Recall / deploy (INT8) / perf** phases — memory-horizon, quantization,
+     inference battery.
   5. **Winners-per-aspect** — which architecture is best on *which* dimension.
-  6. **Composite scores** — weighted z-scores (0–100) across all dimensions.
-  7. **Verdict** — evidence-based claims + the "revolutionary?" assessment.
 
 ### Reading the verdict
 
-- `eval loss ≈ ln(vocab)` = random guessing (4.56 for the 96-char wikitext vocab; 8.32 for synthetic 4096).
-- Each claim lists its winner **and** the measured delta, so the verdict is auditable.
-- A "revolutionary" verdict of *not confirmed* is still a valid result — the report shows precisely where the architecture stands.
-
----
-
-## 6. Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| `wikitext2 files missing` | re-run the data cell from the same directory as the benchmark |
-| Dataset HTTP 401 | use the `Salesforce/wikitext` mirror (see Cell 2) |
-| `ModuleNotFoundError: nfra` | install via pip (Cell 1); do **not** rely on `sys.path` from a notebook cell — it does not reach `!python` subprocesses |
-| Low GPU util (~40%) | expected — batch 4 + per-step sync + fp32 scans |
-| OOM on larger sizes | keep wikitext2 batch auto-shrink, or drop the 50M size |
-| Changed env vars not applying | each `!python` is a fresh process, so re-running applies them; if importing in-kernel, restart the kernel |
-
----
-
-*Benchmark code lives in `src/nfra/benchmark/`. Author: SAURAV BHANDARI.*
+Loss numbers are in **nats** (natural log of perplexity), which is the
+quantity that matters for a matched-parameter comparison. A gap of −0.18 nats
+(5M) or −0.048 nats (20M) with no overlap across seeds is a real, measurable
+architecture difference — see the verified results in
+[`docs/OVERNIGHT_VERIFIED_RESULTS.md`](OVERNIGHT_VERIFIED_RESULTS.md).

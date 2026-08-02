@@ -26,8 +26,9 @@ Toggles:
   NFRA_SCAN_KERNEL   0 = always torch, 1 = auto (default), 2 = force triton
 """
 
-import os
 import math
+import os
+
 import torch
 
 try:
@@ -44,6 +45,7 @@ except Exception:  # pragma: no cover - depends on install
 # --------------------------------------------------------------------------
 # reference implementations (for tests + the torch fallback)
 # --------------------------------------------------------------------------
+
 
 def scan_reference(gate, value, alpha, alpha_min=0.75, alpha_max=0.9995):
     """Exact sequential definition. Correct by construction (slow, O(S) ops)."""
@@ -93,11 +95,10 @@ def _scan_torch(gate, value, alpha, alpha_min, alpha_max):
     h = torch.zeros_like(u[:, :, :1, :])
     for c in range(n):
         sl = slice(c * chunk, min((c + 1) * chunk, S))
-        Cc = torch.cumsum(w[:, :, sl], dim=2)          # chunk-local log-decay
-        hc = torch.exp(Cc) * (torch.cumsum(torch.exp(-Cc) * u[:, :, sl], dim=2)
-                              + h)
+        Cc = torch.cumsum(w[:, :, sl], dim=2)  # chunk-local log-decay
+        hc = torch.exp(Cc) * (torch.cumsum(torch.exp(-Cc) * u[:, :, sl], dim=2) + h)
         outs.append(hc)
-        h = hc[:, :, -1:, :]                            # carry state to next chunk
+        h = hc[:, :, -1:, :]  # carry state to next chunk
     return torch.cat(outs, dim=2)
 
 
@@ -119,14 +120,14 @@ def _du_torch_chunked(dh, a, chunk=64):
         t0 = c * chunk
         t1 = min(t0 + chunk, S)
         sl = slice(t0, t1)
-        E = C[:, :, sl] - C[:, :, t1 - 1:t1]            # >= 0, <= -ln(a_min)*chunk
+        E = C[:, :, sl] - C[:, :, t1 - 1 : t1]  # >= 0, <= -ln(a_min)*chunk
         rsum = _reverse_cumsum(dh[:, :, sl] * torch.exp(E), dim=2)
         du = torch.exp(-E) * rsum
-        if t1 < S:                                      # tail term across chunks
-            wnext = w[:, :, t1:t1 + 1]
+        if t1 < S:  # tail term across chunks
+            wnext = w[:, :, t1 : t1 + 1]
             du = du + torch.exp(wnext - E) * carry.unsqueeze(2)
         chunks.append(du)
-        carry = du[:, :, 0, :]                          # du at this chunk's start
+        carry = du[:, :, 0, :]  # du at this chunk's start
     return torch.cat(chunks[::-1], dim=2)
 
 
@@ -138,20 +139,20 @@ def _reverse_cumsum(x, dim=2):
 # Triton kernels
 # --------------------------------------------------------------------------
 
+
 def _use_triton():
-    mode = os.environ.get('NFRA_SCAN_KERNEL', '1')
-    if mode == '0':
+    mode = os.environ.get("NFRA_SCAN_KERNEL", "1")
+    if mode == "0":
         return False
-    if mode == '2':
+    if mode == "2":
         if not (_HAS_TRITON and torch.cuda.is_available()):
-            raise RuntimeError(
-                'NFRA_SCAN_KERNEL=2 but Triton/CUDA unavailable')
+            raise RuntimeError("NFRA_SCAN_KERNEL=2 but Triton/CUDA unavailable")
         return True
     return bool(_HAS_TRITON and torch.cuda.is_available())
 
 
 def _scan_triton_unavailable(*args, **kwargs):
-    raise RuntimeError('Triton not available; cannot run the CUDA scan kernel')
+    raise RuntimeError("Triton not available; cannot run the CUDA scan kernel")
 
 
 _scan_triton = _scan_triton_unavailable
@@ -161,7 +162,10 @@ if _HAS_TRITON:
 
     @triton.jit
     def _scan_fwd_kernel(
-        value_ptr, gate_ptr, alpha_ptr, out_ptr,
+        value_ptr,
+        gate_ptr,
+        alpha_ptr,
+        out_ptr,
         S,
         HDIM: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -169,12 +173,12 @@ if _HAS_TRITON:
         ALPHA_MIN: tl.constexpr,
         ALPHA_MAX: tl.constexpr,
     ):
-        pid = tl.program_id(0).to(tl.int64)          # index over (B * H)
+        pid = tl.program_id(0).to(tl.int64)  # index over (B * H)
         hd = tl.arange(0, HEAD_DIM)
-        hd_mask = hd < HDIM                          # real inner dim (may be < pow2)
-        base = pid * S * HDIM                        # real row stride (NOT padded)
+        hd_mask = hd < HDIM  # real inner dim (may be < pow2)
+        base = pid * S * HDIM  # real row stride (NOT padded)
         h = tl.zeros([HEAD_DIM], dtype=tl.float32)
-        for t in range(S):                           # dynamic loop over sequence
+        for t in range(S):  # dynamic loop over sequence
             offs = base + t * HDIM + hd
             a = tl.load(alpha_ptr + offs, mask=hd_mask, other=1.0).to(tl.float32)
             a = tl.minimum(tl.maximum(a, ALPHA_MIN), ALPHA_MAX)
@@ -191,7 +195,11 @@ if _HAS_TRITON:
         head_dim = triton.next_power_of_2(Hd)
         gate_ptr = gate if gate is not None else value  # unused when HAS_GATE=0
         _scan_fwd_kernel[(B * H,)](
-            value, gate_ptr, alpha, out, S,
+            value,
+            gate_ptr,
+            alpha,
+            out,
+            S,
             HDIM=Hd,
             HEAD_DIM=head_dim,
             HAS_GATE=gate is not None,
@@ -203,7 +211,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _scan_bwd_kernel(
-        dh_ptr, alpha_ptr, du_ptr,
+        dh_ptr,
+        alpha_ptr,
+        du_ptr,
         S,
         HDIM: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -220,12 +230,14 @@ if _HAS_TRITON:
         # a_next holds a_t (the alpha of the NEXT higher index), which at step
         # t is exactly a_{t+1}. No exp/cumsum -> finite for any S.
         for t in range(S - 1, -1, -1):
-            dh = tl.load(dh_ptr + base + t * HDIM + hd,
-                         mask=hd_mask, other=0.0).to(tl.float32)
+            dh = tl.load(dh_ptr + base + t * HDIM + hd, mask=hd_mask, other=0.0).to(
+                tl.float32
+            )
             du = dh + a_next * du
             tl.store(du_ptr + base + t * HDIM + hd, du, mask=hd_mask)
-            a = tl.load(alpha_ptr + base + t * HDIM + hd,
-                        mask=hd_mask, other=1.0).to(tl.float32)
+            a = tl.load(alpha_ptr + base + t * HDIM + hd, mask=hd_mask, other=1.0).to(
+                tl.float32
+            )
             a_next = tl.minimum(tl.maximum(a, ALPHA_MIN), ALPHA_MAX)
 
     def _scan_bwd_triton(dh, alpha, alpha_min, alpha_max):
@@ -233,7 +245,10 @@ if _HAS_TRITON:
         du = torch.empty((B, H, S, Hd), dtype=torch.float32, device=dh.device)
         head_dim = triton.next_power_of_2(Hd)
         _scan_bwd_kernel[(B * H,)](
-            dh, alpha, du, S,
+            dh,
+            alpha,
+            du,
+            S,
             HDIM=Hd,
             HEAD_DIM=head_dim,
             ALPHA_MIN=alpha_min,
@@ -303,35 +318,44 @@ def selective_scan(gate, value, alpha, alpha_min=0.75, alpha_max=0.9995):
 
 
 def parallel_scan_time_varying(
-    gate, value, alpha, alpha_min=0.75, alpha_max=0.9995,
+    gate,
+    value,
+    alpha,
+    alpha_min=0.75,
+    alpha_max=0.9995,
 ):
     """Public entry point (kept for compatibility with resonance.core)."""
     return selective_scan(gate, value, alpha, alpha_min, alpha_max)
 
 
-def benchmark(seq_lens=(128, 256, 512), heads=(8, 16, 32),
-              head_dim=16, batch=8, repeats=20, warmup=3):
+def benchmark(
+    seq_lens=(128, 256, 512),
+    heads=(8, 16, 32),
+    head_dim=16,
+    batch=8,
+    repeats=20,
+    warmup=3,
+):
     """Time triton vs torch scan on CUDA. Returns dict + prints a table."""
     if not torch.cuda.is_available():
-        raise RuntimeError('benchmark requires CUDA')
+        raise RuntimeError("benchmark requires CUDA")
     import time
 
-    print('scan kernel benchmark (triton vs torch closed-form), '
-          'fp32 accumulation')
+    print("scan kernel benchmark (triton vs torch closed-form), " "fp32 accumulation")
     rows = []
     for S in seq_lens:
         for H in heads:
             Hd = head_dim
             B = batch
-            value = torch.randn(B, H, S, Hd, device='cuda')
-            gate = torch.sigmoid(torch.randn(B, H, S, Hd, device='cuda'))
-            alpha = torch.rand(B, H, S, Hd, device='cuda') * 0.2 + 0.75
+            value = torch.randn(B, H, S, Hd, device="cuda")
+            gate = torch.sigmoid(torch.randn(B, H, S, Hd, device="cuda"))
+            alpha = torch.rand(B, H, S, Hd, device="cuda") * 0.2 + 0.75
             ref = scan_reference(gate, value, alpha)
             tri = _scan_triton(gate, value, alpha, 0.75, 0.9995)
             torch_to = _scan_torch(gate, value, alpha, 0.75, 0.9995)
             # Correctness gate: the kernel is a direct sequential recurrence,
             # so it must match the exact reference.
-            assert torch.allclose(tri, ref, atol=1e-3, rtol=1e-3), 'kernel mismatch'
+            assert torch.allclose(tri, ref, atol=1e-3, rtol=1e-3), "kernel mismatch"
             # The torch closed-form goes through exp(log-alpha)/cumsum; at long
             # S with alpha near the 0.75 floor, exp(-cumlog) exceeds fp32 range
             # (~1e63 > 3.4e38) and overflows to inf. The kernel does not (it
@@ -340,8 +364,10 @@ def benchmark(seq_lens=(128, 256, 512), heads=(8, 16, 32),
             if torch.isfinite(torch_to).all():
                 assert torch.allclose(torch_to, ref, atol=1e-3, rtol=1e-3)
             else:
-                print('  [note] torch closed-form overflowed at S=%d '
-                      '(kernel stays finite) - expected, not a bug' % S)
+                print(
+                    "  [note] torch closed-form overflowed at S=%d "
+                    "(kernel stays finite) - expected, not a bug" % S
+                )
 
             for _ in range(warmup):
                 _scan_triton(gate, value, alpha, 0.75, 0.9995)
@@ -362,12 +388,13 @@ def benchmark(seq_lens=(128, 256, 512), heads=(8, 16, 32),
             t_torch = (time.perf_counter() - t0) / repeats * 1e6
 
             speedup = t_torch / max(t_tri, 1e-6)
-            rows.append((S, H, round(t_torch, 1), round(t_tri, 1),
-                         round(speedup, 2)))
-            print('S=%4d H=%2d Hd=%2d | torch %8.1fus | triton %7.1fus | '
-                  'x%.2f' % (S, H, Hd, t_torch, t_tri, speedup))
+            rows.append((S, H, round(t_torch, 1), round(t_tri, 1), round(speedup, 2)))
+            print(
+                "S=%4d H=%2d Hd=%2d | torch %8.1fus | triton %7.1fus | "
+                "x%.2f" % (S, H, Hd, t_torch, t_tri, speedup)
+            )
     return rows
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     benchmark()

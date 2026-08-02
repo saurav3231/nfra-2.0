@@ -33,27 +33,38 @@ Env:
   NFRA_RECALL_FAMILIES   comma list: nfra,mamba,rwkv,retnet,gpt2 (default nfra,mamba)
 """
 
-import os
-import math
-import json
-import time
 import contextlib
 import functools
+import json
+import math
+import os
+import time
 
-os.environ.setdefault('NFRA_SEEDS', '1')
-os.environ.setdefault('NFRA_SIZES', '5')
+os.environ.setdefault("NFRA_SEEDS", "1")
+os.environ.setdefault("NFRA_SIZES", "5")
 
 print = functools.partial(print, flush=True)
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from .arena import build_nfra, build_mamba, build_rwkv, build_retnet, \
-    build_gpt2, train_one, SEED_LIST
+from .arena import (
+    build_gpt2,
+    build_mamba,
+    build_nfra,
+    build_retnet,
+    build_rwkv,
+    train_one,
+)
 from .compare import (
-    count_params, DEVICE, rescale_embed, make_optimizer, compute_loss,
-    USE_AMP, HAS_CUDA, SEQ_LEN,
+    DEVICE,
+    HAS_CUDA,
+    USE_AMP,
+    compute_loss,
+    count_params,
+    make_optimizer,
+    rescale_embed,
 )
 
 V = 16  # symbol vocab
@@ -108,8 +119,9 @@ class RecallDataset(Dataset):
 
 def make_loader(k, seq_len, batch, seed=0, num_seqs=512):
     ds = RecallDataset(num_seqs, seq_len + 1, k, seed=seed)
-    return DataLoader(ds, batch_size=batch, shuffle=False, num_workers=0,
-                      pin_memory=HAS_CUDA)
+    return DataLoader(
+        ds, batch_size=batch, shuffle=False, num_workers=0, pin_memory=HAS_CUDA
+    )
 
 
 @torch.no_grad()
@@ -119,7 +131,7 @@ def metric_by_span(model, loader, k, V=V):
     ce_span, acc_span, ce_pad = [], [], []
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        logits = model(x)['logits']
+        logits = model(x)["logits"]
         logp = logits.log_softmax(-1)
         pred = logits.argmax(-1)
         for b in range(x.size(0)):
@@ -130,8 +142,7 @@ def metric_by_span(model, loader, k, V=V):
             ce_pad.append(ce[~span].mean().item())
             acc_span.append((pred[b][span] == yy[span]).float().mean().item())
     model.train()
-    return (float(np.mean(ce_span)), float(np.mean(acc_span)),
-            float(np.mean(ce_pad)))
+    return (float(np.mean(ce_span)), float(np.mean(acc_span)), float(np.mean(ce_pad)))
 
 
 def _train_concurrent(models, steps, loaders, seq_len=256):
@@ -144,13 +155,12 @@ def _train_concurrent(models, steps, loaders, seq_len=256):
     Each model keeps its own optimizer/scheduler/loader; results are the same
     as running them sequentially (init RNG is seeded to match, see _run_all)."""
     n = len(models)
-    streams = ([torch.cuda.Stream() for _ in range(n)] if HAS_CUDA
-               else [None] * n)
+    streams = [torch.cuda.Stream() for _ in range(n)] if HAS_CUDA else [None] * n
     opts, scheds, scalers = [], [], []
     for m in models:
-        opt, sched = make_optimizer(m, lr=3e-4,
-                                    warmup=min(50, max(steps // 10, 1)),
-                                    total=steps)
+        opt, sched = make_optimizer(
+            m, lr=3e-4, warmup=min(50, max(steps // 10, 1)), total=steps
+        )
         opts.append(opt)
         scheds.append(sched)
         scalers.append(torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None)
@@ -162,10 +172,12 @@ def _train_concurrent(models, steps, loaders, seq_len=256):
     prog = max(50, steps // 12)
     for step in range(1, steps + 1):
         if step % prog == 0 or step == steps:
-            print('[concurrent] step %d/%d  %.0fs elapsed'
-                  % (step, steps, time.perf_counter() - t0))
+            print(
+                "[concurrent] step %d/%d  %.0fs elapsed"
+                % (step, steps, time.perf_counter() - t0)
+            )
         for i in range(n):
-            with (torch.cuda.stream(streams[i]) if HAS_CUDA else nullctx):
+            with torch.cuda.stream(streams[i]) if HAS_CUDA else nullctx:
                 try:
                     x, y = next(iters[i])
                 except StopIteration:
@@ -174,14 +186,12 @@ def _train_concurrent(models, steps, loaders, seq_len=256):
                 x = x.to(DEVICE, non_blocking=HAS_CUDA)
                 y = y.to(DEVICE, non_blocking=HAS_CUDA)
                 opts[i].zero_grad()
-                with torch.amp.autocast(device_type=DEVICE.type,
-                                        enabled=USE_AMP):
+                with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
                     loss = compute_loss(models[i], x, y, surprise=False)
                 if scalers[i]:
                     scalers[i].scale(loss).backward()
                     scalers[i].unscale_(opts[i])
-                    gnorm = torch.nn.utils.clip_grad_norm_(
-                        models[i].parameters(), 1.0)
+                    gnorm = torch.nn.utils.clip_grad_norm_(models[i].parameters(), 1.0)
                     if not math.isfinite(gnorm):
                         opts[i].zero_grad(set_to_none=True)
                         nan[i] += 1
@@ -189,8 +199,7 @@ def _train_concurrent(models, steps, loaders, seq_len=256):
                     scalers[i].update()
                 else:
                     loss.backward()
-                    gnorm = torch.nn.utils.clip_grad_norm_(
-                        models[i].parameters(), 1.0)
+                    gnorm = torch.nn.utils.clip_grad_norm_(models[i].parameters(), 1.0)
                     if math.isfinite(gnorm):
                         opts[i].step()
                     else:
@@ -203,19 +212,30 @@ def _train_concurrent(models, steps, loaders, seq_len=256):
     wall = time.perf_counter() - t0
     recs = []
     for i in range(n):
-        bs = getattr(loaders[i], 'batch_size', 1)
-        recs.append({
-            'loss_hist': [float(v) for v in hist[i]],
-            'nan_steps': nan[i],
-            'wall_s': wall,
-            'ms_per_step': wall * 1000.0 / steps,
-            'tok_s': bs * seq_len * steps / max(wall, 1e-6),
-        })
+        bs = getattr(loaders[i], "batch_size", 1)
+        recs.append(
+            {
+                "loss_hist": [float(v) for v in hist[i]],
+                "nan_steps": nan[i],
+                "wall_s": wall,
+                "ms_per_step": wall * 1000.0 / steps,
+                "tok_s": bs * seq_len * steps / max(wall, 1e-6),
+            }
+        )
     return recs, wall
 
 
-def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False,
-             families=('nfra', 'mamba')):
+def _run_all(
+    ks,
+    steps,
+    dim,
+    seq_len,
+    batch,
+    unique,
+    depth,
+    concurrent=False,
+    families=("nfra", "mamba"),
+):
     """Run the given families across all k, sequentially or concurrently.
 
     Returns {fam: {k: row, ...}} for each family in `families`. In BOTH modes
@@ -225,11 +245,11 @@ def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False,
     training still differs between the two modes — that is honest
     stochasticity, not an init mismatch.)"""
     builders = {
-        'nfra': lambda v, d: build_nfra(v, d, unique, depth=depth),
-        'mamba': lambda v, d: build_mamba(v, d, 8),
-        'rwkv': lambda v, d: build_rwkv(v, d, 8),
-        'retnet': lambda v, d: build_retnet(v, d, 8, n_heads=8),
-        'gpt2': lambda v, d: build_gpt2(v, d, 8, n_heads=8),
+        "nfra": lambda v, d: build_nfra(v, d, unique, depth=depth),
+        "mamba": lambda v, d: build_mamba(v, d, 8),
+        "rwkv": lambda v, d: build_rwkv(v, d, 8),
+        "retnet": lambda v, d: build_retnet(v, d, 8, n_heads=8),
+        "gpt2": lambda v, d: build_gpt2(v, d, 8, n_heads=8),
     }
     fams = [f for f in families if f in builders]
     rows = {f: {} for f in fams}
@@ -244,27 +264,43 @@ def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False,
                 m = builder(V, dim).to(DEVICE)
                 rescale_embed(m)
                 tasks.append((fam, k, m, train_loader, eval_loader))
-        recs, wall = _train_concurrent([t[2] for t in tasks], steps,
-                                       [t[3] for t in tasks], seq_len)
-        agg_tok_s = (sum(getattr(t[3], 'batch_size', 1) for t in tasks)
-                     * seq_len * steps / max(wall, 1e-6))
-        print('[concurrent] %d trainings in %.1fs -> %.0f tok/s aggregate'
-              % (len(tasks), wall, agg_tok_s))
+        recs, wall = _train_concurrent(
+            [t[2] for t in tasks], steps, [t[3] for t in tasks], seq_len
+        )
+        agg_tok_s = (
+            sum(getattr(t[3], "batch_size", 1) for t in tasks)
+            * seq_len
+            * steps
+            / max(wall, 1e-6)
+        )
+        print(
+            "[concurrent] %d trainings in %.1fs -> %.0f tok/s aggregate"
+            % (len(tasks), wall, agg_tok_s)
+        )
         for (fam, k, m, _tr, ev), rec in zip(tasks, recs):
             ce_span, acc_span, ce_pad = metric_by_span(m, ev, k)
             rows[fam][k] = {
-                'span_ce': round(ce_span, 4),
-                'span_acc': round(acc_span, 4),
-                'pad_ce': round(ce_pad, 4),
-                'train_first': round(rec['loss_hist'][0], 4),
-                'train_last': round(rec['loss_hist'][-1], 4),
-                'params': count_params(m),
+                "span_ce": round(ce_span, 4),
+                "span_acc": round(acc_span, 4),
+                "pad_ce": round(ce_pad, 4),
+                "train_first": round(rec["loss_hist"][0], 4),
+                "train_last": round(rec["loss_hist"][-1], 4),
+                "params": count_params(m),
             }
-            print('[%s] k=%-4d train %.4f -> %.4f | span_ce=%.4f span_acc=%.4f '
-                  'pad_ce=%.4f (floor %.2f)'
-                  % (fam, k, rows[fam][k]['train_first'],
-                     rows[fam][k]['train_last'], ce_span, acc_span, ce_pad,
-                     math.log(V)))
+            print(
+                "[%s] k=%-4d train %.4f -> %.4f | span_ce=%.4f span_acc=%.4f "
+                "pad_ce=%.4f (floor %.2f)"
+                % (
+                    fam,
+                    k,
+                    rows[fam][k]["train_first"],
+                    rows[fam][k]["train_last"],
+                    ce_span,
+                    acc_span,
+                    ce_pad,
+                    math.log(V),
+                )
+            )
     else:
         # Build ALL models first under one RNG stream, in the same (family, k)
         # order concurrent mode builds them, so init matches exactly.
@@ -279,63 +315,109 @@ def _run_all(ks, steps, dim, seq_len, batch, unique, depth, concurrent=False,
             params = count_params(model)
             train_loader = make_loader(k, seq_len, batch, seed=42)
             eval_loader = make_loader(k, seq_len, batch, seed=7)
-            rec = train_one(model, V, steps, train_loader, eval_loader,
-                            max(25, steps // 6), ema_decay=0.0, surprise=False)
+            rec = train_one(
+                model,
+                V,
+                steps,
+                train_loader,
+                eval_loader,
+                max(25, steps // 6),
+                ema_decay=0.0,
+                surprise=False,
+            )
             ce_span, acc_span, ce_pad = metric_by_span(model, eval_loader, k)
             rows[fam][k] = {
-                'span_ce': round(ce_span, 4),
-                'span_acc': round(acc_span, 4),
-                'pad_ce': round(ce_pad, 4),
-                'train_first': round(rec['loss_hist'][0], 4),
-                'train_last': round(rec['loss_hist'][-1], 4),
-                'params': params,
+                "span_ce": round(ce_span, 4),
+                "span_acc": round(acc_span, 4),
+                "pad_ce": round(ce_pad, 4),
+                "train_first": round(rec["loss_hist"][0], 4),
+                "train_last": round(rec["loss_hist"][-1], 4),
+                "params": params,
             }
-            print('[%s] k=%-4d train %.4f -> %.4f | span_ce=%.4f span_acc=%.4f '
-                  'pad_ce=%.4f (floor %.2f)'
-                  % (fam, k, rows[fam][k]['train_first'],
-                     rows[fam][k]['train_last'], ce_span, acc_span, ce_pad,
-                     math.log(V)))
+            print(
+                "[%s] k=%-4d train %.4f -> %.4f | span_ce=%.4f span_acc=%.4f "
+                "pad_ce=%.4f (floor %.2f)"
+                % (
+                    fam,
+                    k,
+                    rows[fam][k]["train_first"],
+                    rows[fam][k]["train_last"],
+                    ce_span,
+                    acc_span,
+                    ce_pad,
+                    math.log(V),
+                )
+            )
     return rows
 
 
 def main():
-    ks = [int(x) for x in
-          os.environ.get('NFRA_RECALL_KS', '4,16,64,128').split(',') if x.strip()]
-    steps = int(os.environ.get('NFRA_RECALL_STEPS', '600'))
-    dim = int(os.environ.get('NFRA_RECALL_DIM', '224'))
-    depth = int(os.environ.get('NFRA_RECALL_DEPTH', '12'))
-    unique = int(os.environ.get('NFRA_RECALL_UNIQUE', '4'))
-    batch = int(os.environ.get('NFRA_RECALL_BATCH', '8'))
-    seq_len = int(os.environ.get('NFRA_RECALL_SEQ', '256'))
-    concurrent = os.environ.get('NFRA_RECALL_CONCURRENT', '0') == '1'
-    out_json = os.environ.get('NFRA_RECALL_OUT', 'recall_probe.json')
-    families = tuple(f.strip().lower() for f in
-                     os.environ.get('NFRA_RECALL_FAMILIES', 'nfra,mamba').split(',')
-                     if f.strip())
+    ks = [
+        int(x)
+        for x in os.environ.get("NFRA_RECALL_KS", "4,16,64,128").split(",")
+        if x.strip()
+    ]
+    steps = int(os.environ.get("NFRA_RECALL_STEPS", "600"))
+    dim = int(os.environ.get("NFRA_RECALL_DIM", "224"))
+    depth = int(os.environ.get("NFRA_RECALL_DEPTH", "12"))
+    unique = int(os.environ.get("NFRA_RECALL_UNIQUE", "4"))
+    batch = int(os.environ.get("NFRA_RECALL_BATCH", "8"))
+    seq_len = int(os.environ.get("NFRA_RECALL_SEQ", "256"))
+    concurrent = os.environ.get("NFRA_RECALL_CONCURRENT", "0") == "1"
+    out_json = os.environ.get("NFRA_RECALL_OUT", "recall_probe.json")
+    families = tuple(
+        f.strip().lower()
+        for f in os.environ.get("NFRA_RECALL_FAMILIES", "nfra,mamba").split(",")
+        if f.strip()
+    )
 
-    print('H3 recall probe  |  V=%d ks=%s steps=%d dim=%d seq=%d fam=%s%s'
-          % (V, ks, steps, dim, seq_len, ','.join(families),
-             '  [concurrent streams]' if concurrent else ''))
-    print('random loss floor ln(%d) = %.3f' % (V, math.log(V)))
+    print(
+        "H3 recall probe  |  V=%d ks=%s steps=%d dim=%d seq=%d fam=%s%s"
+        % (
+            V,
+            ks,
+            steps,
+            dim,
+            seq_len,
+            ",".join(families),
+            "  [concurrent streams]" if concurrent else "",
+        )
+    )
+    print("random loss floor ln(%d) = %.3f" % (V, math.log(V)))
 
-    rows = _run_all(ks, steps, dim, seq_len, batch, unique, depth,
-                    concurrent=concurrent, families=families)
+    rows = _run_all(
+        ks,
+        steps,
+        dim,
+        seq_len,
+        batch,
+        unique,
+        depth,
+        concurrent=concurrent,
+        families=families,
+    )
 
-    print('\nresults (span CE, lower is better; floor %.3f):' % math.log(V))
-    hdr = ' k     ' + '  '.join('%-8s' % f for f in families)
+    print(f"\nresults (span CE, lower is better; floor {math.log(V):.3f}):")
+    hdr = " k     " + "  ".join("%-8s" % f for f in families)
     print(hdr)
     for k in ks:
-        cells = '  '.join('%-8.4f' % rows[f][k]['span_ce'] for f in families)
-        print(' %-4d  %s' % (k, cells))
+        cells = "  ".join("{:<8.4f}".format(rows[f][k]["span_ce"]) for f in families)
+        print(" %-4d  %s" % (k, cells))
 
-    out = {'vocab': V, 'ks': ks, 'steps': steps, 'dim': dim,
-           'floor': round(math.log(V), 4), 'families': families}
+    out = {
+        "vocab": V,
+        "ks": ks,
+        "steps": steps,
+        "dim": dim,
+        "floor": round(math.log(V), 4),
+        "families": families,
+    }
     for f in families:
         out[f] = rows[f]
-    with open(out_json, 'w', encoding='utf-8') as f:
+    with open(out_json, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=True, indent=2)
-    print('Wrote %s' % out_json)
+    print(f"Wrote {out_json}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

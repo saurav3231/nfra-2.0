@@ -13,7 +13,11 @@ Usage:
     python -m scripts.parse_results --results overnight_results.json
 """
 
-import os, sys, json, math, argparse
+import argparse
+import json
+import math
+import os
+import sys
 
 
 def load_results(path):
@@ -49,8 +53,8 @@ def extract_overnight_ablate(data):
         return None
 
     # The ablate results are stored per-size
-    for size_key, size_data in metrics.items():
-        for fam, fam_data in size_data.items():
+    for size_data in metrics.values():
+        for fam in size_data:
             if fam.startswith("nfra_") or fam in ("nfra_baseline", "nfra_all"):
                 return True  # Has ablate data
     return None
@@ -79,7 +83,11 @@ def classify_from_aggregated(variants):
 
         delta = variant_eval - baseline_eval
         variant_sd = metrics.get("final_eval_sd") or 0
-        combined_sd = math.sqrt(baseline_sd ** 2 + variant_sd ** 2) if (baseline_sd + variant_sd) > 0 else 0
+        (
+            math.sqrt(baseline_sd**2 + variant_sd**2)
+            if (baseline_sd + variant_sd) > 0
+            else 0
+        )
 
         threshold = max(0.02, 0.05 * abs(baseline_eval))
 
@@ -94,7 +102,9 @@ def classify_from_aggregated(variants):
         classifications[lever] = {
             "status": status,
             "delta": round(delta, 4),
-            "delta_pct": round(delta / baseline_eval * 100, 2) if baseline_eval != 0 else 0,
+            "delta_pct": (
+                round(delta / baseline_eval * 100, 2) if baseline_eval != 0 else 0
+            ),
             "baseline_eval": baseline_eval,
             "variant_eval": variant_eval,
             "baseline_sd": baseline_sd,
@@ -151,7 +161,9 @@ def generate_report_from_aggregated(variants, classifications, outdir):
         a("")
         for lever in working:
             info = classifications[lever]
-            a(f"- **{lever}**: delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)")
+            a(
+                f"- **{lever}**: delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)"
+            )
         a("")
 
     if neutral:
@@ -159,7 +171,9 @@ def generate_report_from_aggregated(variants, classifications, outdir):
         a("")
         for lever in neutral:
             info = classifications[lever]
-            a(f"- **{lever}**: delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)")
+            a(
+                f"- **{lever}**: delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)"
+            )
         a("")
 
     if harmful:
@@ -167,7 +181,9 @@ def generate_report_from_aggregated(variants, classifications, outdir):
         a("")
         for lever in harmful:
             info = classifications[lever]
-            a(f"- **{lever}**: delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)")
+            a(
+                f"- **{lever}**: delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)"
+            )
         a("")
 
     a("## Recommendations")
@@ -182,7 +198,7 @@ def generate_report_from_aggregated(variants, classifications, outdir):
 
     report = "\n".join(lines)
     out_md = os.path.join(outdir, "mechanism_analysis_aggregated.md")
-    with open(out_md, 'w') as f:
+    with open(out_md, "w") as f:
         f.write(report)
     print(f"  Report saved -> {out_md}")
 
@@ -191,10 +207,12 @@ def generate_report_from_aggregated(variants, classifications, outdir):
 
 def main():
     parser = argparse.ArgumentParser(description="NFRA Results Parser")
-    parser.add_argument("--results", type=str, default=None,
-                        help="Path to results JSON file")
-    parser.add_argument("--outdir", type=str, default=None,
-                        help="Output directory for reports")
+    parser.add_argument(
+        "--results", type=str, default=None, help="Path to results JSON file"
+    )
+    parser.add_argument(
+        "--outdir", type=str, default=None, help="Output directory for reports"
+    )
     args = parser.parse_args()
 
     outdir = args.outdir or os.getcwd()
@@ -203,8 +221,11 @@ def main():
     if args.results:
         path = args.results
     else:
-        for fname in ["global_arena_results.json", "overnight_results.json",
-                        "mechanism_analysis.json"]:
+        for fname in [
+            "global_arena_results.json",
+            "overnight_results.json",
+            "mechanism_analysis.json",
+        ]:
             p = os.path.join(os.getcwd(), fname)
             if os.path.exists(p):
                 path = p
@@ -248,7 +269,9 @@ def main():
         elif info["status"] == "no_data":
             print(f"  {lever:20s} NO DATA")
         else:
-            print(f"  {lever:20s} {info['status']:10s}  delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)")
+            print(
+                f"  {lever:20s} {info['status']:10s}  delta = {info['delta']:+.4f} ({info['delta_pct']:+.1f}%)"
+            )
     print("=" * 72)
 
 

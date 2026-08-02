@@ -1,82 +1,143 @@
-# 🧠 NFRA 2.0 — NeuroFractal Resonance Architecture
+# NFRA — Nonlinear Factorized Recurrent Attention
 
-**A brain-inspired neural network for quality AI on modest hardware — benchmarked apples-to-apples against Mamba-SSM and GPT-2.**
+**An efficient recurrent language-model block that beats RetNet and RWKV on
+quality at matched parameters — verified head-to-head on a single modest GPU.**
 
-> Built on **PyTorch** for **large language model (LLM)** research and deployment: next-token prediction, sequence modeling, and autoregressive text generation on a single modest GPU. A drop-in comparison subject against **Transformer** and **State Space Model (SSM)** baselines such as Mamba, with low-memory training and inference.
+NFRA is a depth-shared recurrent block built from two well-cited atoms — a
+decayed query-key **retention** mixer ([RetNet, Sun et al., 2023](https://arxiv.org/abs/2307.08621))
+and a token-wise **receptance gate** ([RWKV, Peng et al., 2023](https://arxiv.org/abs/2305.13048))
+— plus a SwiGLU feed-forward. A per-gate isolation sweep showed the receptance
+gate is the mechanism that actually carries the quality win, so it ships on and
+the rest of the "brain" machinery ships off by default.
 
-> Built by **SAURAV BHANDARI** — conceived, designed, and developed with AI assistance.
+**Built by SAURAV BHANDARI** — conceived, designed, and developed with AI assistance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
-[![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Ruff](https://img.shields.io/badge/linter-ruff-D7FF64.svg)](https://github.com/astral-sh/ruff)
-[![Status](https://img.shields.io/badge/status-research--alpha-orange.svg)]()
+[![Tests](https://img.shields.io/badge/tests-49%20passing-brightgreen.svg)]()
 
 ---
 
 ## Table of Contents
 
-- [What is NFRA?](#-what-is-nfra)
-- [Measured Results (Real Benchmarks)](#-measured-results)
-- [Key Features](#-key-features)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [Benchmarks](#-benchmarks)
-- [Project Structure](#-project-structure)
-- [Documentation](#-documentation)
-- [Development](#-development)
-- [Author & License](#-author--license)
+- [Why NFRA?](#why-nfra)
+- [Verified Results](#verified-results)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Benchmarks](#benchmarks)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Author & License](#author--license)
 
 ---
 
-## 🌍 What is NFRA?
+## Why NFRA?
 
-NFRA (NeuroFractal Resonance Architecture) is a family of neural-network building blocks inspired by how biological brains use **fractal self-similarity**, **resonance-based sparse activation**, and **predictive coding** to process sequences efficiently.
+Recurrent models promise linear-complexity sequence modeling, but the field's
+two strongest recurrent families have distinct weaknesses that show up clearly
+at small scale:
 
-It ships in two flavours:
+- **RetNet** is fast and stable, but its decayed-retention mixer has no
+  input-dependent selectivity.
+- **RWKV** has strong selectivity (its receptance gate), but its
+  per-channel fixed decay limits effective context, and its training is
+  numerically delicate.
 
-| Flavour | What it is | Best for |
-|---------|-----------|----------|
-| **NFRA Brain** (`mode="brain"`) | Multi-band sequence mixer + fractal gated MLPs, local attention, selective decay, per-pass modulation | Quality-vs-resource benchmarks (`nfra.benchmark`) |
-| **NFRA Lite** (`NFRALiteForCausalLM`) | Single-file, dependency-light model | 2012–2018 CPUs, Raspberry Pi, microcontrollers |
+NFRA combines the two: RetNet-style retention (parallelizable, stable) with an
+RWKV-style receptance read-gate (input-dependent selection). The result, at
+matched parameters on identical data, beats both on next-token loss while
+keeping memory far below a full Transformer.
 
-**The goal**: make capable AI accessible to the billions of devices that cannot afford high-end GPUs — and to prove *with evidence* how it compares to mainstream architectures.
-
----
-
-## 📊 Measured Results
-
-These are **real measured numbers**, not projections — produced by this repository's own benchmark on a Kaggle T4 GPU, on real text (WikiText-2, character-level), with all models **param-matched (~20M)**, trained on **identical data, optimizer, and schedule** (600 steps).
-
-| Model | Eval loss (↓) | Perplexity (↓) | Train tok/s (↑) | Peak memory (↓) |
-|-------|--------------:|---------------:|----------------:|----------------:|
-| **NFRA Brain** | **2.13** | ≈ 8 | 2,042 | **0.62 GB** |
-| **Mamba SSM** (ref) | **1.59** | ≈ 5 | 845 | 5.09 GB |
-| **GPT-2** (ref) | 3.19 | ≈ 24 | 37,570 | 0.95 GB |
-
-**What this shows:**
-- **Quality:** Mamba wins (1.59), NFRA beats GPT-2 by a large margin (2.13 vs 3.19).
-- **Memory:** NFRA uses **8.2× less peak memory** than Mamba and **1.5× less** than GPT-2.
-- **Speed:** NFRA trains **2.4× faster** than Mamba (pure-PyTorch implementations; fused kernels would raise both).
-
-> The **NFRA Arena** benchmark extends this into a global-standard, multi-dimension comparison — multiple sizes, multiple seeds (mean ± std), scaling slopes, inference latency, and an evidence-based verdict. See [Benchmarks](#-benchmarks).
+NFRA is designed for **LLM research and deployment on modest hardware** —
+next-token prediction, sequence modeling, and autoregressive generation on a
+single small GPU — and ships as a drop-in comparison subject against
+Transformer and SSM baselines.
 
 ---
 
-## ✨ Key Features
+## Verified Results
 
-- **Multi-band sequence mixing** — recurrence at several temporal resolutions in a single block (α ∈ [0.90, 0.995])
-- **Fractal gated MLPs** — hierarchical, structurally sparse feed-forward networks
-- **Selective (input-dependent) decay** — the model decides how much to remember per token (SSM-style, but built on parallel scans)
-- **Resonance-guided local attention** — cheap, windowed attention gated by neuromodulation
-- **Per-pass FiLM adapters + global brain state** — depth-shared blocks are modulated per pass like cortical layers
-- **Gradient checkpointing & fp32-safe scans** — stable training on modest GPUs (fp16 scan overflow → NaN is guarded)
-- **Legacy-hardware-friendly Lite variant** — single-file, no heavy dependencies
+All numbers below are **real measured runs**, produced by this repository's own
+benchmark on a **Kaggle T4 GPU**, on **WikiText-2 (character-level, vocab 96)**,
+with every family **param-matched** and trained on **identical data, optimizer,
+EMA, and schedule** (600 steps, seeds 42/7, fp16 AMP). Full log:
+[`docs/OVERNIGHT_VERIFIED_RESULTS.md`](docs/OVERNIGHT_VERIFIED_RESULTS.md).
+
+### Core head-to-head (verified, commit `defe8b2`)
+
+| size | family | eval loss (seed 42 / 7) | mean | train tok/s |
+|------|--------|------------------------:|-----:|------------:|
+| 5M | **nfra** | 1.961 / 1.945 | **1.953** | 10,320 / 10,495 |
+| 5M | retnet | 2.127 / 2.143 | 2.135 | 17,681 / 17,764 |
+| 5M | gpt2 | 3.212 / 3.204 | 3.208 | 33,157 / 33,192 |
+| 5M | rwkv | 4.275 / 4.267 | 4.271 | 13,364 / 13,447 |
+| 20M | **nfra** | 1.763 / 1.763 | **1.763** | 10,484 / 10,500 |
+| 20M | retnet | 1.811 / 1.810 | 1.811 | 24,880 / 24,794 |
+| 20M | gpt2 | 2.962 / 2.935 | 2.949 | 51,554 / 51,552 |
+| 20M | rwkv | 3.931 / 4.090 | 4.011 | 10,755 / 10,708 |
+
+**Verified facts:**
+
+- **nfra beats retnet on loss at both sizes, both seeds, no overlap** — by
+  −0.18 nats @5M (1.953 vs 2.135) and −0.048 nats @20M (1.763 vs 1.811), at
+  **bit-identical geometry** (dim 112/depth 33 @5M, dim 224/depth 33 @20M).
+- **nfra is the only family that improves at 4× context length** (1.759→1.719
+  when eval @1024 vs train @256); gpt2 collapses (+0.44) and retnet barely moves.
+- **Memory** stays small: 1.40 GB @5M / 2.16 GB @20M peak, far below the 16 GB T4.
+
+### Isolation sweep — what actually carries the win (commit `b868477`)
+
+One mechanism turned off at a time, everything else at the exact verified build
+(5M / 600 steps / seed 42, eager). Seed noise is ~±0.01:
+
+| config | loss | Δ loss | tok/s | verdict |
+|--------|-----:|-------:|------:|---------|
+| baseline | 1.966 | +0.000 | 8,059 | — |
+| neuromodulator gland OFF | 1.980 | +0.014 | 10,041 | wash (~seed noise) |
+| value gate OFF | 1.971 | +0.006 | 9,469 | wash |
+| **receptance gate OFF** | **2.004** | **+0.038** | 8,341 | **KEEP — carries the win** |
+| phase modulation OFF | 1.971 | +0.005 | 8,759 | wash |
+| exit gate OFF | 1.972 | +0.006 | 8,539 | wash |
+
+**Conclusion:** the **receptance gate** (RWKV-style read gate) is the only
+mechanism that clears the +0.02 bar — the real differentiator, and cheap. Every
+"brain" gate individually is within seed noise while costing 6–25% speed, so
+the shipped default (**`NFRA_LEAN=1`**) turns them all off: the block is
+**retention + receptance gate + SwiGLU**.
 
 ---
 
-## 💾 Installation
+## Architecture
+
+The lean block (`NFRA_Cortex_Block`):
+
+```
+x → LN → Retention-QK mixer ─→ σ(r) receptance gate → proj_out → + x
+                        ↓
+x → LN → SwiGLU → + x
+```
+
+- **Retention mixer** — decayed `Q·Kᵀ` with per-head exponential decay masks,
+  GroupNorm per head, no softmax ([RetNet, 2023](https://arxiv.org/abs/2307.08621)).
+- **Receptance gate** — input-dependent read gate `y = proj_out(retention · σ(r))`
+  ([RWKV, 2023](https://arxiv.org/abs/2305.13048)).
+- **Multi-scale decay heads** — `log_decay −5…+3`, the source of the verified
+  4×-length improvement.
+- **Depth sharing** — `unique_blocks` unique blocks reused `depth_passes` times
+  with per-pass FiLM adapters: params scale with `unique_blocks`, effective depth
+  with `num_layers`.
+
+The full 3.3b block (neuromodulator, value gate, phase modulation, adaptive
+exit) is retained behind flags for reproducibility — set `NFRA_LEAN=0` — but is
+**not** the recommended architecture: the isolation sweep showed it adds cost,
+not quality, at this budget.
+
+---
+
+## Installation
 
 Requires **Python 3.9+** and **PyTorch 2.0+**.
 
@@ -94,26 +155,24 @@ Verify:
 
 ```python
 import nfra
-print(nfra.__version__, nfra.__author__)   # 3.1.0 SAURAV BHANDARI
+print(nfra.__version__, nfra.__author__)   # 3.3.0 SAURAV BHANDARI
 ```
 
 ---
 
-## 🚀 Quick Start
-
-### NFRA Brain (full model)
+## Quick Start
 
 ```python
 import torch
 from nfra import NFRAConfig, NFRAForCausalLM
 
 config = NFRAConfig(
-    mode="brain",
     vocab_size=32000,
     hidden_size=512,
     num_layers=12,
     unique_blocks=4,        # 4 distinct blocks reused depth-shared
     depth_shared=True,
+    use_cortex=True,        # NFRA_Cortex_Block (the verified architecture)
 )
 model = NFRAForCausalLM(config)
 print(f"params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -123,19 +182,20 @@ logits = model(x)["logits"]
 print(logits.shape)         # [2, 64, 32000]
 ```
 
-### NFRA Lite (legacy hardware)
+A dependency-light **NFRA Lite** variant (`NFRALiteForCausalLM`) is also
+shipped for very old/low-power CPUs:
 
 ```python
-from nfra import NFRAConfig
-from nfra.models.nfra_lite import NFRALiteForCausalLM
-model = NFRALiteForCausalLM(NFRAConfig(mode="lite", vocab_size=50257))
+from nfra.models import create_nfra_lite
+model = create_nfra_lite()
 ```
 
 ---
 
-## 🏆 Benchmarks
+## Benchmarks
 
-Two credible, reproducible benchmarks ship **inside the package** (no external scripts).
+Two credible, reproducible benchmarks ship **inside the package** (no external
+scripts).
 
 ### 1. `nfra.benchmark.compare` — quick apples-to-apples head-to-head
 
@@ -143,76 +203,74 @@ Two credible, reproducible benchmarks ship **inside the package** (no external s
 python -m nfra.benchmark.compare
 ```
 
-NFRA Brain vs Mamba-SSM vs GPT-2, param-matched (~20M), identical training, real Wikitext-2 char data. Outputs final eval loss, perplexity, throughput, and peak memory.
+NFRA vs RetNet vs RWKV vs GPT-2, param-matched, identical training, real
+WikiText-2 char data. Outputs final eval loss, perplexity, throughput, and peak
+memory.
 
-### 2. `nfra.benchmark.arena` — global-standard multi-dimension comparison
+### 2. `nfra.benchmark.overnight` — the verified multi-phase benchmark
 
 ```bash
-python -m nfra.benchmark.arena
+python -m nfra.benchmark.overnight
 ```
 
-The credible one. Answers **"who wins on which aspect"** and **"is NFRA really revolutionary?"** across:
-
-- **Quality** — eval loss & perplexity, multiple seeds (reported as **mean ± std**)
-- **Scaling** — multiple model sizes → measured **power-law slope** (bits of loss per doubling of params) + extrapolation to 100M
-- **Efficiency** — sample-efficiency AUC, parameter efficiency, est. FLOPs/token
-- **Speed** — train tok/s, ms/step, prefill & autoregressive generation tok/s, ms/token
-- **Memory** — peak training & inference GB
-- **Robustness** — eval at 2× context length, NaN/stability events
-- **Composite score** — weighted z-scores across all dimensions, plus a structured evidence-based **verdict**
+The phased, resumable run that produced the verified results above
+(`core, context, efficiency, ablate, recall, deploy, perf` phases). Answers
+"who wins on which aspect" with mean ± std over seeds, measured scaling slopes,
+inference latency, memory, and long-context extrapolation.
 
 #### Environment reference
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `NFRA_MODE` | `standard` | `quick` (150) / `standard` (600) / `rigorous` (1500 steps) |
-| `NFRA_DATA` | `synthetic` | `synthetic` or `wikitext2` (real text; requires the two local `.txt` files) |
-| `NFRA_SIZES` | `5,20` | Target model sizes in millions of params |
-| `NFRA_SEEDS` | `2` | Number of independent seeds for mean ± std |
-| `NFRA_FAMILIES` | `nfra,mamba,gpt2` | Which architectures to include |
-| `NFRA_BATCH` | auto | Override training batch size |
-| `NFRA_TARGET_PARAMS` | `20` | Target params (M) for `compare` |
-| `NFRA_DIM` | `512` | Hidden size for `compare` |
-| `NFRA_EMA` | `0` | EMA weight-averaging decay (e.g. `0.999`); eval uses averaged weights. Applied to all families for a fair head-to-head |
-| `NFRA_SURPRISE` | `0` | `1` = surprise-weighted (dopamine-RPE) gradients; mean-preserving weights. Applied to all families |
-| `NFRA_KWTA` | `0` | k-WTA lateral inhibition fraction for NFRA (e.g. `0.5`); `0` = off |
-| `NFRA_SCAN_KERNEL` | `1` | Selective-scan backend: `0` = torch closed-form, `1` = auto (Triton CUDA kernel when available), `2` = force Triton |
-| `NFRA_BANDS` | `16` | Recurrence band/head count for NFRA Brain (H8 ablation: `2,4,8,16`; `16` = hierarchical `[8,4,2,1]+router`) |
-| `NFRA_CHECKPOINT` | `1` | Gradient checkpointing; set `0` on a big GPU with small models to raise `tok/s` (recompute is overhead when memory is free) |
-| `NFRA_COMPILE` | `0` | `1` = `torch.compile(mode='reduce-overhead')` (CUDA-graph capture; kills launch overhead on small models). Auto-disables checkpointing; pair with `NFRA_SCAN_KERNEL=0` so the scan fuses instead of graph-breaking |
-| `NFRA_RECALL_KS` | `4,16,64,128` | Spans for the H3 memory-horizon probe (`python -m nfra.benchmark.recall_probe`) |
-| `NFRA_RECALL_STEPS` | `600` | Train steps per (span, model) in the recall probe |
-| `NFRA_RECALL_CONCURRENT` | `0` | `1` = train all probe (span, model) configs concurrently on separate CUDA streams (near-100% GPU util, ~one model's wall time for the whole probe) |
+| `NFRA_OVN_MODE` | `standard` | `quick` (300) / `standard` (600) / `big` (1500 steps) |
+| `NFRA_OVN_SIZES` | `5,20` | Target model sizes in millions of params |
+| `NFRA_OVN_SEEDS` | `2` | Independent seeds for mean ± std |
+| `NFRA_OVN_FAMILIES` | `nfra,rwkv,retnet,gpt2` | Architectures to include |
+| `NFRA_OVN_PHASES` | all | Comma list of phases: `core,context,efficiency,ablate,recall,deploy,perf,data2` |
+| `NFRA_OVN_DATA` | `wikitext2` | Data source (only `wikitext2` is allowed for the headline run) |
+| `NFRA_LEAN` | `1` | `0` = full 3.3b block (all gates), `1` = lean (receptance gate only) |
+| `NFRA_COMPILE` | `1` | `1` = `torch.compile(mode='reduce-overhead')` (auto-disables when unstable) |
 
 #### Outputs
 
-- `nfra_arena_results.json` — full per-seed data, config fingerprint, machine-readable verdict
-- `nfra_arena_report.md` — a publishable Markdown report with tables, scaling fits, winners-per-aspect, and the verdict
+- `overnight_results.json` — full per-seed data, config fingerprint, machine-readable verdict
+- `overnight_report.md` — a publishable Markdown report with tables, scaling fits, and per-aspect winners
 
 > Full Kaggle step-by-step guide: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**
 
 ---
 
-## 📁 Project Structure
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/OVERNIGHT_VERIFIED_RESULTS.md](docs/OVERNIGHT_VERIFIED_RESULTS.md) | All verified benchmark results + identity audit + isolation sweep |
+| [docs/BENCHMARK.md](docs/BENCHMARK.md) | Step-by-step benchmark guide (Kaggle T4) + methodology |
+| [docs/RESEARCH_PAPER.md](docs/RESEARCH_PAPER.md) | Research paper draft |
+| [docs/FUTURE_PLAN.md](docs/FUTURE_PLAN.md) | Verified roadmap and open levers |
+| [FAQ.md](docs/FAQ.md) | Frequently asked questions (usage, results, troubleshooting) |
+
+---
+
+## Project Structure
 
 ```
 nfra-2.0/
 ├── src/nfra/
 │   ├── __init__.py            # public API + metadata
 │   ├── benchmark/
-│   │   ├── compare.py         # quick head-to-head (v3)
-│   │   └── arena.py           # global-standard multi-dimension benchmark
-│   ├── core/                  # building blocks: mixers, scans, energy, neuro
+│   │   ├── compare.py         # quick head-to-head
+│   │   ├── arena.py           # shared harness (loaders, trainers, families)
+│   │   └── overnight.py       # phased, resumable multi-phase benchmark
+│   ├── core/                  # blocks: cortex.py (verified), legacy mixers
 │   ├── models/                # NFRAForCausalLM, NFRAConfig, NFRA Lite
 │   ├── training/              # trainer, losses
 │   ├── evaluation/            # metrics
-│   └── utils/                 # config, IO, dataset helpers
-├── benchmarks/                # standalone legacy benchmark scripts
-├── notebooks/                 # Kaggle / Colab notebooks
-├── docs/                      # documentation (research draft, benchmark guide)
+│   ├── kernels/               # selective-scan backend
+│   └── utils/                 # hardware info, quantization
+├── scripts/                   # research helpers (iso_sweep.py, prof_nfra.py, ...)
+├── docs/                      # documentation
 ├── examples/                  # usage examples
-├── configs/                   # YAML configs
-├── scripts/                   # helper scripts
 ├── tests/                     # unit tests
 ├── pyproject.toml             # packaging + tooling (Black, Ruff)
 ├── CONTRIBUTING.md
@@ -221,21 +279,7 @@ nfra-2.0/
 
 ---
 
-## 📚 Documentation
-
-| Doc | Contents |
-|-----|----------|
-| [docs/BENCHMARK.md](docs/BENCHMARK.md) | Full step-by-step benchmark guide (Kaggle T4) + methodology + how to read results |
-| [FAQ.md](FAQ.md) | Frequently asked questions (usage, results, comparison, troubleshooting) |
-| [docs/BRAIN_LEVERS.md](docs/BRAIN_LEVERS.md) | Design, examples, use cases, advantages, and success criteria for the seven brain-inspired levers (`local_route`, `div_norm`, `astro`, `theta`, `ach_retain`, `gain_nov`, `lora_pass`) |
-| [docs/NFRA_2.0_Research_Paper_Draft.md](docs/NFRA_2.0_Research_Paper_Draft.md) | Research paper draft |
-| [docs/PAPER_OUTLINE.md](docs/PAPER_OUTLINE.md) | Paper outline |
-| [docs/DATASETS.md](docs/DATASETS.md) | Dataset notes |
-| [INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md) | Detailed install guide |
-
----
-
-## 🛠️ Development
+## Development
 
 ```bash
 pip install -e ".[dev]"
@@ -244,9 +288,8 @@ pip install -e ".[dev]"
 ruff check src
 black --check src
 
-# Tests
-# CPU smoke tests: model construction, forward/backward, save/load IO,
-# param-scaling with unique_blocks, and the benchmark scoring math.
+# Tests (CPU smoke: model construction, forward/backward, save/load,
+# param-scaling with unique_blocks, and benchmark scoring math)
 pytest
 ```
 
@@ -256,14 +299,8 @@ pytest
 
 ---
 
-## 👤 Author & License
+## Author & License
 
 **Author:** SAURAV BHANDARI
 
 **License:** MIT — see [LICENSE](LICENSE).
-
----
-
-*"The future of AI should be measured not only by capability, but by accessibility and sustainability."*
-
-— **SAURAV BHANDARI**, July 2026

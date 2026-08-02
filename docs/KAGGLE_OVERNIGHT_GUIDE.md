@@ -1,7 +1,7 @@
-# Running the Overnight NFRA Grand Arena on Kaggle (GPU)
+# Running the Overnight NFRA Benchmark on Kaggle (GPU)
 
-This guide runs `src/nfra/benchmark/overnight.py` — the final, all-axes comparison of
-**NFRA Brain vs Mamba-SSM vs GPT-2** on **real WikiText-2** character text — on a
+This guide runs `nfra.benchmark.overnight` — the phased, all-axes comparison of
+**NFRA vs RetNet vs RWKV vs GPT-2** on **real WikiText-2** character text — on a
 Kaggle GPU session. It is designed to run unattended overnight: phases are resumable,
 each phase is wrapped in try/except, and an adaptive time budget prunes work instead
 of crashing.

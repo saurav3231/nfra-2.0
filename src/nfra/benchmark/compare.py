@@ -48,85 +48,100 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import os, sys, time, math, json, warnings, functools
-print = functools.partial(print, flush=True)
-warnings.filterwarnings('ignore', message='Detected call of .*lr_scheduler.*')
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-from typing import Dict, Optional, Tuple
+import functools
+import json
+import math
+import os
+import time
+import warnings
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+print = functools.partial(print, flush=True)
+warnings.filterwarnings("ignore", message="Detected call of .*lr_scheduler.*")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
 
 from nfra import NFRAConfig, NFRAForCausalLM
 
 # ─────────────────────────── config ───────────────────────────
-DATA_SOURCE = os.environ.get('NFRA_DATA', 'synthetic').lower()
-WIKI_PATHS = {'train': 'wikitext-train-raw-v1.txt',
-              'validation': 'wikitext-valid-raw-v1.txt'}
-if DATA_SOURCE == 'wikitext2':
+DATA_SOURCE = os.environ.get("NFRA_DATA", "synthetic").lower()
+WIKI_PATHS = {
+    "train": "wikitext-train-raw-v1.txt",
+    "validation": "wikitext-valid-raw-v1.txt",
+}
+if DATA_SOURCE == "wikitext2":
     missing = [f for f in WIKI_PATHS.values() if not os.path.exists(f)]
     if missing:
-        print(f"  [warn] wikitext2 files missing ({', '.join(missing)}) — "
-              "falling back to synthetic")
-        print("         download from huggingface.co/datasets/Salesforce/wikitext "
-              "(wikitext-2-raw-v1)")
-        DATA_SOURCE = 'synthetic'
+        print(
+            f"  [warn] wikitext2 files missing ({', '.join(missing)}) — "
+            "falling back to synthetic"
+        )
+        print(
+            "         download from huggingface.co/datasets/Salesforce/wikitext "
+            "(wikitext-2-raw-v1)"
+        )
+        DATA_SOURCE = "synthetic"
 
-STEP_CFG = {'quick': 150, 'standard': 600, 'rigorous': 1500}
-MODE = os.environ.get('NFRA_MODE', 'standard')
-STEPS = int(os.environ.get('NFRA_STEPS', STEP_CFG[MODE]))
-TARGET_M = float(os.environ.get('NFRA_TARGET_PARAMS', '20'))
-DIM = int(os.environ.get('NFRA_DIM', '512'))
+STEP_CFG = {"quick": 150, "standard": 600, "rigorous": 1500}
+MODE = os.environ.get("NFRA_MODE", "standard")
+STEPS = int(os.environ.get("NFRA_STEPS", STEP_CFG[MODE]))
+TARGET_M = float(os.environ.get("NFRA_TARGET_PARAMS", "20"))
+DIM = int(os.environ.get("NFRA_DIM", "512"))
 # NFRA 3.2 feature toggles (applied to ALL families when enabled, so the
 # head-to-head stays fair): EMA weight averaging for eval, surprise-weighted
 # (RPE) gradients, and k-WTA lateral inhibition (NFRA architecture only).
-EMA_DECAY = float(os.environ.get('NFRA_EMA', '0'))          # 0 = off
-SURPRISE = os.environ.get('NFRA_SURPRISE', '0') == '1'      # 1 = on
-KWTA = float(os.environ.get('NFRA_KWTA', '0'))              # 0.0 = off
-LOCAL_ROUTE = os.environ.get('NFRA_LOCALROUTE', '0') == '1'
-DIV_NORM = os.environ.get('NFRA_DIVNORM', '0') == '1'
-ASTRO = os.environ.get('NFRA_ASTRO', '0') == '1'
-THETA = os.environ.get('NFRA_THETA', '0') == '1'
-ACH_RETAIN = os.environ.get('NFRA_ACH_RETAIN', '0') == '1'
-GAIN_NOV = os.environ.get('NFRA_GAIN_NOV', '0') == '1'
-LORA_RANK = int(os.environ.get('NFRA_LORA_RANK', '0'))     # 0 = off (Space axis)
+EMA_DECAY = float(os.environ.get("NFRA_EMA", "0"))  # 0 = off
+SURPRISE = os.environ.get("NFRA_SURPRISE", "0") == "1"  # 1 = on
+KWTA = float(os.environ.get("NFRA_KWTA", "0"))  # 0.0 = off
+LOCAL_ROUTE = os.environ.get("NFRA_LOCALROUTE", "0") == "1"
+DIV_NORM = os.environ.get("NFRA_DIVNORM", "0") == "1"
+ASTRO = os.environ.get("NFRA_ASTRO", "0") == "1"
+THETA = os.environ.get("NFRA_THETA", "0") == "1"
+ACH_RETAIN = os.environ.get("NFRA_ACH_RETAIN", "0") == "1"
+GAIN_NOV = os.environ.get("NFRA_GAIN_NOV", "0") == "1"
+LORA_RANK = int(os.environ.get("NFRA_LORA_RANK", "0"))  # 0 = off (Space axis)
 D_STATE = 8
-NFRA_DEPTH = 12                      # effective NFRA depth (unique × passes)
+NFRA_DEPTH = 12  # effective NFRA depth (unique × passes)
 EVAL_GAP = max(50, STEPS // 6)
 SEQ_LEN = 256
 SEED = 42
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-HAS_CUDA = DEVICE.type == 'cuda'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HAS_CUDA = DEVICE.type == "cuda"
 USE_AMP = False
 BATCH = 8
 if HAS_CUDA:
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision("medium")
     cc = torch.cuda.get_device_capability(0)
     if cc >= (8, 0):
-        USE_AMP = True; AMP_DTYPE = torch.bfloat16
+        USE_AMP = True
+        AMP_DTYPE = torch.bfloat16
     elif cc >= (7, 0):
-        USE_AMP = True; AMP_DTYPE = torch.float16
+        USE_AMP = True
+        AMP_DTYPE = torch.float16
     gmem = torch.cuda.get_device_properties(0).total_memory / 1e9
     BATCH = 48 if gmem >= 70 else 32 if gmem >= 35 else 8 if gmem >= 14 else 4
-    if DATA_SOURCE == 'wikitext2' and BATCH > 8 and gmem < 20:
+    if DATA_SOURCE == "wikitext2" and BATCH > 8 and gmem < 20:
         # Mamba is out of the default grid and nfra's cumsum mixer + distinct
         # shallow blocks are memory-light, so batch 8 fits every family on a
         # 14.5 GB T4 (overnight frees non-cached models between runs). nfra is
         # launch-bound at batch 4 — bigger batches are a free tok/s win.
         BATCH = 8
-    BATCH = int(os.environ.get('NFRA_BATCH', BATCH))
+    BATCH = int(os.environ.get("NFRA_BATCH", BATCH))
 else:
     BATCH = 4
-    STEPS = min(STEPS, 80); EVAL_GAP = max(20, STEPS // 4)
+    STEPS = min(STEPS, 80)
+    EVAL_GAP = max(20, STEPS // 4)
     print("  [warn] CPU mode - few steps, speed numbers are not representative")
 
-torch.manual_seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 
 # ─────────────────────────── data ───────────────────────────
@@ -135,7 +150,9 @@ class HierarchicalDataset(Dataset):
     Distribution (bigram/topic matrices) is fixed by `seed`; `seq_seed`
     controls only the sampled sequences, so train and eval share the SAME
     underlying distribution (otherwise eval is unlearnable out-of-distribution)."""
+
     VOCAB_SIZE = 4096
+
     def __init__(self, num_seqs, seq_len, seed=0, seq_seed=None):
         super().__init__()
         self.seq_len = seq_len
@@ -156,35 +173,137 @@ class HierarchicalDataset(Dataset):
         tc = torch.from_numpy(self._topic_trans).cumsum(1)
         ec = torch.from_numpy(self._topic_emit).cumsum(1)
         bc = torch.from_numpy(self._bigram).cumsum(1)
+
         def sample(cdf, rows):
             return torch.searchsorted(cdf[rows], torch.rand(len(rows), 1)).squeeze(-1)
+
         data = np.empty((num_seqs, seq_len), dtype=np.int64)
-        topics = torch.randint(32, (num_seqs,)); prev = torch.randint(V, (num_seqs,))
+        topics = torch.randint(32, (num_seqs,))
+        prev = torch.randint(V, (num_seqs,))
         for t in range(seq_len):
             e = torch.nonzero(torch.rand(num_seqs) < 0.1).flatten()
-            if len(e): topics[e] = sample(tc, topics[e])
+            if len(e):
+                topics[e] = sample(tc, topics[e])
             emit = torch.rand(num_seqs) < 0.3
-            e = torch.nonzero(emit).flatten(); b = torch.nonzero(~emit).flatten()
+            e = torch.nonzero(emit).flatten()
+            b = torch.nonzero(~emit).flatten()
             tok = torch.empty(num_seqs, dtype=torch.long)
-            if len(e): tok[e] = sample(ec, topics[e])
-            if len(b): tok[b] = sample(bc, prev[b])
-            data[:, t] = tok.numpy(); prev = tok
+            if len(e):
+                tok[e] = sample(ec, topics[e])
+            if len(b):
+                tok[b] = sample(bc, prev[b])
+            data[:, t] = tok.numpy()
+            prev = tok
         return data
-    def __len__(self): return len(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
     def __getitem__(self, idx):
-        return (torch.from_numpy(self.data[idx, :-1]),
-                torch.from_numpy(self.data[idx, 1:]))
+        return (
+            torch.from_numpy(self.data[idx, :-1]),
+            torch.from_numpy(self.data[idx, 1:]),
+        )
 
 
 # ─────────────────────────── WikiText-2 (char) ───────────────────────────
-CHAR_VOCAB = ['\n', ' ', '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+',
-              ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8',
-              '9', ':', ';', '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E',
-              'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
-              'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_',
-              'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
-              'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-              '{', '|', '}', '~']
+CHAR_VOCAB = [
+    "\n",
+    " ",
+    "!",
+    '"',
+    "#",
+    "$",
+    "%",
+    "&",
+    "'",
+    "(",
+    ")",
+    "*",
+    "+",
+    ",",
+    "-",
+    ".",
+    "/",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    ":",
+    ";",
+    "<",
+    "=",
+    ">",
+    "?",
+    "@",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "[",
+    "\\",
+    "]",
+    "^",
+    "_",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "{",
+    "|",
+    "}",
+    "~",
+]
 CHAR2IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
 
 
@@ -192,17 +311,17 @@ class WikiText2Dataset(Dataset):
     """Character-level WikiText-2 language modeling dataset (real text).
     Reads the raw .txt files directly (no `datasets`/scipy dependency)."""
 
-    def __init__(self, split: str = 'train', seq_len: int = 256):
+    def __init__(self, split: str = "train", seq_len: int = 256):
         super().__init__()
         self.seq_len = seq_len
         path = WIKI_PATHS[split]
-        print(f"  └- Loading WikiText-2 ({split}: {path})...", end=' ')
-        with open(path, encoding='utf-8') as f:
+        print(f"  └- Loading WikiText-2 ({split}: {path})...", end=" ")
+        with open(path, encoding="utf-8") as f:
             full_text = f.read()
         ids = [CHAR2IDX.get(c, 0) for c in full_text]
         self.data = torch.tensor(ids, dtype=torch.long)
         self.num_seqs = len(self.data) // seq_len
-        self.data = self.data[:self.num_seqs * seq_len + 1]
+        self.data = self.data[: self.num_seqs * seq_len + 1]
         print(f"{self.num_seqs} seqs of {seq_len}")
 
     def __len__(self):
@@ -210,21 +329,35 @@ class WikiText2Dataset(Dataset):
 
     def __getitem__(self, idx):
         start = idx * self.seq_len
-        return (self.data[start:start + self.seq_len],
-                self.data[start + 1:start + self.seq_len + 1])
+        return (
+            self.data[start : start + self.seq_len],
+            self.data[start + 1 : start + self.seq_len + 1],
+        )
 
 
 # ─────────────────────────── models ───────────────────────────
 def make_nfra(vocab, dim, unique_blocks, k_wta=None):
     if k_wta is None:
         k_wta = KWTA
-    cfg = NFRAConfig(mode='brain', vocab_size=vocab, hidden_size=dim,
-                     num_layers=NFRA_DEPTH, n_bands=16, dropout=0.1,
-                     depth_shared=True, unique_blocks=unique_blocks,
-                     gradient_checkpointing=True, k_wta_frac=k_wta,
-                     local_route=LOCAL_ROUTE, div_norm=DIV_NORM, astro=ASTRO,
-                     theta=THETA, ach_retain=ACH_RETAIN, gain_nov=GAIN_NOV,
-                     lora_rank=LORA_RANK)
+    cfg = NFRAConfig(
+        mode="brain",
+        vocab_size=vocab,
+        hidden_size=dim,
+        num_layers=NFRA_DEPTH,
+        n_bands=16,
+        dropout=0.1,
+        depth_shared=True,
+        unique_blocks=unique_blocks,
+        gradient_checkpointing=True,
+        k_wta_frac=k_wta,
+        local_route=LOCAL_ROUTE,
+        div_norm=DIV_NORM,
+        astro=ASTRO,
+        theta=THETA,
+        ach_retain=ACH_RETAIN,
+        gain_nov=GAIN_NOV,
+        lora_rank=LORA_RANK,
+    )
     return NFRAForCausalLM(cfg)
 
 
@@ -249,20 +382,21 @@ def mamba_scan(a, b, chunk=256):
     sensitive; fp16 can overflow and NaN the loss), each chunk gradient-
     checkpointed so backward never holds more than one chunk."""
     orig_dtype = a.dtype
-    a = a.float(); b = b.float()
+    a = a.float()
+    b = b.float()
     B, _, S, D = a.shape
     n = math.ceil(S / chunk)
     pad = n * chunk - S
     if pad:
         a = F.pad(a, (0, 0, 0, pad), value=1.0)
         b = F.pad(b, (0, 0, 0, pad), value=0.0)
-    a = a.reshape(B, 1, n, chunk, D); b = b.reshape(B, 1, n, chunk, D)
+    a = a.reshape(B, 1, n, chunk, D)
+    b = b.reshape(B, 1, n, chunk, D)
     ckpt = torch.utils.checkpoint.checkpoint
     h = torch.zeros(B, D, device=a.device)
     outs = []
     for c in range(n):
-        a_rel, b_rel = ckpt(hillis_prefix, a[:, :, c], b[:, :, c],
-                            use_reentrant=False)
+        a_rel, b_rel = ckpt(hillis_prefix, a[:, :, c], b[:, :, c], use_reentrant=False)
         out = a_rel * h.view(B, 1, 1, D) + b_rel
         h = out[:, :, -1, :].squeeze(1)
         outs.append(out)
@@ -273,19 +407,23 @@ class MambaBlock(nn.Module):
     """Mamba v1: conv1d + input-dependent selective SSM (pure PyTorch),
     with pre-LayerNorm so activations stay bounded without the official
     CUDA kernel (required for stable fp32/AMP training)."""
+
     def __init__(self, dim, d_state=8, d_conv=4, expand=2):
         super().__init__()
         d_inner = expand * dim
         self.d_inner, self.d_state = d_inner, d_state
         self.norm = nn.LayerNorm(dim)
         self.in_proj = nn.Linear(dim, d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, groups=d_inner,
-                                padding=d_conv - 1, bias=True)
+        self.conv1d = nn.Conv1d(
+            d_inner, d_inner, d_conv, groups=d_inner, padding=d_conv - 1, bias=True
+        )
         self.x_proj = nn.Linear(d_inner, 3 * d_state, bias=False)
         self.dt_proj = nn.Linear(d_state, d_inner, bias=True)
         with torch.no_grad():
             self.dt_proj.bias.copy_(torch.log(torch.full_like(self.dt_proj.bias, 0.1)))
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32)))
+        self.A_log = nn.Parameter(
+            torch.log(torch.arange(1, d_state + 1, dtype=torch.float32))
+        )
         self.D = nn.Parameter(torch.randn(d_inner))
         self.out_proj = nn.Linear(d_inner, dim, bias=False)
 
@@ -293,7 +431,7 @@ class MambaBlock(nn.Module):
         x_dtype = x.dtype
         x = x.float()
         with torch.autocast(device_type=DEVICE.type, enabled=False):
-            B, S, D = x.shape
+            B, S, _D = x.shape
             N, E = self.d_state, self.d_inner
             x = self.norm(x)
             x, z = self.in_proj(x).chunk(2, dim=-1)
@@ -321,11 +459,12 @@ class MambaLM(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+
     def forward(self, input_ids, **kw):
         x = self.embed(input_ids)
         for blk in self.blocks:
             x = x + blk(x)
-        return {'logits': self.lm_head(self.norm(x))}
+        return {"logits": self.lm_head(self.norm(x))}
 
 
 class GPT2Attention(nn.Module):
@@ -334,13 +473,14 @@ class GPT2Attention(nn.Module):
         self.n_heads, self.head_dim = n_heads, dim // n_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
+
     def forward(self, x):
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
         qkv = self.qkv(x).view(B, S, 3, H, Hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd ** 0.5)
-        causal = torch.triu(torch.full((S, S), float('-inf'), device=x.device), 1)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (Hd**0.5)
+        causal = torch.triu(torch.full((S, S), float("-inf"), device=x.device), 1)
         attn = F.softmax(scores + causal, dim=-1)
         return self.out(torch.matmul(attn, v).permute(0, 2, 1, 3).reshape(B, S, D))
 
@@ -355,6 +495,7 @@ class GPT2Block(nn.Module):
         self.fc1 = nn.Linear(dim, h, bias=False)
         self.fc2 = nn.Linear(h, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         x = x + self.dropout(self.attn(self.ln1(x)))
         x = x + self.dropout(self.fc2(F.gelu(self.fc1(self.ln2(x)))))
@@ -362,22 +503,27 @@ class GPT2Block(nn.Module):
 
 
 class GPT2ForCausalLM(nn.Module):
-    def __init__(self, vocab_size, dim=512, n_layers=6, n_heads=8, dropout=0.1,
-                 pos_len=8192):
+    def __init__(
+        self, vocab_size, dim=512, n_layers=6, n_heads=8, dropout=0.1, pos_len=8192
+    ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(pos_len, dim)
-        self.blocks = nn.ModuleList([GPT2Block(dim, n_heads, dropout)
-                                     for _ in range(n_layers)])
+        self.blocks = nn.ModuleList(
+            [GPT2Block(dim, n_heads, dropout) for _ in range(n_layers)]
+        )
         self.ln_f = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+
     def forward(self, input_ids, **kw):
-        B, S = input_ids.shape
-        x = self.embed(input_ids) + self.pos_embed(torch.arange(S, device=input_ids.device))
+        _B, S = input_ids.shape
+        x = self.embed(input_ids) + self.pos_embed(
+            torch.arange(S, device=input_ids.device)
+        )
         for blk in self.blocks:
             x = blk(x)
-        return {'logits': self.lm_head(self.ln_f(x))}
+        return {"logits": self.lm_head(self.ln_f(x))}
 
 
 class RWKVBlock(nn.Module):
@@ -388,9 +534,12 @@ class RWKVBlock(nn.Module):
     cumsums — O(S) pure-torch ops, no associative scan — which is why RWKV
     trains much faster than Mamba's selective SSM here.
     """
+
     def __init__(self, dim, dropout=0.1):
         super().__init__()
-        self.ln1 = nn.LayerNorm(dim)          # pre-norm: bounds k/v so fp16 AMP linears stay finite
+        self.ln1 = nn.LayerNorm(
+            dim
+        )  # pre-norm: bounds k/v so fp16 AMP linears stay finite
         self.time_mix_k = nn.Parameter(torch.ones(dim))
         self.time_mix_v = nn.Parameter(torch.ones(dim))
         self.time_mix_r = nn.Parameter(torch.ones(dim))
@@ -398,8 +547,8 @@ class RWKVBlock(nn.Module):
         self.value = nn.Linear(dim, dim, bias=False)
         self.receptance = nn.Linear(dim, dim, bias=False)
         self.output = nn.Linear(dim, dim, bias=False)
-        self.time_decay = nn.Parameter(torch.zeros(dim))   # w = exp(-exp(lw)) ~ 0.37
-        self.time_first = nn.Parameter(torch.randn(dim))   # current-token bonus
+        self.time_decay = nn.Parameter(torch.zeros(dim))  # w = exp(-exp(lw)) ~ 0.37
+        self.time_first = nn.Parameter(torch.randn(dim))  # current-token bonus
         self.ln2 = nn.LayerNorm(dim)
         self.time_mix_cm = nn.Parameter(torch.ones(dim))
         self.time_mix_r2 = nn.Parameter(torch.ones(dim))
@@ -410,7 +559,7 @@ class RWKVBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B, S, D = x.shape
+        _B, S, D = x.shape
         xn = self.ln1(x)
         x_shift = F.pad(xn[:, :-1, :], (0, 0, 1, 0))
         # ── time mixing (linear attention, WKV recurrence)
@@ -422,8 +571,12 @@ class RWKVBlock(nn.Module):
         r = torch.sigmoid(self.receptance(xr))
         # WKV recurrence is numerically delicate (exp decay + long cumsum):
         # cast to fp32 like mamba_scan so fp16 AMP can't overflow to NaN.
-        k = k.float(); v = v.float(); r = r.float()
-        w = torch.exp(-torch.exp(self.time_decay.float())).clamp(max=1.0)  # [D] in (0,1]
+        k = k.float()
+        v = v.float()
+        r = r.float()
+        w = torch.exp(-torch.exp(self.time_decay.float())).clamp(
+            max=1.0
+        )  # [D] in (0,1]
         t = torch.arange(S, device=x.device).float()
         wpos = torch.clamp(w.view(1, 1, D) * t.view(1, S, 1), -60, 60)
         e = torch.exp(wpos)
@@ -444,8 +597,10 @@ class RWKVBlock(nn.Module):
         xk2 = x2 * self.time_mix_cm + x2_shift * (1 - self.time_mix_cm)
         xr2 = x2 * self.time_mix_r2 + x2_shift * (1 - self.time_mix_r2)
         kk = self.cm_key(xk2)
-        y2 = self.cm_output(torch.sigmoid(self.cm_receptance(xr2))
-                            * (F.relu(kk).float() ** 2 * self.cm_value(xk2)))
+        y2 = self.cm_output(
+            torch.sigmoid(self.cm_receptance(xr2))
+            * (F.relu(kk).float() ** 2 * self.cm_value(xk2))
+        )
         return x + self.dropout(y2)
 
 
@@ -453,16 +608,16 @@ class RWKVLM(nn.Module):
     def __init__(self, vocab_size, dim, n_layers, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        self.blocks = nn.ModuleList([RWKVBlock(dim, dropout)
-                                     for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([RWKVBlock(dim, dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+
     def forward(self, input_ids, **kw):
         x = self.embed(input_ids)
         for blk in self.blocks:
             x = blk(x)
-        return {'logits': self.lm_head(self.ln_f(x))}
+        return {"logits": self.lm_head(self.ln_f(x))}
 
 
 class RetNetAttention(nn.Module):
@@ -471,6 +626,7 @@ class RetNetAttention(nn.Module):
     GroupNorm over head groups. O(S^2) matmul like attention but no softmax —
     fast and stable in pure torch.
     """
+
     def __init__(self, dim, n_heads):
         super().__init__()
         self.n_heads, self.head_dim = n_heads, dim // n_heads
@@ -482,18 +638,22 @@ class RetNetAttention(nn.Module):
         # (log_decay +3 -> gamma ~2e-9, local only). A uniform -1 gives every
         # head gamma^255 ~ 1e-42, i.e. no usable long-range memory.
         self.log_decay = nn.Parameter(torch.linspace(-5.0, 3.0, n_heads))
+
     def forward(self, x):
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
         qkv = self.qkv(x).view(B, S, 3, H, Hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         gamma = torch.exp(-torch.exp(self.log_decay)).view(1, H, 1, 1)
-        rel = (torch.arange(S, device=x.device).float().view(S, 1)
-               - torch.arange(S, device=x.device).float().view(1, S)).clamp(min=0)
-        decay = gamma ** rel
-        decay = decay.masked_fill(torch.triu(
-            torch.ones(S, S, device=x.device, dtype=torch.bool), 1), 0.0)
-        y = torch.matmul((q * Hd ** -0.5), k.transpose(-2, -1))
+        rel = (
+            torch.arange(S, device=x.device).float().view(S, 1)
+            - torch.arange(S, device=x.device).float().view(1, S)
+        ).clamp(min=0)
+        decay = gamma**rel
+        decay = decay.masked_fill(
+            torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), 1), 0.0
+        )
+        y = torch.matmul((q * Hd**-0.5), k.transpose(-2, -1))
         y = torch.matmul(y * decay, v)
         y = y.permute(0, 2, 1, 3).reshape(B, S, D)
         y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
@@ -510,6 +670,7 @@ class RetNetBlock(nn.Module):
         self.fc1 = nn.Linear(dim, h, bias=False)
         self.fc2 = nn.Linear(h, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         x = x + self.dropout(self.ret(self.ln1(x)))
         x = x + self.dropout(self.fc2(F.silu(self.fc1(self.ln2(x)))))
@@ -520,20 +681,24 @@ class RetNetLM(nn.Module):
     def __init__(self, vocab_size, dim, n_layers, n_heads=8, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        self.blocks = nn.ModuleList([RetNetBlock(dim, n_heads, dropout)
-                                     for _ in range(n_layers)])
+        self.blocks = nn.ModuleList(
+            [RetNetBlock(dim, n_heads, dropout) for _ in range(n_layers)]
+        )
         self.ln_f = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
+
     def forward(self, input_ids, **kw):
         x = self.embed(input_ids)
         for blk in self.blocks:
             x = blk(x)
-        return {'logits': self.lm_head(self.ln_f(x))}
+        return {"logits": self.lm_head(self.ln_f(x))}
 
 
 # ─────────────────────────── helpers ───────────────────────────
-def count_params(m): return sum(p.numel() for p in m.parameters())
+def count_params(m):
+    return sum(p.numel() for p in m.parameters())
+
 
 def rescale_embed(model, std=0.02):
     """Scale the tied embedding/lm_head to GPT-2-style init so every model
@@ -544,9 +709,10 @@ def rescale_embed(model, std=0.02):
                 m.weight.mul_(std / max(m.weight.std(), 1e-8))
                 break
 
+
 def tune_layers(make_fn, target, vocab):
     """Pick layer count landing closest to the target param budget."""
-    best = (1, float('inf'))
+    best = (1, float("inf"))
     prev, plateau = None, 0
     for L in range(1, 64):
         p = count_params(make_fn(vocab, DIM, L))
@@ -562,6 +728,7 @@ def tune_layers(make_fn, target, vocab):
             plateau = 0
         prev = p
     return best
+
 
 def tune_nfra(make_fn, target, vocab, depth, min_dim=224):
     """Jointly tune NFRA unique_blocks and hidden dim so it lands near the
@@ -584,13 +751,17 @@ def tune_nfra(make_fn, target, vocab, depth, min_dim=224):
         return 1, DIM, count_params(make_fn(vocab, DIM, 1))
     return best[1], best[2], best[3]
 
+
 def make_optimizer(model, lr=3e-4, warmup=50, total=STEPS):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95))
+
     def sched(step):
         if step < warmup:
             return step / max(warmup, 1)
         return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))
+
     return opt, torch.optim.lr_scheduler.LambdaLR(opt, sched)
+
 
 class EMA:
     """Exponential moving average of model weights (zero-cost at inference).
@@ -604,7 +775,8 @@ class EMA:
         self.decay = decay
         self.shadow = {
             k: v.detach().clone().float()
-            for k, v in model.named_parameters() if v.requires_grad
+            for k, v in model.named_parameters()
+            if v.requires_grad
         }
         self._backup = {}
 
@@ -616,14 +788,14 @@ class EMA:
                 # Never let a NaN/Inf spike permanently infect the shadow:
                 # skip the update for that tensor if it is not finite.
                 if torch.isfinite(w).all():
-                    self.shadow[k].mul_(self.decay).add_(w,
-                                                         alpha=1.0 - self.decay)
+                    self.shadow[k].mul_(self.decay).add_(w, alpha=1.0 - self.decay)
 
     @torch.no_grad()
     def apply(self, model):
         self._backup = {
             k: v.detach().clone()
-            for k, v in model.named_parameters() if k in self.shadow
+            for k, v in model.named_parameters()
+            if k in self.shadow
         }
         for k, v in model.named_parameters():
             if k in self.shadow:
@@ -639,17 +811,17 @@ class EMA:
 
 def compute_loss(model, x, y, surprise: bool = False):
     out = model(x)
-    logits = out['logits']
+    logits = out["logits"]
     logits = logits.view(-1, logits.size(-1))
     targets = y.view(-1)
     logp = logits.log_softmax(-1)
-    ce = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)   # [N]
+    ce = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [N]
     if surprise:
         # Dopamine-style reward-prediction-error weighting: tokens where the
         # model was wrong/unsure (low P(correct) → high surprise) get higher
         # gradient weight. Weights are normalized to mean 1, so the effective
         # learning rate is unchanged (mean-preserving).
-        w = 1.0 - torch.exp(-ce)                                # surprise in (0,1)
+        w = 1.0 - torch.exp(-ce)  # surprise in (0,1)
         w = w / (w.mean() + 1e-6)
         loss = (ce * w).mean()
     else:
@@ -657,25 +829,29 @@ def compute_loss(model, x, y, surprise: bool = False):
     # NFRA 3.3 Cortex: additive adaptive-compute regularizer from the exit gate
     # (easy tokens exit early, hard tokens spend all depth passes). None for
     # every other family, so the head-to-head cost is unchanged.
-    if 'exit_aux' in out:
-        loss = loss + out['exit_aux']
+    if "exit_aux" in out:
+        loss = loss + out["exit_aux"]
     return loss
+
 
 @torch.no_grad()
 def evaluate(model, loader, max_batches=15):
     model.eval()
     total, n = 0.0, 0
     for i, (x, y) in enumerate(loader):
-        if i >= max_batches: break
+        if i >= max_batches:
+            break
         x, y = x.to(DEVICE), y.to(DEVICE)
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
             loss = compute_loss(model, x, y)
-        total += loss.item() * x.size(0); n += x.size(0)
+        total += loss.item() * x.size(0)
+        n += x.size(0)
     model.train()
     # Empty / too-short loader: report inf, never a silent "perfect" 0.0.
     if n == 0:
-        return float('inf')
+        return float("inf")
     return total / n
+
 
 def measure_speed_memory(model, vocab, n_steps=10):
     x = torch.randint(0, vocab, (BATCH, SEQ_LEN), device=DEVICE)
@@ -684,16 +860,20 @@ def measure_speed_memory(model, vocab, n_steps=10):
     scaler = torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None
     if HAS_CUDA:
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(n_steps):
         opt.zero_grad()
         with torch.amp.autocast(device_type=DEVICE.type, enabled=USE_AMP):
             loss = compute_loss(model, x, y)
         if scaler:
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
         else:
-            loss.backward(); opt.step()
+            loss.backward()
+            opt.step()
     if HAS_CUDA:
         torch.cuda.synchronize()
     tok_s = BATCH * SEQ_LEN * n_steps / (time.perf_counter() - t0)
@@ -705,8 +885,9 @@ def measure_speed_memory(model, vocab, n_steps=10):
 def fmt_loss(v):
     return f"{v:7.2f}"
 
+
 def main():
-    use_wiki = DATA_SOURCE == 'wikitext2'
+    use_wiki = DATA_SOURCE == "wikitext2"
     VOCAB = 96 if use_wiki else 4096
     RANDOM_LOSS = math.log(VOCAB)
     target = int(TARGET_M * 1e6)
@@ -716,11 +897,15 @@ def main():
     print("  apples-to-apples  •  matched params  •  identical training")
     print("=" * 66)
     print(f"  bench   : v3 (in-package, local-txt wikitext2)   — {DATA_SOURCE}")
-    print(f"  data    : {'WikiText-2 (char)' if use_wiki else 'Synthetic hierarchical'}")
+    print(
+        f"  data    : {'WikiText-2 (char)' if use_wiki else 'Synthetic hierarchical'}"
+    )
     print(f"  vocab   : {VOCAB}    dim: {DIM}    seq_len: {SEQ_LEN}")
     print(f"  params  : ~{TARGET_M:.0f}M    steps: {STEPS}    batch: {BATCH}")
-    print(f"  device  : {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'}"
-          + ("   (fp16 AMP)" if USE_AMP else ""))
+    print(
+        f"  device  : {'GPU ' + torch.cuda.get_device_name(0) if HAS_CUDA else 'CPU'}"
+        + ("   (fp16 AMP)" if USE_AMP else "")
+    )
     feats = []
     if EMA_DECAY > 0:
         feats.append(f"EMA={EMA_DECAY}")
@@ -729,36 +914,44 @@ def main():
     if KWTA > 0:
         feats.append(f"k-WTA={KWTA}")
     if feats:
-        print(f"  features: {', '.join(feats)}  (NFRA 3.2 toggles; apply to all families)")
+        print(
+            f"  features: {', '.join(feats)}  (NFRA 3.2 toggles; apply to all families)"
+        )
     print("=" * 66)
 
     # ── data
-    print("\n[1/5] Generating data ... ", end='')
+    print("\n[1/5] Generating data ... ", end="")
     if use_wiki:
-        train_ds = WikiText2Dataset('train', SEQ_LEN)
-        eval_ds = WikiText2Dataset('validation', SEQ_LEN)
+        train_ds = WikiText2Dataset("train", SEQ_LEN)
+        eval_ds = WikiText2Dataset("validation", SEQ_LEN)
     else:
-        train_ds = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1,
-                                       seed=SEED, seq_seed=SEED)
-        eval_ds = HierarchicalDataset(512, SEQ_LEN + 1,
-                                      seed=SEED, seq_seed=SEED + 1)
-    train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
-                              num_workers=0, pin_memory=HAS_CUDA)
-    eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False,
-                             num_workers=0, pin_memory=HAS_CUDA)
+        train_ds = HierarchicalDataset(
+            max(4096, BATCH * 8), SEQ_LEN + 1, seed=SEED, seq_seed=SEED
+        )
+        eval_ds = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED, seq_seed=SEED + 1)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH, shuffle=True, num_workers=0, pin_memory=HAS_CUDA
+    )
+    eval_loader = DataLoader(
+        eval_ds, batch_size=BATCH, shuffle=False, num_workers=0, pin_memory=HAS_CUDA
+    )
     print("done")
 
     # ── build models, matched on params
-    print("\n[2/5] Building models (param-matched to ~%.0fM) ..." % TARGET_M)
+    print(f"\n[2/5] Building models (param-matched to ~{TARGET_M:.0f}M) ...")
 
     U, n_dim, p_n = tune_nfra(make_nfra, target, VOCAB, NFRA_DEPTH)
     nfra = make_nfra(VOCAB, n_dim, U).to(DEVICE)
     rescale_embed(nfra)
     n_passes = NFRA_DEPTH // U
-    print(f"    ✓ NFRA Brain   {p_n/1e6:6.1f}M   {U} unique blocks x {n_passes} passes "
-          f"= {NFRA_DEPTH} effective layers (dim {n_dim})")
+    print(
+        f"    ✓ NFRA Brain   {p_n/1e6:6.1f}M   {U} unique blocks x {n_passes} passes "
+        f"= {NFRA_DEPTH} effective layers (dim {n_dim})"
+    )
 
-    L_m, p_m = tune_layers(lambda v, d, L: MambaLM(v, d, L, d_state=D_STATE), target, VOCAB)
+    L_m, p_m = tune_layers(
+        lambda v, d, L: MambaLM(v, d, L, d_state=D_STATE), target, VOCAB
+    )
     mamba = MambaLM(VOCAB, DIM, L_m, d_state=D_STATE).to(DEVICE)
     rescale_embed(mamba)
     print(f"    ✓ Mamba SSM    {p_m/1e6:6.1f}M   {L_m} layers (d_state={D_STATE})")
@@ -768,7 +961,7 @@ def main():
     rescale_embed(gpt2)
     print(f"    ✓ GPT-2        {p_g/1e6:6.1f}M   {L_g} layers")
 
-    models = {'NFRA Brain': nfra, 'Mamba SSM': mamba, 'GPT-2': gpt2}
+    models = {"NFRA Brain": nfra, "Mamba SSM": mamba, "GPT-2": gpt2}
 
     # ── throughput + memory
     print("\n[3/5] Measuring throughput + peak memory ...")
@@ -776,32 +969,44 @@ def main():
     for name, m in models.items():
         m.train()
         tok_s, mem = measure_speed_memory(m, VOCAB)
-        perf[name] = {'tok_s': int(tok_s), 'mem': mem}
+        perf[name] = {"tok_s": int(tok_s), "mem": mem}
         print(f"    {name:<11s} {int(tok_s):>9,d} tok/s    peak {mem:.2f} GB")
 
     # ── training
     print(f"\n[4/5] Training {STEPS} steps (AdamW 3e-4, warmup + cosine)...")
-    history = {n: {'loss': [], 'eval': []} for n in models}
+    history = {n: {"loss": [], "eval": []} for n in models}
     opts = {n: make_optimizer(m) for n, m in models.items()}
     # One identically-seeded DataLoader per model => every family consumes
     # byte-identical batches at the same step (fair head-to-head). Sharing a
     # single loader's iterator would draw offset batches from one RNG.
     loaders = {
-        n: iter(DataLoader(train_ds, batch_size=BATCH, shuffle=True,
-                           generator=torch.Generator().manual_seed(SEED),
-                           num_workers=0, pin_memory=HAS_CUDA))
+        n: iter(
+            DataLoader(
+                train_ds,
+                batch_size=BATCH,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(SEED),
+                num_workers=0,
+                pin_memory=HAS_CUDA,
+            )
+        )
         for n in models
     }
-    scalers = {n: (torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None) for n in models}
+    scalers = {
+        n: (torch.amp.GradScaler(str(DEVICE)) if USE_AMP else None) for n in models
+    }
     step_ms = {n: [] for n in models}
-    emas = {n: (EMA(m, EMA_DECAY) if EMA_DECAY > 0 else None) for n, m in models.items()}
+    emas = {
+        n: (EMA(m, EMA_DECAY) if EMA_DECAY > 0 else None) for n, m in models.items()
+    }
 
     for step in range(1, STEPS + 1):
         for name, m in models.items():
             try:
                 x, y = next(loaders[name])
             except StopIteration:
-                loaders[name] = iter(train_loader); x, y = next(loaders[name])
+                loaders[name] = iter(train_loader)
+                x, y = next(loaders[name])
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt, sched = opts[name]
             opt.zero_grad()
@@ -814,7 +1019,8 @@ def main():
                 gnorm = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
                 if not math.isfinite(gnorm):
                     opt.zero_grad(set_to_none=True)
-                scalers[name].step(opt); scalers[name].update()
+                scalers[name].step(opt)
+                scalers[name].update()
             else:
                 loss.backward()
                 gnorm = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
@@ -828,7 +1034,7 @@ def main():
             sched.step()
             if emas[name] is not None:
                 emas[name].update(m)
-            history[name]['loss'].append(loss.item())
+            history[name]["loss"].append(loss.item())
 
         if step % EVAL_GAP == 0 or step == 1 or step == STEPS:
             evals = {}
@@ -839,9 +1045,10 @@ def main():
                 if emas[n] is not None:
                     emas[n].restore(m)
             for n in models:
-                history[n]['eval'].append((step, evals[n]))
-            line = f"    step {step:>5d}/{STEPS}   eval loss:  " + \
-                   "  |  ".join(f"{n} {evals[n]:7.2f}" for n in models)
+                history[n]["eval"].append((step, evals[n]))
+            line = f"    step {step:>5d}/{STEPS}   eval loss:  " + "  |  ".join(
+                f"{n} {evals[n]:7.2f}" for n in models
+            )
             print(line)
 
     # ── summary
@@ -853,42 +1060,79 @@ def main():
     results = {}
     for name, m in models.items():
         params = count_params(m)
-        depth = NFRA_DEPTH if name == 'NFRA Brain' else (L_m if name == 'Mamba SSM' else L_g)
-        final = history[name]['eval'][-1][1] if history[name]['eval'] else float('nan')
-        results[name] = {'params': params, 'depth': depth, 'eval_loss': round(final, 3),
-                         'ppl': round(math.exp(min(final, 30)), 2),
-                         'tok_s': perf[name]['tok_s'], 'mem_gb': round(perf[name]['mem'], 2),
-                         'ms_per_step': round(sum(step_ms[name]) / len(step_ms[name]), 1)
-                         if step_ms[name] else 0.0}
-        ppl = f"{math.exp(min(final, 30)):8.2f}" if final < 25 else "   >e^25 "
-        print(f"  {name:<11s} {params/1e6:6.1f}M {depth:5d} {final:9.2f} "
-              f"{perf[name]['tok_s']:>8,d} "
-              f"{results[name]['ms_per_step']:7.1f} {perf[name]['mem']:5.2f}G"
-              + (f"   ppl≈{math.exp(min(final,30)):.0f}" if final < 25 else "   ppl: huge"))
+        depth = (
+            NFRA_DEPTH
+            if name == "NFRA Brain"
+            else (L_m if name == "Mamba SSM" else L_g)
+        )
+        final = history[name]["eval"][-1][1] if history[name]["eval"] else float("nan")
+        results[name] = {
+            "params": params,
+            "depth": depth,
+            "eval_loss": round(final, 3),
+            "ppl": round(math.exp(min(final, 30)), 2),
+            "tok_s": perf[name]["tok_s"],
+            "mem_gb": round(perf[name]["mem"], 2),
+            "ms_per_step": (
+                round(sum(step_ms[name]) / len(step_ms[name]), 1)
+                if step_ms[name]
+                else 0.0
+            ),
+        }
+        f"{math.exp(min(final, 30)):8.2f}" if final < 25 else "   >e^25 "
+        print(
+            f"  {name:<11s} {params/1e6:6.1f}M {depth:5d} {final:9.2f} "
+            f"{perf[name]['tok_s']:>8,d} "
+            f"{results[name]['ms_per_step']:7.1f} {perf[name]['mem']:5.2f}G"
+            + (
+                f"   ppl≈{math.exp(min(final,30)):.0f}"
+                if final < 25
+                else "   ppl: huge"
+            )
+        )
     print("-" * 66)
-    best_q = min(results, key=lambda k: results[k]['eval_loss'])
-    best_s = max(results, key=lambda k: results[k]['tok_s'])
+    best_q = min(results, key=lambda k: results[k]["eval_loss"])
+    best_s = max(results, key=lambda k: results[k]["tok_s"])
     print(f"\n  ✓ best quality (lowest eval loss): {best_q}")
     print(f"  ✓ best throughput:                 {best_s}")
 
     print("\n  — how to read this —")
-    print(f"  • eval loss ~{RANDOM_LOSS:.2f} = random guessing; lower = better language model.")
-    print(f"  • All losses start near {RANDOM_LOSS:.2f} (fair init) and fall as the model")
+    print(
+        f"  • eval loss ~{RANDOM_LOSS:.2f} = random guessing; lower = better language model."
+    )
+    print(
+        f"  • All losses start near {RANDOM_LOSS:.2f} (fair init) and fall as the model"
+    )
     print("    learns the structure — judge by the FINAL value.")
     print("  • tok/s here is pure-PyTorch (no fused kernels). Production fused")
     print("    kernels would make Mamba and NFRA dramatically faster.")
     print("  • All three trained on identical data with identical optimizer,")
-    print("    matched to ~%.0fM params." % TARGET_M)
+    print(f"    matched to ~{TARGET_M:.0f}M params.")
 
-    out_path = os.path.join(os.getcwd(), 'nfra_vs_mamba_vs_gpt2_results.json')
-    with open(out_path, 'w') as f:
-        json.dump({'config': {'steps': STEPS, 'dim': DIM, 'target_params': TARGET_M,
-                              'data': DATA_SOURCE, 'vocab': VOCAB, 'batch': BATCH},
-                   'results': results, 'perf': perf,
-                   'history': {k: {'loss': v['loss'], 'eval': v['eval']}
-                               for k, v in history.items()}}, f, indent=2)
+    out_path = os.path.join(os.getcwd(), "nfra_vs_mamba_vs_gpt2_results.json")
+    with open(out_path, "w") as f:
+        json.dump(
+            {
+                "config": {
+                    "steps": STEPS,
+                    "dim": DIM,
+                    "target_params": TARGET_M,
+                    "data": DATA_SOURCE,
+                    "vocab": VOCAB,
+                    "batch": BATCH,
+                },
+                "results": results,
+                "perf": perf,
+                "history": {
+                    k: {"loss": v["loss"], "eval": v["eval"]}
+                    for k, v in history.items()
+                },
+            },
+            f,
+            indent=2,
+        )
     print(f"\n  results saved → {out_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

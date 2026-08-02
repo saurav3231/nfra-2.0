@@ -32,11 +32,14 @@ Preserved identity:
                   and fast generation survive.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple
+from __future__ import annotations
+
 import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
 
 class CortexMixer(nn.Module):
     """Resonance retention mixer (the 3.3b core).
@@ -56,16 +59,22 @@ class CortexMixer(nn.Module):
     plain elementwise multiplies, so the parallel form stays intact.
     """
 
-    def __init__(self, dim: int, n_heads: int = 8,
-                 iso_vgate: bool = False, iso_rgate: bool = False,
-                 iso_phase: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        iso_vgate: bool = False,
+        iso_rgate: bool = False,
+        iso_phase: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         if dim != self.n_heads * self.head_dim:
-            raise ValueError('dim (%d) must be divisible by %d heads'
-                             % (dim, self.n_heads))
+            raise ValueError(
+                "dim (%d) must be divisible by %d heads" % (dim, self.n_heads)
+            )
         self.iso_vgate = iso_vgate
         self.iso_rgate = iso_rgate
         self.iso_phase = iso_phase
@@ -101,28 +110,32 @@ class CortexMixer(nn.Module):
         (S, device) -- they are constants -- so each forward only pays the
         [H,S,S] exp. Called once per block per step; this was the per-forward
         arange-diff + triu construction that at depth 33 is pure overhead."""
-        cache = getattr(self, '_mask_cache', None)
+        cache = getattr(self, "_mask_cache", None)
         if cache is None:
             cache = self._mask_cache = {}
         key = (S, self.log_decay.device)
         if key not in cache:
             idx = torch.arange(S, device=self.log_decay.device).float()
-            rel = (idx.view(S, 1) - idx.view(1, S)).clamp(min=0.0)   # [S,S]
-            causal = torch.triu(torch.ones(S, S, device=idx.device,
-                                           dtype=torch.bool), 1)
+            rel = (idx.view(S, 1) - idx.view(1, S)).clamp(min=0.0)  # [S,S]
+            causal = torch.triu(
+                torch.ones(S, S, device=idx.device, dtype=torch.bool), 1
+            )
             cache[key] = (rel, causal)
         rel, causal = cache[key]
-        decay = torch.exp(-torch.exp(self.log_decay.view(1, self.n_heads, 1, 1))
-                          * rel.view(1, 1, S, S))                # [1,H,S,S]
+        decay = torch.exp(
+            -torch.exp(self.log_decay.view(1, self.n_heads, 1, 1))
+            * rel.view(1, 1, S, S)
+        )  # [1,H,S,S]
         return decay.masked_fill(causal, 0.0)
 
-    def forward(self, x: torch.Tensor,
-                hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, hormones: torch.Tensor | None = None
+    ) -> torch.Tensor:
         B, S, D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
         t = self.qkvr(x).view(B, S, 3 + self.n_gates, H, Hd).permute(2, 0, 3, 1, 4)
-        q, k, v = t[0], t[1], t[2]                              # [B,H,S,Hd]
+        q, k, v = t[0], t[1], t[2]  # [B,H,S,Hd]
         if not self.iso_vgate:
             g = t[3]
         if not self.iso_rgate:
@@ -130,20 +143,22 @@ class CortexMixer(nn.Module):
 
         # Selectivity: input-dependent value gate (ACh -> HOLD, phase-modulated).
         if not self.iso_vgate:
-            gate = torch.sigmoid(g).permute(0, 2, 1, 3)            # [B,S,H,Hd]
+            gate = torch.sigmoid(g).permute(0, 2, 1, 3)  # [B,S,H,Hd]
             if hormones is not None:
                 ach = hormones[:, :, 0:1]
-                gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))       # high ACh -> HOLD
+                gate = gate / (1.0 + 0.5 * ach.unsqueeze(-1))  # high ACh -> HOLD
             if not self.iso_phase:
                 pos = torch.arange(S, device=x.device).float()
-                phase = torch.sin(2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
-                                  + self.phases[:, None])           # [H,S]
+                phase = torch.sin(
+                    2.0 * math.pi * self.freqs[:, None] * pos[None, :] / S
+                    + self.phases[:, None]
+                )  # [H,S]
                 gate = gate * (1.0 + 0.05 * phase.t())[None, :, :, None]
             v = v * gate.permute(0, 2, 1, 3)
 
         # Retention (parallel form): decayed QK^T attention, no softmax.
-        scores = torch.matmul(q * (Hd ** -0.5), k.transpose(-2, -1))
-        y = torch.matmul(scores * self.decay_mask(S), v)         # [B,H,S,Hd]
+        scores = torch.matmul(q * (Hd**-0.5), k.transpose(-2, -1))
+        y = torch.matmul(scores * self.decay_mask(S), v)  # [B,H,S,Hd]
         y = y.permute(0, 2, 1, 3).reshape(B, S, D)
         y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
 
@@ -168,10 +183,10 @@ class CortexExit(nn.Module):
         self.gate = nn.Linear(dim, 1, bias=True)
         self.reg = reg
         self.tau = tau
-        nn.init.constant_(self.gate.bias, -1.0)             # start "keep going"
+        nn.init.constant_(self.gate.bias, -1.0)  # start "keep going"
 
     def prob(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.gate(x))                  # [B, S, 1]
+        return torch.sigmoid(self.gate(x))  # [B, S, 1]
 
     def sample_mask(self, x: torch.Tensor, hard: bool = False):
         """Return (continue_mask, exit_prob). continue=1 means keep computing."""
@@ -182,7 +197,7 @@ class CortexExit(nn.Module):
         # Gumbel straight-through: forward is 0/1, backward flows through p.
         u = torch.rand_like(p)
         g = -torch.log(-torch.log(u + 1e-8) + 1e-8)
-        logit = (p + 1e-8).log() - (1.0 - p + 1e-8).log()   # logit(p)
+        logit = (p + 1e-8).log() - (1.0 - p + 1e-8).log()  # logit(p)
         y = torch.sigmoid((logit + g) / self.tau)
         cont = (y > 0.5).float()
         return cont + (p - p.detach()), p
@@ -203,8 +218,7 @@ class CortexMLP(nn.Module):
     mixer's extra selectivity carries the differentiator.
     """
 
-    def __init__(self, dim: int, hidden_mult: float = 2.0,
-                 k_wta_frac: float = 0.0):
+    def __init__(self, dim: int, hidden_mult: float = 2.0, k_wta_frac: float = 0.0):
         super().__init__()
         self.dim = dim
         self.k_wta_frac = k_wta_frac
@@ -212,13 +226,14 @@ class CortexMLP(nn.Module):
         self.gate_up = nn.Linear(dim, 2 * hidden, bias=False)
         self.down_proj = nn.Linear(hidden, dim, bias=False)
 
-    def forward(self, x: torch.Tensor,
-                hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, hormones: torch.Tensor | None = None
+    ) -> torch.Tensor:
         gu = self.gate_up(x)
         gate, up = gu.chunk(2, dim=-1)
         hidden = F.silu(gate) * up
         if self.k_wta_frac > 0.0:
-            k = max(1, int(math.ceil(self.k_wta_frac * hidden.shape[-1])))
+            k = max(1, math.ceil(self.k_wta_frac * hidden.shape[-1]))
             thr = hidden.topk(k, dim=-1).values[..., -1:]
             hidden = hidden * (hidden >= thr).float()
         if hormones is not None:
@@ -243,17 +258,19 @@ class CortexNeuromodulator(nn.Module):
         self.context_gland = nn.Linear(dim, n_hormones, bias=False)
         self.baseline = nn.Parameter(torch.zeros(n_hormones))
 
-    def forward(self, x: torch.Tensor,
-                prev_hormones: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, prev_hormones: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # Prefix-pool the LOW-DIM readout, not the full hidden state. Since
         # context_gland is linear, cumsum(gland(x))/cnt == gland(cumsum(x)/cnt)
         # exactly, so this is bit-equivalent to the old prefix_pool(x) -> gland
         # path but scans [B,S,6] instead of [B,S,D] -- the per-block D-wide
         # cumsum was pure overhead at depth 33 and dominated the scan cost.
-        proj = self.context_gland(x)                         # [B,S,6]
-        cnt = torch.arange(1, x.shape[1] + 1, device=x.device,
-                           dtype=proj.dtype).view(1, x.shape[1], 1)
-        pooled = proj.cumsum(1) / cnt                        # causal prefix
+        proj = self.context_gland(x)  # [B,S,6]
+        cnt = torch.arange(1, x.shape[1] + 1, device=x.device, dtype=proj.dtype).view(
+            1, x.shape[1], 1
+        )
+        pooled = proj.cumsum(1) / cnt  # causal prefix
         raw = torch.sigmoid(pooled + self.baseline.unsqueeze(0))
         if prev_hormones is not None:
             return self.smoothing * prev_hormones + (1.0 - self.smoothing) * raw
@@ -268,23 +285,32 @@ class NFRA_Cortex_Block(nn.Module):
     RetNet speed instead of the 5-D-scan 3.3 block (4323 vs 23338 tok/s).
     """
 
-    def __init__(self, dim: int, n_bands: int = 16, dropout: float = 0.1,
-                 d_state: int = 8, exit_reg: float = 1e-3,
-                 k_wta_frac: float = 0.0, local_route: bool = False,
-                 div_norm: bool = False,
-                 iso_gland: bool = False, iso_vgate: bool = False,
-                 iso_rgate: bool = False, iso_phase: bool = False,
-                 iso_exit: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        n_bands: int = 16,
+        dropout: float = 0.1,
+        d_state: int = 8,
+        exit_reg: float = 1e-3,
+        k_wta_frac: float = 0.0,
+        local_route: bool = False,
+        div_norm: bool = False,
+        iso_gland: bool = False,
+        iso_vgate: bool = False,
+        iso_rgate: bool = False,
+        iso_phase: bool = False,
+        iso_exit: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.iso_gland = iso_gland
         self.iso_exit = iso_exit
 
-        self.neuromodulator = (None if iso_gland
-                               else CortexNeuromodulator(dim))
+        self.neuromodulator = None if iso_gland else CortexNeuromodulator(dim)
         self.ln1 = nn.LayerNorm(dim)
-        self.mixer = CortexMixer(dim, iso_vgate=iso_vgate,
-                                 iso_rgate=iso_rgate, iso_phase=iso_phase)
+        self.mixer = CortexMixer(
+            dim, iso_vgate=iso_vgate, iso_rgate=iso_rgate, iso_phase=iso_phase
+        )
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = CortexMLP(dim, k_wta_frac=k_wta_frac)
 
@@ -294,13 +320,13 @@ class NFRA_Cortex_Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        hormones: Optional[torch.Tensor] = None,
-        energy_budget: Optional[float] = None,
-        exit_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hormones: torch.Tensor | None = None,
+        energy_budget: float | None = None,
+        exit_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return (out, hormones, exit_logit). exit_state unused (kept for a
         compatible signature with depth-pass threading)."""
-        B, S, D = x.shape
+        B, S, _D = x.shape
 
         if self.neuromodulator is not None:
             hormones = self.neuromodulator(x, prev_hormones=hormones)
@@ -322,7 +348,11 @@ class NFRA_Cortex_Block(nn.Module):
         return x, (hormones.detach() if hormones is not None else None), exit_logit
 
     def exit_prob(self, x: torch.Tensor) -> torch.Tensor:
-        return self.exit_gate.prob(x) if self.exit_gate is not None else x.new_zeros(x.shape[0], x.shape[1], 1)
+        return (
+            self.exit_gate.prob(x)
+            if self.exit_gate is not None
+            else x.new_zeros(x.shape[0], x.shape[1], 1)
+        )
 
     def get_sparsity(self) -> float:
         return 0.0

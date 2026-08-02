@@ -5,9 +5,8 @@ Created by Saurav Bhandari
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from torch import nn
 
 
 class Int8Linear(nn.Module):
@@ -25,9 +24,11 @@ class Int8Linear(nn.Module):
         self.out_features = linear.out_features
         self.bias = linear.bias
         scale = linear.weight.data.abs().max() / 127.0
-        self.register_buffer('scale', scale if scale > 0 else 1.0)
+        self.register_buffer("scale", scale if scale > 0 else 1.0)
         self.qweight = nn.Parameter(
-            torch.round(linear.weight.data / self.scale).clamp(-128, 127).to(torch.int8),
+            torch.round(linear.weight.data / self.scale)
+            .clamp(-128, 127)
+            .to(torch.int8),
             requires_grad=False,
         )
 
@@ -36,13 +37,13 @@ class Int8Linear(nn.Module):
         return F.linear(x, w, self.bias)
 
 
-def quantize_to_int8(model: nn.Module) -> Dict:
+def quantize_to_int8(model: nn.Module) -> dict:
     """
     Simple post-training INT8 quantization.
     This is a basic implementation suitable for CPU inference.
     """
     quantized_state = {}
-    
+
     for name, param in model.named_parameters():
         if param.dtype == torch.float32:
             # Simple symmetric quantization
@@ -50,22 +51,19 @@ def quantize_to_int8(model: nn.Module) -> Dict:
             if scale == 0:
                 scale = 1.0
             quantized = torch.round(param / scale).clamp(-128, 127).to(torch.int8)
-            quantized_state[name] = {
-                'quantized': quantized,
-                'scale': scale
-            }
+            quantized_state[name] = {"quantized": quantized, "scale": scale}
         else:
             quantized_state[name] = param
-    
+
     return quantized_state
 
 
-def dequantize(state: Dict) -> Dict:
+def dequantize(state: dict) -> dict:
     """Convert quantized state back to float32 for inference."""
     dequantized = {}
     for name, value in state.items():
-        if isinstance(value, dict) and 'quantized' in value:
-            dequantized[name] = value['quantized'].float() * value['scale']
+        if isinstance(value, dict) and "quantized" in value:
+            dequantized[name] = value["quantized"].float() * value["scale"]
         else:
             dequantized[name] = value
     return dequantized
@@ -84,14 +82,14 @@ def apply_int8_to_model(model: nn.Module):
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear) or isinstance(module, Int8Linear):
             continue
-        if hasattr(module, 'is_quantized') and module.is_quantized:
+        if hasattr(module, "is_quantized") and module.is_quantized:
             continue
         quantized = Int8Linear(module)
-        parts = name.split('.')
+        parts = name.split(".")
         parent = model
         for p in parts[:-1]:
             parent = getattr(parent, p)
         setattr(parent, parts[-1], quantized)
         quantized.is_quantized = True
-    
+
     return model

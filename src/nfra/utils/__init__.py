@@ -1,5 +1,5 @@
-"""Utility functions for NFRA 2.0"""
+"""Utility functions for NFRA (Nonlinear Factorized Recurrent Attention)."""
 
-from .hardware import get_hardware_info, estimate_energy_usage
+from .hardware import estimate_energy_usage, get_hardware_info
 
-__all__ = ["get_hardware_info", "estimate_energy_usage"]
+__all__ = ["estimate_energy_usage", "get_hardware_info"]

@@ -1,5 +1,13 @@
 # NFRA Brain Levers — Adaptive Computation on the Space / Gain / Time Axis
 
+> **STATUS — VERIFIED NO-OPS (2026-08-01).** The ablate phase of the verified
+> 8-phase run (`docs/OVERNIGHT_VERIFIED_RESULTS.md` §12) and the isolation sweep
+> (§14) proved that **all seven levers below are within seed noise in the Cortex
+> block** — each measured exactly 1.763, identical to the baseline, and removing
+> them costs nothing. They are kept as legacy design documentation only and are
+> **not** part of the recommended architecture. The verified differentiator is
+> the **receptance gate** (RWKV-style), not any of these mechanisms.
+
 **Design, examples, use cases, advantages, and what success would mean — for the seven near-zero-cost brain-inspired mechanisms added to NFRA Brain:**
 
 | Lever | Env flag | `NFRAConfig` field | Brain component | Axis it adapts |

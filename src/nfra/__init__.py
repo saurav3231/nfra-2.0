@@ -1,60 +1,63 @@
 """
-NFRA 3.0 — NeuroFractal Resonance Architecture
+NFRA — Nonlinear Factorized Recurrent Attention
 
-A brain-inspired neural network with efficient multi-band sequence mixing
-and fractal gated MLPs for ultra-low-power and legacy hardware.
+An efficient recurrent language-model block: a depth-shared, decayed
+query-key retention mixer (RetNet-style) gated by a token-wise receptance
+gate (RWKV-style) and a SwiGLU feed-forward. Designed to deliver strong
+quality-per-parameter on modest hardware, verified head-to-head against
+RetNet, RWKV, Mamba, and GPT-2 baselines.
 
 Author: SAURAV BHANDARI
 """
 
-__version__ = "3.1.0"
+__version__ = "3.3.0"
 __author__ = "SAURAV BHANDARI"
 __license__ = "MIT"
 
 from .core import (
-    FractalResonanceBlock,
-    FractalGatedMLP,
-    CausalResonanceMixer,
-    ParallelGatedRecurrence,
-    MultiScaleGatedRecurrence,
-    ResonanceGuidedLocalAttention,
-    SwiGLU_MLP,
-    FractalSwiGLU,
-    NFRA_Max_Block,
-    NFRA_Brain_Block,
-    NFRA_Cortex_Block,
-    ResonanceRouter,
-    PredictiveGenerator,
-    DynamicEnergyBudgetAllocator,
-    NeuroModulator,
-    ThalamicGate,
     BrainMixer,
     BrainMLP,
+    CausalResonanceMixer,
+    DynamicEnergyBudgetAllocator,
+    FractalGatedMLP,
+    FractalResonanceBlock,
+    FractalSwiGLU,
+    MultiScaleGatedRecurrence,
+    NeuroModulator,
+    NFRA_Brain_Block,
+    NFRA_Cortex_Block,
+    NFRA_Max_Block,
+    ParallelGatedRecurrence,
+    PredictiveGenerator,
+    ResonanceGuidedLocalAttention,
+    ResonanceRouter,
+    SwiGLU_MLP,
     TemporalGridEncoder,
+    ThalamicGate,
 )
-from .models import NFRAForCausalLM, NFRAForSequenceClassification, NFRAConfig
+from .models import NFRAConfig, NFRAForCausalLM, NFRAForSequenceClassification
 
 __all__ = [
-    "FractalResonanceBlock",
-    "FractalGatedMLP",
-    "CausalResonanceMixer",
-    "ParallelGatedRecurrence",
-    "MultiScaleGatedRecurrence",
-    "ResonanceGuidedLocalAttention",
-    "SwiGLU_MLP",
-    "FractalSwiGLU",
-    "NFRA_Max_Block",
-    "NFRA_Brain_Block",
-    "NFRA_Cortex_Block",
-    "ResonanceRouter",
-    "PredictiveGenerator",
-    "DynamicEnergyBudgetAllocator",
-    "NeuroModulator",
-    "ThalamicGate",
-    "BrainMixer",
     "BrainMLP",
-    "TemporalGridEncoder",
+    "BrainMixer",
+    "CausalResonanceMixer",
+    "DynamicEnergyBudgetAllocator",
+    "FractalGatedMLP",
+    "FractalResonanceBlock",
+    "FractalSwiGLU",
+    "MultiScaleGatedRecurrence",
+    "NFRAConfig",
     "NFRAForCausalLM",
     "NFRAForSequenceClassification",
-    "NFRAConfig",
+    "NFRA_Brain_Block",
+    "NFRA_Cortex_Block",
+    "NFRA_Max_Block",
+    "NeuroModulator",
+    "ParallelGatedRecurrence",
+    "PredictiveGenerator",
+    "ResonanceGuidedLocalAttention",
+    "ResonanceRouter",
+    "SwiGLU_MLP",
+    "TemporalGridEncoder",
+    "ThalamicGate",
 ]

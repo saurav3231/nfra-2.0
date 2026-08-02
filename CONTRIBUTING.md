@@ -1,8 +1,11 @@
-# Contributing to NFRA 2.0
+# Contributing to NFRA
 
-Thank you for your interest in contributing to NFRA 2.0!
+Thank you for your interest in contributing to NFRA (Nonlinear Factorized
+Recurrent Attention)!
 
-This project was created by **Saurav Bhandari** with the goal of making advanced AI accessible on low-power and legacy hardware.
+This project was created by **Saurav Bhandari** with the goal of building an
+efficient, honestly-verified recurrent language-model block that runs well on
+modest hardware.
 
 ## How to Contribute
 

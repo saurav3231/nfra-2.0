@@ -1,11 +1,9 @@
-"""Evaluation and benchmarking module for NFRA 2.0"""
+"""Evaluation metrics for NFRA (Nonlinear Factorized Recurrent Attention)."""
 
 from .metrics import compute_perplexity, compute_sparsity, estimate_energy
-from .benchmark import NFRABenchmark
 
 __all__ = [
     "compute_perplexity",
-    "compute_sparsity", 
+    "compute_sparsity",
     "estimate_energy",
-    "NFRABenchmark"
 ]

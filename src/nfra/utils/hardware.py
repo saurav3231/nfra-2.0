@@ -4,8 +4,9 @@ Hardware detection and energy estimation utilities
 Created by Saurav Bhandari
 """
 
-import torch
 import platform
+
+import torch
 
 
 def get_hardware_info():
@@ -15,13 +16,13 @@ def get_hardware_info():
         "platform": platform.platform(),
         "python_version": platform.python_version(),
     }
-    
+
     if torch.cuda.is_available():
         info["gpu_name"] = torch.cuda.get_device_name(0)
         info["gpu_memory"] = torch.cuda.get_device_properties(0).total_memory / 1e9
     else:
         info["cpu_cores"] = torch.get_num_threads()
-    
+
     return info
 
 
@@ -56,10 +57,10 @@ def recommended_max_config(vocab_size: int = 50257, gpu_memory_gb=None) -> dict:
     """
     tier = gpu_tier(gpu_memory_gb)
     presets = {
-        "low":  {"hidden_size": 384, "num_layers": 8},
-        "mid":  {"hidden_size": 512, "num_layers": 12},
+        "low": {"hidden_size": 384, "num_layers": 8},
+        "mid": {"hidden_size": 512, "num_layers": 12},
         "high": {"hidden_size": 768, "num_layers": 24},
-        "cpu":  {"hidden_size": 256, "num_layers": 6},
+        "cpu": {"hidden_size": 256, "num_layers": 6},
     }
     return {"mode": "max", "vocab_size": vocab_size, **presets[tier]}
 
@@ -69,11 +70,11 @@ def estimate_energy_usage(model, input_shape, device="cpu"):
     Rough estimate of energy usage during inference.
     """
     param_count = sum(p.numel() for p in model.parameters())
-    
+
     # Very rough estimation
     if device == "cpu":
         energy_per_token = param_count * 1e-9 * 0.5  # Joules (very approximate)
     else:
         energy_per_token = param_count * 1e-9 * 0.2
-        
+
     return energy_per_token

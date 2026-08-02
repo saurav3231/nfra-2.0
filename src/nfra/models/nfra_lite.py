@@ -8,9 +8,9 @@ This is the most lightweight and fastest variant of NFRA.
 Created by Saurav Bhandari
 """
 
+from __future__ import annotations
+
 import torch
-import torch.nn as nn
-from typing import Optional, Dict
 
 from .nfra_model import NFRAConfig, NFRAForCausalLM
 
@@ -18,7 +18,7 @@ from .nfra_model import NFRAConfig, NFRAForCausalLM
 class NFRALiteForCausalLM(NFRAForCausalLM):
     """
     NFRA Lite - Highly optimized for low-power and legacy CPUs.
-    
+
     Key characteristics:
     - Small hidden size (384)
     - Only 2 fractal scales
@@ -26,8 +26,8 @@ class NFRALiteForCausalLM(NFRAForCausalLM):
     - Aggressive sparsity
     - INT8 friendly
     """
-    
-    def __init__(self, config: Optional[NFRAConfig] = None):
+
+    def __init__(self, config: NFRAConfig | None = None):
         if config is None:
             config = NFRAConfig(mode="lite")
         else:
@@ -41,32 +41,30 @@ class NFRALiteForCausalLM(NFRAForCausalLM):
             config.use_selective_scanning = False
             config.use_dynamic_precision = False
             config.aggressive_sparsity = True
-        
+
         super().__init__(config)
-        
+
         # Lite-specific optimizations
         self._lite_mode = True
 
     def forward(
-        self, 
-        input_ids: torch.Tensor, 
-        energy_budget: Optional[float] = None,
+        self,
+        input_ids: torch.Tensor,
+        energy_budget: float | None = None,
         return_dict: bool = True,
-    ) -> Dict:
+    ) -> dict:
         """
         Optimized forward pass for Lite mode.
         Forces high sparsity and energy efficiency.
         """
         if energy_budget is None:
             energy_budget = 0.5  # Very aggressive for Lite
-            
+
         return super().forward(
-            input_ids=input_ids,
-            energy_budget=energy_budget,
-            return_dict=return_dict
+            input_ids=input_ids, energy_budget=energy_budget, return_dict=return_dict
         )
-    
-    def get_model_info(self) -> Dict:
+
+    def get_model_info(self) -> dict:
         """Return information about the Lite model."""
         total_params = sum(p.numel() for p in self.parameters())
         return {
@@ -76,7 +74,7 @@ class NFRALiteForCausalLM(NFRAForCausalLM):
             "num_layers": self.config.num_layers,
             "fractal_scales": self.config.fractal_scales,
             "target_hardware": "Intel Core i5-337U and similar",
-            "note": "Advanced features (Mixture of Fractals, Selective Scanner) are disabled for performance."
+            "note": "Advanced features (Mixture of Fractals, Selective Scanner) are disabled for performance.",
         }
 
 

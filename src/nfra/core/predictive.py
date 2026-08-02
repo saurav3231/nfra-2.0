@@ -2,37 +2,34 @@
 Predictive Resonance Coding components
 """
 
+from __future__ import annotations
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from torch import nn
 
 
 class PredictiveGenerator(nn.Module):
     """
     Generates predictions at multiple scales for predictive coding.
     """
-    
-    def __init__(self, dim: int, hidden_dim: Optional[int] = None):
+
+    def __init__(self, dim: int, hidden_dim: int | None = None):
         super().__init__()
         hidden_dim = hidden_dim or dim * 2
-        
+
         self.predictor = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)
+            nn.Linear(dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, dim)
         )
-        
+
         self.error_scale = nn.Parameter(torch.ones(1))
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Generate prediction for next state."""
         return self.predictor(x)
-    
+
     def compute_prediction_error(
-        self, 
-        actual: torch.Tensor, 
-        prediction: torch.Tensor
+        self, actual: torch.Tensor, prediction: torch.Tensor
     ) -> torch.Tensor:
         """Compute prediction error (core of predictive coding)."""
         error = actual - prediction
@@ -49,15 +46,17 @@ class MultiScalePredictor(nn.Module):
     full `dim`. Scale-1 predictors keep the full width.
     """
 
-    def __init__(self, dim: int, scales: Optional[List[int]] = None):
+    def __init__(self, dim: int, scales: list[int] | None = None):
         super().__init__()
         scales = [1, 2, 4] if scales is None else scales
         self.dim = dim
         self.scales = [s for s in scales if s >= 1 and dim % s == 0]
-        self.predictors = nn.ModuleDict({
-            f"scale_{s}": PredictiveGenerator(dim // s if s > 1 else dim)
-            for s in self.scales
-        })
+        self.predictors = nn.ModuleDict(
+            {
+                f"scale_{s}": PredictiveGenerator(dim // s if s > 1 else dim)
+                for s in self.scales
+            }
+        )
 
     def forward(self, x: torch.Tensor, scale: int = 1) -> torch.Tensor:
         key = f"scale_{scale}"

@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import time
+
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,11 +41,11 @@ def bench(arch):
     model.train()
     if arena.COMPILE and arena.HAS_CUDA:
         try:
-            cfg = getattr(model, "config", None)
+            getattr(model, "config", None)
             model = torch.compile(model, mode="reduce-overhead", dynamic=False)
             print("  [compile] reduce-overhead active")
         except Exception as e:
-            print("  [warn] compile failed (%s)" % e)
+            print(f"  [warn] compile failed ({e})")
     opt, sched = arena.make_optimizer(model, lr=3e-4, warmup=5, total=STEPS)
     scaler = torch.amp.GradScaler(str(arena.DEVICE)) if arena.USE_AMP else None
 
@@ -77,9 +78,12 @@ def bench(arch):
         step()
     torch.cuda.synchronize()
     ms = (time.perf_counter() - t0) / STEPS * 1e3
-    print(f"=== {arch}: {ms:.1f} ms/step  ({B*S*STEPS/ (time.perf_counter()-t0) * 1000:.0f} tok/s) ===")
+    print(
+        f"=== {arch}: {ms:.1f} ms/step  ({B*S*STEPS/ (time.perf_counter()-t0) * 1000:.0f} tok/s) ==="
+    )
 
-    from torch.profiler import profile, ProfilerActivity
+    from torch.profiler import ProfilerActivity, profile
+
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(3):
             step()

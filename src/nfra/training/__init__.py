@@ -1,4 +1,4 @@
-"""Training components for NFRA 2.0"""
+"""Training components for NFRA (Nonlinear Factorized Recurrent Attention)."""
 
 from .losses import NFRACombinedLoss
 from .trainer import NFRATrainer

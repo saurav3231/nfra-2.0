@@ -12,14 +12,16 @@ Lazy __getattr__ (PEP 562) so `python -m nfra.kernels.scan` does not warn:
 the submodule is only imported on attribute access.
 """
 
-__all__ = ['selective_scan', 'parallel_scan_time_varying']
+__all__ = ["parallel_scan_time_varying", "selective_scan"]
 
 
 def __getattr__(name):
-    if name == 'selective_scan':
+    if name == "selective_scan":
         from .scan import selective_scan
+
         return selective_scan
-    if name == 'parallel_scan_time_varying':
+    if name == "parallel_scan_time_varying":
         from .scan import parallel_scan_time_varying
+
         return parallel_scan_time_varying
-    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
