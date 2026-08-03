@@ -140,7 +140,9 @@ class CortexMixer(nn.Module):
             -torch.exp(self.log_decay.to(dtype).view(1, self.n_heads, 1, 1))
             * rel.view(1, 1, S, S)
         )  # [1,H,S,S]
-        return decay.masked_fill(causal, 0.0)
+        # Fresh clone so CUDA-graph capture (torch.compile reduce-overhead)
+        # never aliases the cached rel/causal buffers.
+        return decay.masked_fill(causal, 0.0).clone()
 
     def _local_decay(self, C: int, dtype: torch.dtype) -> torch.Tensor:
         """Within-chunk causal decay D_h[i,j] = gamma_h^(i-j), j <= i [1,H,C,C]
@@ -162,7 +164,7 @@ class CortexMixer(nn.Module):
             -torch.exp(self.log_decay.to(dtype).view(1, self.n_heads, 1, 1))
             * rel.view(1, 1, C, C)
         )  # [1,H,C,C]
-        return decay.masked_fill(causal, 0.0)
+        return decay.masked_fill(causal, 0.0).clone()
 
     def _retention_chunked(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
