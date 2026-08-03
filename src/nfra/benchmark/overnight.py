@@ -258,23 +258,27 @@ os.environ.setdefault("NFRA_LORA_RANK", "0")
 # 1) NFRA_CHECKPOINT=0: the NFRA 5M model needs 0.2 GB and 50M ~1 GB, so there is
 #    no memory pressure on a 16 GB T4 — gradient checkpointing only ADDED recompute
 #    cost in backward (~+30-50% train time). Off = same results, strictly faster.
-# 2) NFRA_COMPILE=1 + NFRA_SCAN_KERNEL=0: torch.compile fuses the model's hundreds
-#    of small per-block ops into a handful of kernels — the exact reason NFRA is
-#    launch-bound slow. Same numerics, 1.5-3x fewer launches. train_one already
-#    falls back to eager on any compile error, so this is safe.
-# 3) NFRA_CHUNK_SIZE=64: the CortexMixer retention runs as EXACT chunked retention
-#    (within-chunk quadratic + cross-chunk linear state) — the same decayed-QK^T
-#    operator with ~4-8x fewer attention FLOPs and a fraction of the O(S^2)
-#    parallel form's memory. Verified loss unchanged (bit-identical math); this is
-#    the lever that closes the 20M tok/s and peak-memory gaps to RetNet.
-# 4) NFRA_CKPT_GEMM=0 (default): recompute the two biggest GEMM activations in
-#    backward instead of storing them — the memory path. Off by default because
-#    compile is on (checkpointed recompute breaks graph capture); set
-#    NFRA_COMPILE=0 NFRA_CKPT_GEMM=1 to trade ~20% speed for ~0.3 GB.
+# 2) NFRA_COMPILE=1 + NFRA_SCAN_KERNEL=0: torch.compile(mode=default) fuses the
+#    model's hundreds of small per-block ops into a handful of kernels — the exact
+#    reason NFRA is launch-bound slow (267 ms/step eager vs retnet 87 at 20M).
+#    mode=default (inductor fusion, NO CUDA-graph capture) is deliberate:
+#    reduce-overhead took ~9h to compile this model on a T4 CPU and crashed at
+#    graph execution on cached mask buffers. train_one falls back to eager on any
+#    compile error, so this is safe.
+# 3) NFRA_CHUNK_SIZE=0 (default): the CortexMixer retention runs the verified
+#    parallel decayed-QK^T form. Chunked retention (within-chunk quadratic +
+#    cross-chunk linear state) is exact-equivalent and saves the O(S^2) attention
+#    matrix (~0.3 GB at 20M/S=256, quadratic in S), but its serial per-chunk state
+#    loop measured 2x SLOWER in eager at S=256 (7.7k vs 15.2k tok/s, T4). Keep 0
+#    for the standard benchmark; enable for long-context runs (S >= 512) where the
+#    quadratic memory win dominates.
+# 4) NFRA_CKPT_GEMM=0 (default): recomputing the two biggest GEMM activations in
+#    backward was measured NEGATIVE at 20M/S=256 (1.63 -> 1.69 GB, +23% time) —
+#    the recompute masks dominate. Off.
 os.environ.setdefault("NFRA_CHECKPOINT", "0")
 os.environ.setdefault("NFRA_COMPILE", "1")
 os.environ.setdefault("NFRA_SCAN_KERNEL", "0")
-os.environ.setdefault("NFRA_CHUNK_SIZE", "64")
+os.environ.setdefault("NFRA_CHUNK_SIZE", "0")
 os.environ.setdefault("NFRA_CKPT_GEMM", "0")
 
 # Loss-focus lever: EMA (weight averaging) applied to ALL families during

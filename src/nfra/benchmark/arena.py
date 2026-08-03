@@ -142,23 +142,28 @@ else:
 # for 3.3b: the lean retention block's activations are small (RetNet-shaped),
 # so the recompute cost is pure speed loss.
 CHECKPOINT = os.environ.get("NFRA_CHECKPOINT", "0") == "1"
-# torch.compile(mode='reduce-overhead'): fuses the per-step kernel stream and
-# captures it as CUDA graphs, killing Python/launch overhead (the main reason
-# a small model idles the GPU). Auto-disables checkpointing (recompute conflicts
-# with graph capture). Best combined with NFRA_SCAN_KERNEL=0 so the scan is
-# plain torch and fuses into the same graph instead of forcing a graph break.
+# torch.compile(mode='default'): fuses the per-step kernel stream into a few
+# kernels, killing the Python/launch overhead that is nfra's measured bottleneck
+# (267 ms/step eager vs retnet 87 ms/step at 20M, both launch-bound). mode
+# 'default' (inductor fusion, no CUDA-graph capture) is used deliberately:
+# 'reduce-overhead' captured CUDA graphs and (a) took ~9h to compile the 33-block
+# model on a T4 CPU and (b) crashed at graph execution on cached mask buffers.
+# 'default' compiles in minutes, cannot hit that crash, and still fuses the
+# launch stream. Auto-disables checkpointing (recompute conflicts with compile).
 COMPILE = os.environ.get("NFRA_COMPILE", "0") == "1"
 # Chunked retention: exact-equivalent reformulation of the decayed-QK^T mixer
-# (within-chunk quadratic attention + cross-chunk linear state). Same math,
-# ~C/S of the attention FLOPs and a fraction of the O(S^2) parallel form's
-# memory — the Tier-1 lever to reach retnet-class tok/s AND retnet-class peak
-# memory at 20M (verified loss 1.710 unchanged; the operator is identical).
-# NFRA_CHUNK_SIZE=0 reproduces the verified parallel path bit-for-bit.
-CHUNK_SIZE = int(os.environ.get("NFRA_CHUNK_SIZE", "64"))
+# (within-chunk quadratic attention + cross-chunk linear state). Saves the
+# O(S^2) [B,H,S,S] attention matrix (~0.3 GB at 20M/S=256, quadratic in S) but
+# in EAGER mode its serial per-chunk state loop is launch-bound and measured
+# 2x SLOWER than the parallel path at S=256 (7.7k vs 15.2k tok/s, T4). Default
+# 0 = verified parallel path; enable (NFRA_CHUNK_SIZE=64) only for long-context
+# runs where the quadratic memory win dominates. Verified loss unchanged.
+CHUNK_SIZE = int(os.environ.get("NFRA_CHUNK_SIZE", "0"))
 # Recompute the two biggest GEMM activations (qkvr, MLP gate_up) in backward
 # instead of storing them (~8 MB/layer saved, ~0.3 GB at depth 33). Trade
-# compute for memory; forced OFF under torch.compile (checkpointed recompute
-# breaks graph capture — pick one: speed via compile, or memory via ckpt).
+# compute for memory; measured NEGATIVE at 20M/S=256 (1.63 -> 1.69 GB, +23%
+# time) because the recompute masks dominate — default 0. Forced OFF under
+# torch.compile (checkpointed recompute breaks graph capture).
 CKPT_GEMM = os.environ.get("NFRA_CKPT_GEMM", "0") == "1" and not COMPILE
 EVAL_GAP = max(50, STEPS // 6)
 EXT_FACTOR = 2  # extrapolation test: eval at SEQ_LEN * EXT_FACTOR
@@ -423,8 +428,8 @@ def train_one(
             ckpt_was = cfg.gradient_checkpointing if cfg is not None else None
             if cfg is not None:
                 cfg.gradient_checkpointing = False
-            model = torch.compile(model, mode="reduce-overhead", dynamic=False)
-            print("  [compile] torch.compile(reduce-overhead) active")
+            model = torch.compile(model, mode="default", dynamic=False)
+            print("  [compile] torch.compile(mode=default) active")
         except Exception as e:  # pragma: no cover - depends on torch version
             print(f"  [warn] torch.compile failed ({e}) - eager fallback")
         finally:
