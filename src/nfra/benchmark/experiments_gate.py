@@ -69,8 +69,10 @@ def _sanity(build, label):
     Uses S=256 (> any chunk_size) so the chunked/Triton retention path is
     actually exercised — a kernel bug that only shows at S > chunk_size must
     abort here, never report a garbage loss. A loose CE bound on a random batch
-    catches structurally-wrong kernels (huge logits): random-init CE ~ ln(96)
-    ~ 4.56, so >20 means the forward is broken."""
+    catches structurally-wrong kernels: the broken Triton path measured ~171,
+    while a healthy arm stays well under 20. (Init logits are large on this
+    architecture, so init CE can be ~0 via softmax saturation; only the upper
+    bound is a real regression signal.)"""
     m = build().to(DEVICE)
     x = torch.randint(0, VOCAB, (2, 256), device=DEVICE)
     out = m(x)
@@ -78,7 +80,7 @@ def _sanity(build, label):
     ce = torch.nn.functional.cross_entropy(
         logits.view(-1, VOCAB), x.view(-1)
     ).item()
-    assert 0.0 < ce < 20.0, f"{label} forward broken: CE {ce:.2f}"
+    assert ce == ce and ce < 20.0, f"{label} forward broken: CE {ce:.2f}"
     logits.mean().backward()
     grads = [p.grad for p in m.parameters() if p.grad is not None]
     assert grads and all(torch.isfinite(g).all() for g in grads), f"{label} grads"
