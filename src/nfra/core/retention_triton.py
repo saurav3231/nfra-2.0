@@ -91,7 +91,7 @@ if _HAS_TRITON:
             state = state * gC + tl.dot(tl.trans(kc * dec_carry), vc)  # [Hd,Hd]
 
 
-def _chunked_retention_triton(q, k, v, log_decay, chunk_size):
+def _chunked_retention_triton_impl(q, k, v, log_decay, chunk_size):
     """Triton fused chunked retention. q,k,v [B,H,S,Hd], log_decay [H]."""
     B, H, S, Hd = q.shape
     C = int(chunk_size)
@@ -138,7 +138,10 @@ class _ChunkedRetentionFn(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, log_decay)
         ctx.chunk_size = int(chunk_size)
         if use_triton and q.is_cuda and _HAS_TRITON:
-            return _chunked_retention_triton(q, k, v, log_decay, ctx.chunk_size)
+            return _chunked_retention_triton_impl(
+                q.contiguous(), k.contiguous(), v.contiguous(),
+                log_decay, ctx.chunk_size,
+            )
         return chunked_retention_eager(q, k, v, log_decay, ctx.chunk_size)
 
     @staticmethod
