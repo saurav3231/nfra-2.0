@@ -97,6 +97,12 @@ def _chunked_retention_triton(q, k, v, log_decay, chunk_size):
     C = int(chunk_size)
     if (Hd & (Hd - 1)) or (C & (C - 1)):
         return chunked_retention_eager(q, k, v, log_decay, C)
+    # The kernel does raw pointer arithmetic assuming contiguous [B,H,S,Hd];
+    # model q/k/v are permuted views (non-contiguous) and MUST be materialized
+    # before launch or the kernel reads wrong memory offsets.
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     nC = (S + C - 1) // C
     S_pad = nC * C
     if S_pad != S:
