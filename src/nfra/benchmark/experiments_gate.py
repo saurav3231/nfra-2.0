@@ -51,7 +51,16 @@ from nfra.benchmark.arena import (
 )
 from nfra.benchmark.compare import DEVICE, HAS_CUDA, evaluate
 
-VOCAB = 96
+# Model vocab must match the ACTUAL data source. WikiText-2 char vocab is sized
+# 96 (95 real entries + one unused row); the synthetic fallback
+# (HierarchicalDataset) emits tokens up to VOCAB_SIZE-1, so building the model
+# at 96 there crashes the embedding gather with "index out of bounds" on CUDA.
+if arena.DATA_SOURCE == "wikitext2":
+    VOCAB = 96
+else:
+    from nfra.benchmark.compare import HierarchicalDataset
+
+    VOCAB = HierarchicalDataset.VOCAB_SIZE
 
 
 def _sanity(build, label):

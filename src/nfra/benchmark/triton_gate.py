@@ -56,7 +56,12 @@ from nfra.benchmark.compare import (
 from nfra.core.retention import chunked_retention_eager
 from nfra.core.retention_triton import _HAS_TRITON, chunked_retention
 
-VOCAB = 96
+if arena.DATA_SOURCE == "wikitext2":
+    VOCAB = 96
+else:
+    from nfra.benchmark.compare import HierarchicalDataset
+
+    VOCAB = HierarchicalDataset.VOCAB_SIZE
 
 
 def run_gate() -> None:
