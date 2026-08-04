@@ -95,6 +95,8 @@ def _chunked_retention_triton(q, k, v, log_decay, chunk_size):
     """Triton fused chunked retention. q,k,v [B,H,S,Hd], log_decay [H]."""
     B, H, S, Hd = q.shape
     C = int(chunk_size)
+    if (Hd & (Hd - 1)) or (C & (C - 1)):
+        return chunked_retention_eager(q, k, v, log_decay, C)
     nC = (S + C - 1) // C
     S_pad = nC * C
     if S_pad != S:
