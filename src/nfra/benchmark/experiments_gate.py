@@ -64,15 +64,26 @@ else:
 
 
 def _sanity(build, label):
-    """Forward + backward finite-grad smoke for an arm's model on CPU/GPU."""
+    """Forward + backward finite-grad smoke for an arm's model on CPU/GPU.
+
+    Uses S=256 (> any chunk_size) so the chunked/Triton retention path is
+    actually exercised — a kernel bug that only shows at S > chunk_size must
+    abort here, never report a garbage loss. A loose CE bound on a random batch
+    catches structurally-wrong kernels (huge logits): random-init CE ~ ln(96)
+    ~ 4.56, so >20 means the forward is broken."""
     m = build().to(DEVICE)
-    x = torch.randint(0, VOCAB, (2, 64), device=DEVICE)
+    x = torch.randint(0, VOCAB, (2, 256), device=DEVICE)
     out = m(x)
-    out["logits"].float().mean().backward()
+    logits = out["logits"].float()
+    ce = torch.nn.functional.cross_entropy(
+        logits.view(-1, VOCAB), x.view(-1)
+    ).item()
+    assert 0.0 < ce < 20.0, f"{label} forward broken: CE {ce:.2f}"
+    logits.mean().backward()
     grads = [p.grad for p in m.parameters() if p.grad is not None]
     assert grads and all(torch.isfinite(g).all() for g in grads), f"{label} grads"
-    print(f"  sanity {label}: forward/backward OK")
-    del m, grads
+    print(f"  sanity {label}: CE {ce:.2f} forward/backward OK")
+    del m, grads, out, logits
     if HAS_CUDA:
         torch.cuda.empty_cache()
 
@@ -89,7 +100,7 @@ def main() -> int:
 
     arms = [
         ("baseline",     dict(chunk_size=0, triton=False, lsr=False, int8_state=False, depth_time=False)),
-        ("triton_chunk", dict(chunk_size=64, triton=True)),
+        ("triton_chunk", dict(chunk_size=64, triton=arena.TRITON)),
         ("lsr",          dict(lsr=True)),
         ("int8_state",   dict(chunk_size=64, int8_state=True)),
         ("depth_time",   dict(depth_time=True)),
