@@ -280,6 +280,7 @@ os.environ.setdefault("NFRA_COMPILE", "1")
 os.environ.setdefault("NFRA_SCAN_KERNEL", "0")
 os.environ.setdefault("NFRA_CHUNK_SIZE", "0")
 os.environ.setdefault("NFRA_CKPT_GEMM", "0")
+os.environ.setdefault("NFRA_TRITON", "0")
 
 # Loss-focus lever: EMA (weight averaging) applied to ALL families during
 # training — a near-free loss gain (~-0.1..-0.3 nats at these sizes) for

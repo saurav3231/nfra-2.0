@@ -40,6 +40,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .experiments import chunked_retention_int8state
+from .retention_triton import chunked_retention
+
 
 class CortexMixer(nn.Module):
     """Resonance retention mixer (the 3.3b core).
@@ -68,6 +71,9 @@ class CortexMixer(nn.Module):
         iso_phase: bool = False,
         chunk_size: int = 0,
         ckpt_gems: bool = False,
+        triton: bool = False,
+        lsr: bool = False,
+        int8_state: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -82,6 +88,23 @@ class CortexMixer(nn.Module):
         # torch.compile, checkpointed recompute breaks graph capture).
         self.chunk_size = int(chunk_size or 0)
         self.ckpt_gems = ckpt_gems
+        # triton: run the chunked retention forward as ONE fused Triton kernel
+        # per (batch, head) instead of the eager per-chunk loop (the Tier-1
+        # speed/memory lever). Backward stays a checkpoint-recompute through
+        # the eager reference, so grads are unchanged. Falls back to eager
+        # automatically on any machine without Triton/CUDA.
+        self.triton = triton
+        # lsr (learned long/short route): a per-head learnable bias added to
+        # log_decay so each head can specialize toward SHORT-range (up = faster
+        # decay, local attention) or LONG-range (down = slower decay, global)
+        # beyond the fixed init grid. Zero at init, so no effect until trained.
+        # int8_state: quantize the cross-chunk linear state to int8 so the
+        # cheap long-range path costs ~4x less memory (asymmetric precision —
+        # short-range stays exact). Deliberately changes loss.
+        self.lsr = lsr
+        self.int8_state = int8_state
+        if lsr:
+            self.route = nn.Parameter(torch.zeros(self.n_heads))
         if dim != self.n_heads * self.head_dim:
             raise ValueError(
                 "dim (%d) must be divisible by %d heads" % (dim, self.n_heads)
@@ -114,16 +137,29 @@ class CortexMixer(nn.Module):
             del self.freqs
             del self.phases
 
-    def decay_mask(self, S: int, dtype: torch.dtype | None = None) -> torch.Tensor:
+    def _eff_log_decay(self) -> torch.Tensor:
+        """Effective per-head log decay: the learned grid plus the LSR route
+        bias when enabled (else just the grid, preserving the baseline)."""
+        return self.log_decay + self.route if self.lsr else self.log_decay
+
+    def decay_mask(
+        self,
+        S: int,
+        dtype: torch.dtype | None,
+        l: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Causal decayed mask D_h[i,j] = gamma_h^(i-j), j <= i. [1,H,S,S].
 
         Built directly in the active AMP dtype (default fp32). Building it in
         fp16 under AMP stops the [B,H,S,S] attention multiply from promoting
         to fp32 — that promotion used to be a ~16 MB/block activation leak at
         depth 33. rel/causal are cached per (S, device, dtype); only the
-        [H,S,S] exp is recomputed per call (log_decay is trainable)."""
+        [H,S,S] exp is recomputed per call (log_decay is trainable). `l` lets
+        callers inject the LSR-adjusted decay without mutating self; defaults
+        to the raw learned grid."""
         if dtype is None:
             dtype = self.log_decay.dtype
+        l = self.log_decay if l is None else l
         cache = getattr(self, "_mask_cache", None)
         if cache is None:
             cache = self._mask_cache = {}
@@ -137,33 +173,11 @@ class CortexMixer(nn.Module):
             cache[key] = (rel, causal)
         rel, causal = cache[key]
         decay = torch.exp(
-            -torch.exp(self.log_decay.to(dtype).view(1, self.n_heads, 1, 1))
+            -torch.exp(l.to(dtype).view(1, self.n_heads, 1, 1))
             * rel.view(1, 1, S, S)
         )  # [1,H,S,S]
         # Fresh clone so CUDA-graph capture (torch.compile reduce-overhead)
         # never aliases the cached rel/causal buffers.
-        return decay.masked_fill(causal, 0.0).clone()
-
-    def _local_decay(self, C: int, dtype: torch.dtype) -> torch.Tensor:
-        """Within-chunk causal decay D_h[i,j] = gamma_h^(i-j), j <= i [1,H,C,C]
-        in `dtype`. rel/causal are cached per (C, device, dtype); only the
-        [H,C,C] exp is recomputed per call (32k exp at C=64, negligible)."""
-        cache = getattr(self, "_chunk_cache", None)
-        if cache is None:
-            cache = self._chunk_cache = {}
-        key = (C, self.log_decay.device, dtype)
-        if key not in cache:
-            idx = torch.arange(C, device=self.log_decay.device)
-            rel = (idx.view(C, 1) - idx.view(1, C)).clamp(min=0).to(dtype)  # [C,C]
-            causal = torch.triu(
-                torch.ones(C, C, device=idx.device, dtype=torch.bool), 1
-            )
-            cache[key] = (rel, causal)
-        rel, causal = cache[key]
-        decay = torch.exp(
-            -torch.exp(self.log_decay.to(dtype).view(1, self.n_heads, 1, 1))
-            * rel.view(1, 1, C, C)
-        )  # [1,H,C,C]
         return decay.masked_fill(causal, 0.0).clone()
 
     def _retention_chunked(
@@ -171,64 +185,29 @@ class CortexMixer(nn.Module):
     ) -> torch.Tensor:
         """Exact chunked retention: the decayed-QK^T operator computed as
         within-chunk quadratic attention + a cross-chunk linear state instead
-        of the full O(S^2) parallel form.
-
-        For a chunk of C positions and the carried state R (decay measured
-        from the last position before the chunk), this is bit-for-bit the
-        same sum as the parallel form:
-
-            y_local_i = sum_{j<=i in chunk} gamma^(i-j)  (Q_i.K_j^T / sqrt Hd) V_j
-            y_cross_i = gamma^(i+1) (Q_i / sqrt Hd) R
-            R_new     = gamma^C R + sum_{j in chunk} gamma^(C-1-j) V_j K_j^T
-
-        Tail positions are zero-padded to a chunk multiple: zeros contribute
-        nothing to the state and real positions never attend to them (causal
-        local mask), so the result is unchanged and no branch is needed for
-        odd sequence lengths. ~C/S of the attention FLOPs and a fraction of
-        the memory of the O(S^2) form — the Tier-1 speed/memory lever.
+        of the full O(S^2) parallel form (see retention.chunked_retention_eager
+        for the math). ~C/S of the attention FLOPs and a fraction of the
+        memory of the O(S^2) form. With self.triton the forward is a single
+        fused Triton kernel per (batch, head); otherwise it runs the eager
+        per-chunk loop. The Tier-1 speed/memory lever.
         """
-        B, H, S, Hd = q.shape
-        C = self.chunk_size
-        dtype = q.dtype
-        nC = math.ceil(S / C)
-        pad = nC * C - S
-        if pad:
-            q = F.pad(q, (0, 0, 0, pad))
-            k = F.pad(k, (0, 0, 0, pad))
-            v = F.pad(v, (0, 0, 0, pad))
-        q = q.view(B, H, nC, C, Hd)
-        k = k.view(B, H, nC, C, Hd)
-        v = v.view(B, H, nC, C, Hd)
-        l = self.log_decay.to(dtype).view(1, H, 1, 1)  # [1,H,1,1]
-
-        # Within-chunk quadratic retention (all chunks batched at once).
-        qs = q * (Hd**-0.5)
-        scores = torch.matmul(qs, k.transpose(-2, -1))  # [B,H,nC,C,C]
-        y = torch.matmul(
-            scores * self._local_decay(C, dtype).unsqueeze(2), v
-        )  # [B,H,nC,C,Hd]
-
-        # Cross-chunk linear state. dec_out[i] = gamma^(i+1),
-        # dec_carry[j] = gamma^(C-1-j), gC = gamma^C.
-        pos_out = torch.arange(1, C + 1, device=q.device, dtype=dtype).view(
-            1, 1, C, 1
+        return chunked_retention(
+            q,
+            k,
+            v,
+            self._eff_log_decay(),
+            self.chunk_size,
+            use_triton=self.triton,
         )
-        dec_out = torch.exp(-torch.exp(l) * pos_out)  # [1,H,C,1]
-        pos_carry = torch.arange(C - 1, -1, -1, device=q.device, dtype=dtype).view(
-            1, 1, C, 1
-        )
-        dec_carry = torch.exp(-torch.exp(l) * pos_carry)  # [1,H,C,1]
-        gC = torch.exp(-torch.exp(l) * C)  # [1,H,1,1]
 
-        state = q.new_zeros(B, H, Hd, Hd)
-        cross = []
-        for c in range(nC):
-            cross.append(torch.matmul(qs[:, :, c] * dec_out, state))
-            state = state * gC + torch.matmul(
-                (k[:, :, c] * dec_carry).transpose(-2, -1), v[:, :, c]
-            )
-        y = y + torch.stack(cross, dim=2)
-        return y.view(B, H, nC * C, Hd)[:, :, :S, :]
+    def _retention_chunked_int8(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Chunked retention with the long-range cross-chunk state stored as
+        int8 (idea 6, NFRA_INT8_STATE). Triggers the experiments variant."""
+        return chunked_retention_int8state(
+            q, k, v, self._eff_log_decay(), self.chunk_size
+        )
 
     def forward(
         self, x: torch.Tensor, hormones: torch.Tensor | None = None
@@ -268,10 +247,15 @@ class CortexMixer(nn.Module):
         # form — with an AMP-dtype mask so the multiply stays fp16 — handles
         # short prefill steps and chunk_size=0 (exact board reproduction).
         if self.chunk_size and S > self.chunk_size:
-            y = self._retention_chunked(q, k, v)
+            if self.int8_state:
+                y = self._retention_chunked_int8(q, k, v)
+            else:
+                y = self._retention_chunked(q, k, v)
         else:
             scores = torch.matmul(q * (Hd**-0.5), k.transpose(-2, -1))
-            y = torch.matmul(scores * self.decay_mask(S, q.dtype), v)  # [B,H,S,Hd]
+            y = torch.matmul(
+                scores * self.decay_mask(S, q.dtype, self._eff_log_decay()), v
+            )  # [B,H,S,Hd]
         y = y.permute(0, 2, 1, 3).reshape(B, S, D)
         y = self.gn(y.permute(0, 2, 1)).permute(0, 2, 1)
 
@@ -429,6 +413,9 @@ class NFRA_Cortex_Block(nn.Module):
         iso_exit: bool = False,
         chunk_size: int = 0,
         ckpt_gems: bool = False,
+        triton: bool = False,
+        lsr: bool = False,
+        int8_state: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -444,6 +431,9 @@ class NFRA_Cortex_Block(nn.Module):
             iso_phase=iso_phase,
             chunk_size=chunk_size,
             ckpt_gems=ckpt_gems,
+            triton=triton,
+            lsr=lsr,
+            int8_state=int8_state,
         )
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = CortexMLP(dim, k_wta_frac=k_wta_frac, ckpt_gems=ckpt_gems)

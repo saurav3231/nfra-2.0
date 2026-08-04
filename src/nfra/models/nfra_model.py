@@ -110,6 +110,25 @@ class NFRAConfig:
     #                     O(S^2) parallel form's memory. 0 = parallel (the
     #                     verified board path). Tier-1 speed/memory lever.
     cortex_chunk_size: int = 0
+    # cortex_triton : >0 runs the chunked CortexMixer retention forward as ONE
+    #                 fused Triton kernel per (batch, head) instead of the eager
+    #                 per-chunk loop (the Tier-1 speed lever; backward stays a
+    #                 checkpoint-recompute through the eager reference so grads
+    #                 are unchanged). Falls back to eager on any machine without
+    #                 Triton/CUDA. Requires cortex_chunk_size > 0 to matter.
+    cortex_triton: bool = False
+    # ── Tier-1 experiment flags (ALL default off → every one preserves the exact
+    #    verified 1.7 baseline unless explicitly enabled; those marked * change
+    #    the loss by design — they are A/B experiments, not exact-math kernels).
+    # cortex_lsr*       : per-head learned long/short route (a bias added to
+    #                     log_decay so heads specialize local vs global).
+    # cortex_int8_state*: keep the chunked retention's long-range linear state
+    #                     in int8 (asymmetric precision → cheaper memory).
+    # cortex_depth_time*: continuous function of the depth-pass index instead of
+    #                     free per-pass FiLM scalars (fractional-depth capacity).
+    cortex_lsr: bool = False
+    cortex_int8_state: bool = False
+    cortex_depth_time: bool = False
     # ckpt_gems : recompute the two biggest GEMM activations (qkvr, MLP gate_up)
     #             in backward instead of storing them. Trade compute for ~8 MB/
     #             layer of memory. Do NOT combine with torch.compile.
@@ -239,6 +258,9 @@ class NFRAForCausalLM(nn.Module):
             block_kwargs["iso_exit"] = config.iso_exit
             block_kwargs["chunk_size"] = config.cortex_chunk_size
             block_kwargs["ckpt_gems"] = config.ckpt_gems
+            block_kwargs["triton"] = config.cortex_triton
+            block_kwargs["lsr"] = config.cortex_lsr
+            block_kwargs["int8_state"] = config.cortex_int8_state
         elif config.mode == "brain":
             block_kwargs["k_wta_frac"] = config.k_wta_frac
             block_kwargs["local_route"] = config.local_route
@@ -255,7 +277,21 @@ class NFRAForCausalLM(nn.Module):
         # start of each depth pass. Breaks depth-sharing symmetry so the SAME
         # weights don't compute identically at every depth — each pass learns
         # a cheap "depth position" specialization (~2*depth_passes*dim params).
-        if config.depth_shared and self.depth_passes > 1:
+        # idea 4 (cortex_depth_time): replace the free per-pass scalars with a
+        # continuous function of the depth index (fewer params, fractional-depth
+        # capacity). Mutually exclusive with the per-pass FiLM scalars.
+        self.depth_time = None
+        if config.depth_shared and self.depth_passes > 1 and config.cortex_depth_time:
+            from ..core.experiments import DepthTimeAdapter
+
+            self.depth_time = DepthTimeAdapter(
+                self.depth_passes, config.hidden_size
+            )
+        if (
+            config.depth_shared
+            and self.depth_passes > 1
+            and not config.cortex_depth_time
+        ):
             self.pass_scale = nn.Parameter(
                 torch.ones(self.depth_passes, config.hidden_size)
             )
@@ -341,7 +377,12 @@ class NFRAForCausalLM(nn.Module):
                 # Isolation ablation: no adaptive-compute exit gate -- plain
                 # full-depth forward, no freezing, no compute regularizer.
                 for p in range(self.depth_passes):
-                    if self.pass_scale is not None:
+                    if self.depth_time is not None:
+                        _sc, _bs = self.depth_time.film(p)
+                        hidden_states = hidden_states * _sc.view(1, 1, -1) + _bs.view(
+                            1, 1, -1
+                        )
+                    elif self.pass_scale is not None:
                         hidden_states = hidden_states * self.pass_scale[p].view(
                             1, 1, -1
                         ) + self.pass_bias[p].view(1, 1, -1)
@@ -386,7 +427,12 @@ class NFRAForCausalLM(nn.Module):
                 for p in range(self.depth_passes):
                     if not self.training and bool((active == 0).all()):
                         break
-                    if self.pass_scale is not None:
+                    if self.depth_time is not None:
+                        _sc, _bs = self.depth_time.film(p)
+                        hidden_states = hidden_states * _sc.view(1, 1, -1) + _bs.view(
+                            1, 1, -1
+                        )
+                    elif self.pass_scale is not None:
                         hidden_states = hidden_states * self.pass_scale[p].view(
                             1, 1, -1
                         ) + self.pass_bias[p].view(1, 1, -1)

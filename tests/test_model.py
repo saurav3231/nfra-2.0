@@ -323,6 +323,97 @@ def test_cortex_chunked_retention_grads_finite():
             f"{p.shape}: {p.grad.abs().max().item()} vs {q.grad.abs().max().item()}"
 
 
+def test_chunked_retention_recompute_backward():
+    """The ChunkedRetentionFn wrapper (what the fused Triton forward plugs
+    into) must match the O(S^2) parallel reference in forward AND produce the
+    same gradients via its checkpoint-recompute backward — the load-bearing
+    guarantee that swapping in the Triton forward cannot move the loss."""
+    from nfra.core.cortex import CortexMixer
+    from nfra.core.retention_triton import chunked_retention
+
+    torch.manual_seed(0)
+    m = CortexMixer(
+        dim=64, n_heads=8, iso_vgate=True, iso_rgate=False, iso_phase=True
+    )
+    m.eval()
+    B, H, S, Hd = 2, 8, 80, 8
+    q = torch.randn(B, H, S, Hd, requires_grad=True)
+    k = torch.randn(B, H, S, Hd, requires_grad=True)
+    v = torch.randn(B, H, S, Hd, requires_grad=True)
+    l = m.log_decay.detach().clone().requires_grad_(True)
+
+    scale = Hd**-0.5
+    idx = torch.arange(S, dtype=torch.float32)
+    rel = (idx.view(S, 1) - idx.view(1, S)).clamp(min=0)
+    causal = torch.triu(torch.ones(S, S, dtype=torch.bool), 1)
+    decay = torch.exp(-torch.exp(l.view(H, 1, 1)) * rel.view(1, S, S))
+    decay = decay.masked_fill(causal.view(1, S, S), 0.0)
+    yp = torch.matmul(torch.matmul(q * scale, k.transpose(-2, -1)) * decay, v)
+
+    ya = chunked_retention(q, k, v, l, 16, use_triton=False)
+    assert torch.allclose(ya, yp, atol=1e-3), (ya - yp).abs().max().item()
+    ya.pow(2).mean().backward()
+    gq_a, gk_a, gv_a, gl_a = q.grad, k.grad, v.grad, l.grad
+
+    q.grad = k.grad = v.grad = l.grad = None
+    yb = chunked_retention(q, k, v, l, 16, use_triton=True)  # CPU -> eager fallback
+    assert torch.allclose(ya, yb, atol=1e-6)
+    yb.pow(2).mean().backward()
+    assert torch.allclose(q.grad, gq_a, atol=1e-6)
+    assert torch.allclose(k.grad, gk_a, atol=1e-6)
+    assert torch.allclose(v.grad, gv_a, atol=1e-6)
+    assert torch.allclose(l.grad, gl_a, atol=1e-6)
+
+
+def _cortex_cfg(**overrides):
+    cfg = dict(
+        mode="brain", vocab_size=32, hidden_size=64, num_layers=4,
+        use_cortex=True, dropout=0.0, iso_gland=True, iso_vgate=True,
+        iso_rgate=False, iso_phase=True, iso_exit=True,
+    )
+    cfg.update(overrides)
+    return NFRAConfig(**cfg)
+
+
+def test_cortex_experiments_flags_train_smoke():
+    """Each opt-in experiment flag (LSR, int8 state, depth-time, chunked+Triton)
+    must build, forward, and backprop with finite grads on CPU."""
+    variants = (
+        _cortex_cfg(cortex_lsr=True),
+        _cortex_cfg(cortex_chunk_size=16, cortex_int8_state=True),
+        _cortex_cfg(cortex_depth_time=True),
+        _cortex_cfg(cortex_chunk_size=16, cortex_triton=True),
+    )
+    for cfg in variants:
+        model = NFRAForCausalLM(cfg)
+        x = torch.randint(0, 32, (2, 40))
+        out = model(x)
+        assert out["logits"].shape == (2, 40, 32)
+        out["logits"].float().mean().backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads
+        assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_cortex_default_is_all_flags_off():
+    """The default config (every experiment knob unset) must be IDENTICAL to a
+    model built with every knob explicitly off — guards that no experiment gate
+    leaks into the verified path."""
+    defaults = NFRAForCausalLM(_cortex_cfg())
+    explicit = NFRAForCausalLM(_cortex_cfg(
+        cortex_chunk_size=0, cortex_triton=False, cortex_lsr=False,
+        cortex_int8_state=False, cortex_depth_time=False,
+    ))
+    with torch.no_grad():
+        for p, q in zip(defaults.parameters(), explicit.parameters()):
+            q.copy_(p)
+    defaults.eval()
+    explicit.eval()
+    x = torch.randint(0, 32, (2, 40))
+    diff = (defaults(x)["logits"] - explicit(x)["logits"]).abs().max().item()
+    assert diff == 0.0, f"default vs all-off drifted by {diff:.2e}"
+
+
 def test_cortex_chunked_model_train_smoke():
     """Full NFRAForCausalLM with the chunked cortex mixer: builds, forwards,
     backward, finite grads (CPU smoke — guards config plumbing)."""

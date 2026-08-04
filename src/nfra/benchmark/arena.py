@@ -159,6 +159,29 @@ COMPILE = os.environ.get("NFRA_COMPILE", "0") == "1"
 # 0 = verified parallel path; enable (NFRA_CHUNK_SIZE=64) only for long-context
 # runs where the quadratic memory win dominates. Verified loss unchanged.
 CHUNK_SIZE = int(os.environ.get("NFRA_CHUNK_SIZE", "0"))
+# Fused Triton chunked-retention forward (NFRA_TRITON=1, only with NFRA_CHUNK_SIZE>0):
+# one fused kernel per (batch, head) replaces the eager per-chunk state loop —
+# the Tier-1 speed lever. Backward is an unchanged checkpoint-recompute through
+# the eager reference, so loss is preserved. Falls back to eager if Triton or
+# CUDA is unavailable. Only for NFRA; RetNet is untouched.
+TRITON = os.environ.get("NFRA_TRITON", "0") == "1"
+# ── Tier-1 experiment flags (idea list). ALL default off → NFRA is byte-identical
+#    to the verified baseline unless one is set. Only meaningful with CORTEX=1.
+#    Ideas 4-6 change loss by design (A/B experiments, not exact-math kernels).
+# LSR         idea 5: per-head learned long/short route (log_decay bias).
+# INT8_STATE  idea 6: int8 long-range state in chunked retention.
+# DEPTH_TIME  idea 4: continuous function of depth-pass index instead of free
+#             per-pass FiLM scalars.
+# FUSE_MODEL  idea 1: whole-model single-graph fusion (strongest inductor mode).
+# BATCH_PASSES idea 2: fuse the shared-weight depth-pass loop into one compiled
+#             graph (used when FUSE_MODEL is off).
+# FUSE_NORM   idea 3: fused output-projection + GroupNorm epilogue (Triton).
+LSR = os.environ.get("NFRA_LSR", "0") == "1"
+INT8_STATE = os.environ.get("NFRA_INT8_STATE", "0") == "1"
+DEPTH_TIME = os.environ.get("NFRA_DEPTH_TIME", "0") == "1"
+FUSE_MODEL = os.environ.get("NFRA_FUSE_MODEL", "0") == "1"
+BATCH_PASSES = os.environ.get("NFRA_BATCH_PASSES", "0") == "1"
+FUSE_NORM = os.environ.get("NFRA_FUSE_NORM", "0") == "1"
 # Recompute the two biggest GEMM activations (qkvr, MLP gate_up) in backward
 # instead of storing them (~8 MB/layer saved, ~0.3 GB at depth 33). Trade
 # compute for memory; measured NEGATIVE at 20M/S=256 (1.63 -> 1.69 GB, +23%
@@ -220,6 +243,10 @@ def build_nfra(
     iso_exit=None,
     chunk_size=None,
     ckpt_gems=None,
+    triton=None,
+    lsr=None,
+    int8_state=None,
+    depth_time=None,
 ):
     if k_wta is None:
         k_wta = KWTA
@@ -257,6 +284,14 @@ def build_nfra(
         chunk_size = CHUNK_SIZE
     if ckpt_gems is None:
         ckpt_gems = CKPT_GEMM
+    if triton is None:
+        triton = TRITON
+    if lsr is None:
+        lsr = LSR
+    if int8_state is None:
+        int8_state = INT8_STATE
+    if depth_time is None:
+        depth_time = DEPTH_TIME
     cfg = NFRAConfig(
         mode="brain",
         vocab_size=vocab,
@@ -285,6 +320,10 @@ def build_nfra(
         iso_exit=iso_exit,
         cortex_chunk_size=chunk_size,
         ckpt_gems=ckpt_gems,
+        cortex_triton=triton,
+        cortex_lsr=lsr,
+        cortex_int8_state=int8_state,
+        cortex_depth_time=depth_time,
     )
     return NFRAForCausalLM(cfg)
 
@@ -419,7 +458,18 @@ def train_one(
     seed=None,
 ):
     model.train()
-    if COMPILE and HAS_CUDA:
+    # Idea 1/2 (whole-model fusion): the depth_shared reuse loop and the whole
+    # block stream are folded into ONE inducted computation graph. FUSE_MODEL
+    # uses the strongest whole-graph mode; otherwise compile (or BATCH_PASSES,
+    # which fuses just the shared-weight depth loop) uses the standard mode —
+    # both auto-disable checkpointing (recompute conflicts with graph capture).
+    compile_mode = None
+    if HAS_CUDA:
+        if FUSE_MODEL:
+            compile_mode = "max-autotune-no-cudagraphs"
+        elif COMPILE or BATCH_PASSES:
+            compile_mode = "default"
+    if compile_mode:
         # Keep the caller's reference uncompiled (fine for later evals); train
         # the compiled copy here. Dropout is handled correctly by Dynamo (it
         # advances RNG between replays), so no loss of stochasticity.
@@ -428,8 +478,8 @@ def train_one(
             ckpt_was = cfg.gradient_checkpointing if cfg is not None else None
             if cfg is not None:
                 cfg.gradient_checkpointing = False
-            model = torch.compile(model, mode="default", dynamic=False)
-            print("  [compile] torch.compile(mode=default) active")
+            model = torch.compile(model, mode=compile_mode, dynamic=False)
+            print(f"  [compile] torch.compile(mode={compile_mode}) active")
         except Exception as e:  # pragma: no cover - depends on torch version
             print(f"  [warn] torch.compile failed ({e}) - eager fallback")
         finally:
