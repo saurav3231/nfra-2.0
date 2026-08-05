@@ -25,22 +25,38 @@ Run on a Kaggle T4 (the one-cell bootstrap):
 import os
 import sys
 
-os.environ["NFRA_CHECKPOINT"] = "0"
+os.environ["NFRA_CHECKPOINT"] = os.environ.get("NFRA_GATE_CKPT", "0")
 os.environ["NFRA_COMPILE"] = "0"
 os.environ["NFRA_SCAN_KERNEL"] = "0"
 os.environ["NFRA_CHUNK_SIZE"] = "0"
 os.environ["NFRA_CKPT_GEMM"] = "0"
+os.environ["NFRA_BATCH"] = os.environ.get("NFRA_GATE_BATCH", os.environ.get("NFRA_BATCH", ""))
 os.environ["NFRA_EMA"] = os.environ.get("NFRA_GATE_EMA", "0.99")
 os.environ["NFRA_DATA"] = os.environ.get("NFRA_GATE_DATA", "wikitext2").lower()
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 STEPS = int(os.environ.get("NFRA_GATE_STEPS", "300"))
 EMA = float(os.environ["NFRA_EMA"])
+# NFRA_GATE_TARGET_M: param budget to tune to (5/20/50). NFRA_GATE_ARMS: a
+# comma-list of arm names to run (empty = all). Both let a single run target
+# one goal — loss (50M, lsr, rigorous steps) vs memory (ckpt, small batch).
+TARGET_M = int(os.environ.get("NFRA_GATE_TARGET_M", "20"))
+ARMS = {
+    "baseline":     dict(chunk_size=0, triton=False, lsr=False, int8_state=False, depth_time=False),
+    "triton_chunk": dict(chunk_size=64, triton=True),
+    "lsr":          dict(lsr=True),
+    "int8_state":   dict(chunk_size=64, int8_state=True),
+    "depth_time":   dict(depth_time=True),
+    "batch_pass":   dict(),
+    "fuse_model":   dict(),
+}
 
 import torch
 
 from nfra.benchmark import arena
 from nfra.benchmark.arena import (
+    BATCH,
+    CHECKPOINT,
     DIM_GRID,
     EVAL_GAP,
     SEED_LIST,
@@ -94,21 +110,17 @@ def main() -> int:
     if not HAS_CUDA:
         print("experiments_gate.py needs a CUDA GPU (T4). This box is CPU-only.")
         return 1
-    print(f"T4 experiment battery  steps={STEPS} ema={EMA} data={arena.DATA_SOURCE}")
+    print(
+        f"T4 experiment battery  steps={STEPS} ema={EMA} data={arena.DATA_SOURCE} "
+        f"target={TARGET_M}M batch={BATCH} ckpt={arena.CHECKPOINT}"
+    )
 
-    U, dim, _params = tune_nfra_size(20_000_000, VOCAB, 33, DIM_GRID[20])
+    U, dim, _params = tune_nfra_size(TARGET_M * 1_000_000, VOCAB, 33, DIM_GRID[TARGET_M])
     seed = SEED_LIST[0]
     train_loaders, eval_loader, _ = make_loaders(0)
 
-    arms = [
-        ("baseline",     dict(chunk_size=0, triton=False, lsr=False, int8_state=False, depth_time=False)),
-        ("triton_chunk", dict(chunk_size=64, triton=arena.TRITON)),
-        ("lsr",          dict(lsr=True)),
-        ("int8_state",   dict(chunk_size=64, int8_state=True)),
-        ("depth_time",   dict(depth_time=True)),
-        ("batch_pass",   dict()),
-        ("fuse_model",   dict()),
-    ]
+    select = [s.strip() for s in os.environ.get("NFRA_GATE_ARMS", "").split(",") if s.strip()]
+    arms = [(n, k) for n, k in ARMS.items() if not select or n in select]
     compile_arm = {"batch_pass": "BATCH_PASSES", "fuse_model": "FUSE_MODEL"}
 
     results = {}
