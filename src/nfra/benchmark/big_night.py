@@ -50,15 +50,14 @@ import nfra.benchmark.compare as C
 importlib.reload(C)
 importlib.reload(A)
 from nfra.benchmark.compare import (
-    DataLoader, WikiText2Dataset, count_params, evaluate, make_optimizer, EMA,
-    compute_loss, rescale_embed, measure_speed_memory, RetNetLM, RWKVLM,
-    GPT2ForCausalLM, SEQ_LEN, BATCH, USE_AMP,
+    DataLoader, WikiText2Dataset, HierarchicalDataset, count_params, evaluate,
+    make_optimizer, EMA, compute_loss, rescale_embed, measure_speed_memory,
+    RetNetLM, RWKVLM, GPT2ForCausalLM, SEQ_LEN, BATCH, USE_AMP,
 )
 from nfra.benchmark.arena import build_nfra
 from nfra.core.stateful import stateful_generate_metrics
 
 VOCAB = 96
-RANDOM_LOSS = math.log(VOCAB)
 DIMS = [768, 704, 640, 576, 512, 448, 384, 352, 320, 288, 256, 224, 192, 160, 128]
 
 
@@ -166,8 +165,15 @@ def train(seed, steps, train_ds, eval_loader, model, vocab):
 
 
 wall0 = time.perf_counter()
-train_ds = WikiText2Dataset("train", SEQ_LEN)
-eval_ds = WikiText2Dataset("validation", SEQ_LEN)
+if C.DATA_SOURCE == "wikitext2":  # real WikiText-2 char text (vocab 96)
+    train_ds = WikiText2Dataset("train", SEQ_LEN)
+    eval_ds = WikiText2Dataset("validation", SEQ_LEN)
+    VOCAB = 96
+else:  # synthetic hierarchical topics (vocab 4096) — mirror compare's fallback
+    train_ds = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1, seed=42, seq_seed=42)
+    eval_ds = HierarchicalDataset(512, SEQ_LEN + 1, seed=42, seq_seed=43)
+    VOCAB = HierarchicalDataset.VOCAB_SIZE
+RANDOM_LOSS = math.log(VOCAB)
 eval_loader = DataLoader(eval_ds, batch_size=BATCH, shuffle=False, num_workers=0)
 
 SEEDS = [42, 7, 2026, 1337, 777][:SEED_CNT]
