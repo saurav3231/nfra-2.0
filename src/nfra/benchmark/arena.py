@@ -186,6 +186,24 @@ PER_TOKEN_GN = os.environ.get("NFRA_PERTOKEN_GN", "0") == "1"
 FUSE_MODEL = os.environ.get("NFRA_FUSE_MODEL", "0") == "1"
 BATCH_PASSES = os.environ.get("NFRA_BATCH_PASSES", "0") == "1"
 FUSE_NORM = os.environ.get("NFRA_FUSE_NORM", "0") == "1"
+
+# NFRA_RECOMMENDED=1: apply the verified best-practice recipe in one switch.
+# The repo's DEFAULT is deliberately byte-identical to the verified baseline
+# (knobs off) so a fresh clone reproduces the board exactly. This preset is the
+# opt-in production config from docs/VERIFIED_FINDINGS.md — it turns on the two
+# levers that measured as safe all-round wins without changing anything else:
+#   * LSR          (learned long/short routing): best composite score, best
+#                   sample-AUC, ~neutral eval, and keeps exact O(1) stateful gen.
+#   * PER_TOKEN_GN (per-token normalization): gives the exact stateful O(1)
+#                   decode dual (safe fast path, guard-verified).
+# An explicitly-set NFRA_LSR=0 / NFRA_PERTOKEN_GN=0 still wins over the preset, so users can't
+# be forced into a preset they explicitly disabled.
+RECOMMENDED = os.environ.get("NFRA_RECOMMENDED", "0") == "1"
+if RECOMMENDED:
+    if "NFRA_LSR" not in os.environ:
+        LSR = True
+    if "NFRA_PERTOKEN_GN" not in os.environ:
+        PER_TOKEN_GN = True
 # Recompute the two biggest GEMM activations (qkvr, MLP gate_up) in backward
 # instead of storing them (~8 MB/layer saved, ~0.3 GB at depth 33). Trade
 # compute for memory; measured NEGATIVE at 20M/S=256 (1.63 -> 1.69 GB, +23%
