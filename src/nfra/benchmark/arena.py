@@ -179,6 +179,10 @@ TRITON = os.environ.get("NFRA_TRITON", "0") == "1"
 LSR = os.environ.get("NFRA_LSR", "0") == "1"
 INT8_STATE = os.environ.get("NFRA_INT8_STATE", "0") == "1"
 DEPTH_TIME = os.environ.get("NFRA_DEPTH_TIME", "0") == "1"
+# PER_TOKEN_GN: normalize the mixer GroupNorm per token (no cross-token
+# coupling) so the retention stateful-decode dual is exact (stateful.py).
+# Requires a retrain; toggled by NFRA_PERTOKEN_GN=1.
+PER_TOKEN_GN = os.environ.get("NFRA_PERTOKEN_GN", "0") == "1"
 FUSE_MODEL = os.environ.get("NFRA_FUSE_MODEL", "0") == "1"
 BATCH_PASSES = os.environ.get("NFRA_BATCH_PASSES", "0") == "1"
 FUSE_NORM = os.environ.get("NFRA_FUSE_NORM", "0") == "1"
@@ -324,6 +328,7 @@ def build_nfra(
         cortex_lsr=lsr,
         cortex_int8_state=int8_state,
         cortex_depth_time=depth_time,
+        cortex_per_token_gn=PER_TOKEN_GN,
     )
     return NFRAForCausalLM(cfg)
 

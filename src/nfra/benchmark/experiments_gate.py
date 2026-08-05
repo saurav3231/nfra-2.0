@@ -172,14 +172,23 @@ def main() -> int:
         gm = generate_metrics(m, VOCAB)
         r["gen_tok_s"] = gm["gen_tok_s"]
         r["infer_mem"] = gm["infer_mem"]
+        try:
+            from nfra.core.stateful import stateful_generate_metrics
+
+            sf = stateful_generate_metrics(m, VOCAB, device=DEVICE)
+            r.update(sf)
+        except Exception:  # pragma: no cover - keep the battery alive on any hiccup
+            r.update({"gen_sf": None, "sf_abs": None, "sf_rel": None, "sf_ok": None})
         results[name] = r
         ext_d = r["ext_eval"] - r["final_eval"]
+        gen_sf = f"{r['gen_sf']:.0f}/s" if r["gen_sf"] else "  -  "
+        sf_ok = f"ok" if r["sf_ok"] else ("X" if r["sf_ok"] is not None else "-")
         print(
             f"  {name:11s} train {r['loss_hist'][-1]:.4f}  eval {r['final_eval']:.4f}  "
             f"ext {r['ext_eval']:.4f}(d{ext_d:+.3f})  tok/s {r['tok_s']:.0f}  "
             f"mem {r['peak_mem']:.3f} GB  gen {r['gen_tok_s']:.0f}/s  "
-            f"infer {r['infer_mem']:.3f} GB  auc {r['sample_auc']:.3f}  "
-            f"ms/step {r['ms_per_step']:.1f}"
+            f"gen_sf {gen_sf}{sf_ok}  infer {r['infer_mem']:.3f} GB  "
+            f"auc {r['sample_auc']:.3f}  ms/step {r['ms_per_step']:.1f}"
         )
         del m
         torch.cuda.empty_cache()

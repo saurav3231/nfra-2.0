@@ -44,6 +44,40 @@ from .experiments import chunked_retention_int8state
 from .retention_triton import chunked_retention
 
 
+class PerTokenGN(nn.Module):
+    """GroupNorm over each head's channels for EACH token independently.
+
+    nn.GroupNorm couples all positions (it normalizes a group across the
+    sequence), so re-evaluating a longer context silently changes every prior
+    token's hidden state -- a future leak that makes the retention dual
+    impossible to run O(1)-exactly. Per-token GN removes the cross-token
+    coupling: retention state + running causal stats are then the ONLY
+    cross-token state, so the stateful decode dual (stateful.py) is exact.
+    Params are named .weight/.bias exactly like GroupNorm, so existing
+    checkpoints (same keys) still load and retraining with this flag is a
+    drop-in swap. Input [B, D, S] (same calling convention as the old gn)."""
+
+    def __init__(self, num_channels: int, num_groups: int, eps: float = 1e-5):
+        super().__init__()
+        self.num_channels = num_channels
+        self.num_groups = num_groups
+        self.head_dim = num_channels // num_groups
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, D, S = x.shape
+        H = self.num_groups
+        Hd = self.head_dim
+        xg = x.view(B, H, Hd, S)
+        mean = xg.mean(dim=2, keepdim=True)  # [B,H,1,S] over Hd only
+        var = xg.var(dim=2, keepdim=True, unbiased=False)
+        yn = (xg - mean) / torch.sqrt(var + self.eps)
+        yn = yn * self.weight.view(H, Hd, 1) + self.bias.view(H, Hd, 1)
+        return yn.view(B, D, S)
+
+
 class CortexMixer(nn.Module):
     """Resonance retention mixer (the 3.3b core).
 
@@ -74,6 +108,7 @@ class CortexMixer(nn.Module):
         triton: bool = False,
         lsr: bool = False,
         int8_state: bool = False,
+        per_token_gn: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -120,7 +155,11 @@ class CortexMixer(nn.Module):
         #   3*D        (q,k,v)                  -- receptance pruned too
         self.n_gates = 2 - int(iso_vgate) - int(iso_rgate)
         self.qkvr = nn.Linear(dim, (3 + self.n_gates) * dim, bias=False)
-        self.gn = nn.GroupNorm(n_heads, dim)
+        # per-token GN: normalizes each head over its own channels per token
+        # (no cross-token coupling), making the retention stateful dual exact.
+        self.gn = (
+            PerTokenGN(dim, n_heads) if per_token_gn else nn.GroupNorm(n_heads, dim)
+        )
         self.proj_out = nn.Linear(dim, dim, bias=False)
 
         # Multi-scale resonance decay: heads spread across timescales. Init
@@ -416,6 +455,7 @@ class NFRA_Cortex_Block(nn.Module):
         triton: bool = False,
         lsr: bool = False,
         int8_state: bool = False,
+        per_token_gn: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -434,6 +474,7 @@ class NFRA_Cortex_Block(nn.Module):
             triton=triton,
             lsr=lsr,
             int8_state=int8_state,
+            per_token_gn=per_token_gn,
         )
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = CortexMLP(dim, k_wta_frac=k_wta_frac, ckpt_gems=ckpt_gems)

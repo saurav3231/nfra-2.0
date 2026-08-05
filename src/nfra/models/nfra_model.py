@@ -129,6 +129,10 @@ class NFRAConfig:
     cortex_lsr: bool = False
     cortex_int8_state: bool = False
     cortex_depth_time: bool = False
+    # cortex_per_token_gn*: normalize the mixer GroupNorm over each head's
+    #                       channels PER TOKEN (no cross-token coupling) so the
+    #                       retention dual runs O(1)-exact (stateful.py).
+    cortex_per_token_gn: bool = False
     # ckpt_gems : recompute the two biggest GEMM activations (qkvr, MLP gate_up)
     #             in backward instead of storing them. Trade compute for ~8 MB/
     #             layer of memory. Do NOT combine with torch.compile.
@@ -261,6 +265,7 @@ class NFRAForCausalLM(nn.Module):
             block_kwargs["triton"] = config.cortex_triton
             block_kwargs["lsr"] = config.cortex_lsr
             block_kwargs["int8_state"] = config.cortex_int8_state
+            block_kwargs["per_token_gn"] = config.cortex_per_token_gn
         elif config.mode == "brain":
             block_kwargs["k_wta_frac"] = config.k_wta_frac
             block_kwargs["local_route"] = config.local_route
