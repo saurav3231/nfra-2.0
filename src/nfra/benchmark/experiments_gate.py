@@ -32,6 +32,7 @@ os.environ["NFRA_CHUNK_SIZE"] = "0"
 os.environ["NFRA_CKPT_GEMM"] = "0"
 os.environ["NFRA_BATCH"] = os.environ.get("NFRA_GATE_BATCH", os.environ.get("NFRA_BATCH", ""))
 os.environ["NFRA_EMA"] = os.environ.get("NFRA_GATE_EMA", "0.99")
+os.environ["NFRA_SEQ"] = os.environ.get("NFRA_GATE_SEQ", os.environ.get("NFRA_SEQ", ""))
 os.environ["NFRA_DATA"] = os.environ.get("NFRA_GATE_DATA", "wikitext2").lower()
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
@@ -69,9 +70,12 @@ from nfra.benchmark.arena import (
     CHECKPOINT,
     DIM_GRID,
     EVAL_GAP,
+    SEQ_LEN,
     SEED_LIST,
     build_nfra,
+    generate_metrics,
     make_loaders,
+    sample_auc,
     train_one,
     tune_nfra_size,
 )
@@ -122,14 +126,14 @@ def main() -> int:
         return 1
     print(
         f"T4 experiment battery  steps={STEPS} ema={EMA} data={arena.DATA_SOURCE} "
-        f"target={TARGET_M}M depth={DEPTH} batch={BATCH} ckpt={arena.CHECKPOINT}"
+        f"target={TARGET_M}M depth={DEPTH} seq={SEQ_LEN} batch={BATCH} ckpt={arena.CHECKPOINT}"
     )
 
     U, dim, _params = tune_nfra_size(
         TARGET_M * 1_000_000, VOCAB, DEPTH, DIM_GRID[TARGET_M]
     )
     seed = SEED_LIST[0]
-    train_loaders, eval_loader, _ = make_loaders(0)
+    train_loaders, eval_loader, ext_loader = make_loaders(0)
 
     select = [s.strip() for s in os.environ.get("NFRA_GATE_ARMS", "").split(",") if s.strip()]
     arms = [(n, k) for n, k in ARMS.items() if not select or n in select]
@@ -157,10 +161,19 @@ def main() -> int:
         )
         ev = evaluate(m, eval_loader)
         r["final_eval"] = float(ev)
+        r["ext_eval"] = float(evaluate(m, ext_loader))  # long-context (seq*2)
+        r["sample_auc"] = sample_auc(r["eval_hist"])
+        gm = generate_metrics(m, VOCAB)
+        r["gen_tok_s"] = gm["gen_tok_s"]
+        r["infer_mem"] = gm["infer_mem"]
         results[name] = r
+        ext_d = r["ext_eval"] - r["final_eval"]
         print(
-            f"  {name:11s} train {r['loss_hist'][-1]:.4f}  eval {float(ev):.4f}  "
-            f"tok/s {r['tok_s']:.0f}  mem {r['peak_mem']:.3f} GB  ms/step {r['ms_per_step']:.1f}"
+            f"  {name:11s} train {r['loss_hist'][-1]:.4f}  eval {r['final_eval']:.4f}  "
+            f"ext {r['ext_eval']:.4f}(d{ext_d:+.3f})  tok/s {r['tok_s']:.0f}  "
+            f"mem {r['peak_mem']:.3f} GB  gen {r['gen_tok_s']:.0f}/s  "
+            f"infer {r['infer_mem']:.3f} GB  auc {r['sample_auc']:.3f}  "
+            f"ms/step {r['ms_per_step']:.1f}"
         )
         del m
         torch.cuda.empty_cache()
@@ -173,8 +186,11 @@ def main() -> int:
                 continue
             print(
                 f"  {name:11s} eval {r['final_eval'] - base['final_eval']:+.4f}   "
+                f"ext {r['ext_eval'] - base['ext_eval']:+.4f}   "
                 f"tok/s {r['tok_s'] - base['tok_s']:+.0f}   "
-                f"mem {r['peak_mem'] - base['peak_mem']:+.3f} GB"
+                f"mem {r['peak_mem'] - base['peak_mem']:+.3f}   "
+                f"gen_inf {r['gen_tok_s'] - base['gen_tok_s']:+.0f}   "
+                f"infer_mem {r['infer_mem'] - base['infer_mem']:+.3f}"
             )
     return 0
 

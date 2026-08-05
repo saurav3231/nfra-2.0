@@ -107,7 +107,7 @@ LORA_RANK = int(os.environ.get("NFRA_LORA_RANK", "0"))  # 0 = off (Space axis)
 D_STATE = 8
 NFRA_DEPTH = 12  # effective NFRA depth (unique × passes)
 EVAL_GAP = max(50, STEPS // 6)
-SEQ_LEN = 256
+SEQ_LEN = int(os.environ.get("NFRA_SEQ", "256"))
 SEED = 42
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
