@@ -158,16 +158,17 @@ def main() -> int:
         del m
         torch.cuda.empty_cache()
 
-    base = results["baseline"]
-    print("\n── deltas vs baseline ──")
-    for name, r in results.items():
-        if name == "baseline":
-            continue
-        print(
-            f"  {name:11s} eval {r['final_eval'] - base['final_eval']:+.4f}   "
-            f"tok/s {r['tok_s'] - base['tok_s']:+.0f}   "
-            f"mem {r['peak_mem'] - base['peak_mem']:+.3f} GB"
-        )
+    if "baseline" in results:
+        base = results["baseline"]
+        print("\n── deltas vs baseline ──")
+        for name, r in results.items():
+            if name == "baseline":
+                continue
+            print(
+                f"  {name:11s} eval {r['final_eval'] - base['final_eval']:+.4f}   "
+                f"tok/s {r['tok_s'] - base['tok_s']:+.0f}   "
+                f"mem {r['peak_mem'] - base['peak_mem']:+.3f} GB"
+            )
     return 0
 
 
