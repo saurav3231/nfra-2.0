@@ -40,7 +40,12 @@ EMA = float(os.environ["NFRA_EMA"])
 # NFRA_GATE_TARGET_M: param budget to tune to (5/20/50). NFRA_GATE_ARMS: a
 # comma-list of arm names to run (empty = all). Both let a single run target
 # one goal — loss (50M, lsr, rigorous steps) vs memory (ckpt, small batch).
+# NFRA_GATE_DEPTH: effective layer count (default 33 = the verified deep stack).
+# The step is compute-bound across the sequential blocks, so fewer layers give
+# an almost-linear tok/s win at a small loss cost (dim is re-tuned to keep the
+# same 20M budget): depth 33 -> 16 roughly doubles tok/s toward ~30k.
 TARGET_M = int(os.environ.get("NFRA_GATE_TARGET_M", "20"))
+DEPTH = int(os.environ.get("NFRA_GATE_DEPTH", "33"))
 ARMS = {
     "baseline":     dict(chunk_size=0, triton=False, lsr=False, int8_state=False, depth_time=False),
     "triton_chunk": dict(chunk_size=64, triton=True),
@@ -117,10 +122,12 @@ def main() -> int:
         return 1
     print(
         f"T4 experiment battery  steps={STEPS} ema={EMA} data={arena.DATA_SOURCE} "
-        f"target={TARGET_M}M batch={BATCH} ckpt={arena.CHECKPOINT}"
+        f"target={TARGET_M}M depth={DEPTH} batch={BATCH} ckpt={arena.CHECKPOINT}"
     )
 
-    U, dim, _params = tune_nfra_size(TARGET_M * 1_000_000, VOCAB, 33, DIM_GRID[TARGET_M])
+    U, dim, _params = tune_nfra_size(
+        TARGET_M * 1_000_000, VOCAB, DEPTH, DIM_GRID[TARGET_M]
+    )
     seed = SEED_LIST[0]
     train_loaders, eval_loader, _ = make_loaders(0)
 
@@ -140,7 +147,7 @@ def main() -> int:
         for attr in ("FUSE_MODEL", "BATCH_PASSES"):
             setattr(arena, attr, attr in (compile_arm.get(name, ""),))
         build = lambda n=name, k=dict(kw): build_nfra(
-            VOCAB, dim, U, depth=33, use_cortex=True, **k,
+            VOCAB, dim, U, depth=DEPTH, use_cortex=True, **k,
         )
         _sanity(build, name)
         m = build().to(DEVICE)
