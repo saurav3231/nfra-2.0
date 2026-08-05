@@ -30,11 +30,17 @@ os.environ["NFRA_COMPILE"] = "0"
 os.environ["NFRA_SCAN_KERNEL"] = "0"
 os.environ["NFRA_CHUNK_SIZE"] = "0"
 os.environ["NFRA_CKPT_GEMM"] = "0"
-os.environ["NFRA_BATCH"] = os.environ.get("NFRA_GATE_BATCH", os.environ.get("NFRA_BATCH", ""))
+os.environ["NFRA_BATCH"] = os.environ.get("NFRA_GATE_BATCH") or os.environ.get("NFRA_BATCH") or ""
 os.environ["NFRA_EMA"] = os.environ.get("NFRA_GATE_EMA", "0.99")
-os.environ["NFRA_SEQ"] = os.environ.get("NFRA_GATE_SEQ", os.environ.get("NFRA_SEQ", ""))
+os.environ["NFRA_SEQ"] = os.environ.get("NFRA_GATE_SEQ") or os.environ.get("NFRA_SEQ") or "256"
 os.environ["NFRA_DATA"] = os.environ.get("NFRA_GATE_DATA", "wikitext2").lower()
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+# Only propagate BATCH / SEQLEN overrides when a real (non-empty) value exists;
+# leaving them unset lets compare.py / arena pick their own defaults.
+for _k in ("NFRA_BATCH", "NFRA_SEQ"):
+    if not os.environ.get(_k, "").strip():
+        os.environ.pop(_k, None)
 
 STEPS = int(os.environ.get("NFRA_GATE_STEPS", "300"))
 EMA = float(os.environ["NFRA_EMA"])
