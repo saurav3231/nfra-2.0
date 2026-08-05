@@ -25,7 +25,7 @@ CONFIG = {                     # flagship budget from the depth-8 sweep
     "NFRA_PERTOKEN_GN": "1",    # O(1) stateful decode is exact (guard = 'ok')
     "NFRA_EMA": "0.99",         # EMA weight-averaging decay (0 = off)
 }
-ARMS = ["baseline", "lsr", "int8_state", "depth_time", "triton_chunk", "rev"]
+ARMS = ["trained", "lsr", "int8_state", "depth_time", "triton_chunk", "rev"]
 for _k, _v in CONFIG.items():
     os.environ[_k] = _v
 
