@@ -49,6 +49,11 @@ ARMS = {
     "depth_time":   dict(depth_time=True),
     "batch_pass":   dict(),
     "fuse_model":   dict(),
+    # "rev" = the optimum balanced recipe: lsr (proven -0.078 eval) + default
+    # torch.compile (fuses the 33-block launch stream: the documented fix for
+    # the 11.5k tok/s bottleneck, and it reuses buffers -> also cuts peak mem).
+    # lsr and compile compose (compile wraps the whole model, lsr is interior).
+    "rev":          dict(lsr=True),
 }
 
 import torch
@@ -121,7 +126,11 @@ def main() -> int:
 
     select = [s.strip() for s in os.environ.get("NFRA_GATE_ARMS", "").split(",") if s.strip()]
     arms = [(n, k) for n, k in ARMS.items() if not select or n in select]
-    compile_arm = {"batch_pass": "BATCH_PASSES", "fuse_model": "FUSE_MODEL"}
+    compile_arm = {
+        "batch_pass": "BATCH_PASSES",
+        "fuse_model": "FUSE_MODEL",
+        "rev": "BATCH_PASSES",
+    }
 
     results = {}
     for name, kw in arms:
