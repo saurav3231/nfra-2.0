@@ -53,13 +53,20 @@ constant*, so no gradient reaches `wq/wk` and the ring never learns. Fix: zero o
 Once training starts, `wq/wk/wv` receive real gradients inside a fitted read signal and the
 ring learns a function while starting as the pure bottom baseline → **zero-regression**.
 
-### Verified (CPU structural, this repo)
-```
-[1] init zero-regression  : enabled == disabled, max_abs = 0.0        → bit-identical
-[2] stateful O(1) dual    : sf_ok=True, max_rel=4.39e-07, active ring → exact
-[3] ring learns (3 steps) : wv.grad ~1.8, w_out.grad ~11.9, output moved
-```
-The eval-Δ / speed / regression numbers require the T4; see the `bench_stm` cell.
+### Verified
+CPU structural (this repo): init parity 0.0 (bit-identical), O(1) dual exact with an
+active ring (`max_rel ≈ 4e-7`), ring trains. On the T4 (20M, batch 16, seq 256, EMA 0.99):
+
+| A/B (off vs ring-on, identical init/batches) | result |
+|---|---|
+| eval, unseen content (seq_seed SEED+1), 2000 steps | 8.333 vs 8.335 → **Δ +0.002 (tie)** |
+| train-step time | **+19.6–27%** (fp32 bug fixed; remaining cost is launch-bound) |
+| O(1) stateful | sf_ok True, max_rel ≤ 2e-5, gen_sf ~90–100/s |
+
+Perplexity is **unchanged on unseen content** (the −2.4 nat "win" earlier was shared-content
+echo, not real). The ring does not regress the model and keeps exact O(1) decode, but its
+training overhead (+~20%) is inherent to many tiny per-layer ops under checkpointing at
+this model size — so it is **opt-in, default OFF** (`NFRA_STM_RING=0`).
 
 ### Wiring
 - `NFRAConfig.cortex_stm_ring: int = 0` (0=off), `cortex_stm_dim: int = 32`.
@@ -81,20 +88,24 @@ Not implemented. RFC direction:
 
 ## 4. Evaluation contract (all on T4)
 
-1. **Zero-regression gate** (`bench_stm`): off vs ring-on identical init → `Δ eval <= 0.004`
-   nats and step-time `% ` <= `+5%`. If regresses, drop `w_out` lr or reduce window.
-2. **Throughput**: keep the ~29k tok/s·0.8 GB ·20M baseline.
-3. **Recall probe**: windowed copy-recall, per family (`nfra` vs `retnet` vs `gpt2`).
-4. **Final**: `big_night` multi-seed run.
+1. **Zero-regression gate**: off vs ring-on identical init → Δ eval within ±0.004 nats
+   on unseen content. Met: Δ +0.002 (tie). **Speed**: ring +~20% → fails the +5% bar →
+   ring is **opt-in, default OFF**.
+2. **Throughput**: default path keeps the ~29k tok/s · 0.8 GB · 20 M baseline (no ring).
+3. **Recall probe**: canonicalized to the stable hierarchical unseen-content A/B (the pure
+   copy task destabilized training → logit blow-up eval ~138).
+4. **Final**: `big_night` multi-seed runs use the default (ring OFF) for headline numbers.
 
 ## 5. Open questions
-- One ring per layer (current) vs a single shared top-level ring (half the memory, loses
-  per-depth relevance)?
+- One ring per layer (current) vs a single shared top-level ring (half the cost, loses
+  per-depth relevance)? A shared top ring is the likely path to making STM both cheaper
+  and `big_night`-compatible.
 - Always-cache vs a gradual read-workload-selected tag decay to free ring space?
 
 ## Milestones
 1. [x] prototype + O(1) dual + zero-init verified on CPU (`test_stm.py`, `bench_stm.py`)
-2. [ ] zero-regression A/B + speed on T4 (`bench_stm` → `BENCH_DONE`)
-3. [ ] recall probe (auxiliary memory objective), per family
-4. [ ] LTM sleep-scheduled consolidation + slow-copy ring
-5. [ ] `big_night` multi-seed headline run
+2. [x] on-T4 A/B: perplexity tie (~+0.002 nats), +20% step-time → opt-in, default OFF
+3. [~] recall probe: copy task unstable (collapsed); stable unseen-content A/B instead
+4. [ ] shared-ring variant (aim: +~5% cost), then re-run the A/B
+5. [ ] LTM sleep-scheduled consolidation + slow-copy ring
+6. [ ] `big_night` multi-seed headline run (default config)
