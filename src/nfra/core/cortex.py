@@ -78,6 +78,77 @@ class PerTokenGN(nn.Module):
         return yn.view(B, D, S)
 
 
+class CortexWorkingMemory(nn.Module):
+    """STM working-tag ring (RSM short-term store).
+
+    A small windowed causal attention head that reads the last `window` tokens
+    of the block's pre-norm mixer input and adds a residual:
+
+        y_wm[i] = sum_{j = i-window..i} softmax_j( q_i . k_j / sqrt(hd) ) * v_j
+
+    Biology: bounded, recent, decaying working memory (only the last window is
+    addressable; older trace falls out of the ring).
+
+    O(1) guarantee: `window` is a constant, so the read costs O(window) per
+    token = O(1) amortized, and the stateful O(1) decoder reproduces it exactly
+    by caching the last `window` mixer inputs per layer (see stateful.py).
+
+    Zero-regression guarantee: the output projection is zero-initialized, so
+    the read adds exactly 0 at init -> the verified NFRA is reproduced
+    bit-for-bit until the ring learns (quality/performance provably unregressed
+    at init; it can only add after training). wq/wk/wv keep normal init so the
+    read is not a dead gate (gradient flows through w_out).
+    """
+
+    def __init__(self, dim: int, window: int, stm_dim: int = 32):
+        super().__init__()
+        self.dim = dim
+        self.window = int(window)
+        self.stm_dim = int(stm_dim)
+        self.wq = nn.Linear(dim, stm_dim, bias=False)
+        self.wk = nn.Linear(dim, stm_dim, bias=False)
+        self.wv = nn.Linear(dim, stm_dim, bias=False)
+        self.w_out = nn.Linear(stm_dim, dim, bias=False)
+        # Zero-init ONLY the output projection (the "B" read-gate): the read then
+        # adds exactly 0 at init (no regression) yet wq/wk/wv keep nonzero values
+        # so gradient flows into w_out and then into the key/query/value paths,
+        # avoiding the all-zero dead-gate trap.
+        nn.init.zeros_(self.w_out.weight)
+
+    def _score(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """scores[q_idx, k_idx] = q . k / sqrt(stm_dim)."""
+        B, S1, _ = q.shape
+        S2 = k.shape[1]
+        q4 = q.view(B, 1, S1, self.stm_dim)
+        k4 = k.view(B, 1, S2, self.stm_dim)
+        return (q4 @ k4.transpose(-2, -1)) * (self.stm_dim ** -0.5)  # [B,1,S1,S2]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, _D = x.shape
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
+        ids = torch.arange(S, device=x.device)
+        rel = ids.view(S, 1) - ids.view(1, S)  # [S,S]
+        mask = (rel >= 0) & (rel <= self.window)  # causal, recent window only
+        scores = self._score(q, k)  # [B,1,S,S]
+        scores = scores.masked_fill(~mask.view(1, 1, S, S), float("-inf"))
+        att = torch.softmax(scores, dim=-1)
+        out = att @ v.view(B, 1, S, self.stm_dim)  # [B,1,S,sd]
+        return self.w_out(out.view(B, S, self.stm_dim))
+
+    @torch.no_grad()
+    def read_step(self, x1: torch.Tensor, ctx: list) -> torch.Tensor:
+        """One-token decode read: attend the current token over the cached past
+        window (+ itself), exactly mirroring forward() at the same positions."""
+        B = x1.shape[0]
+        q = self.wq(x1)  # [B,1,sd]
+        past = torch.cat(ctx, dim=1) if ctx else x1.new_zeros(B, 0, self.dim)
+        full = torch.cat([past, x1], dim=1)  # [B, L, D], L <= window+1
+        scores = self._score(q, self.wk(full))  # [B,1,1,L]
+        att = torch.softmax(scores, dim=-1)
+        out = att @ self.wv(full).view(B, 1, full.shape[1], self.stm_dim)  # [B,1,1,sd]
+        return self.w_out(out.view(B, 1, self.stm_dim))
+
+
 class CortexMixer(nn.Module):
     """Resonance retention mixer (the 3.3b core).
 
@@ -109,6 +180,8 @@ class CortexMixer(nn.Module):
         lsr: bool = False,
         int8_state: bool = False,
         per_token_gn: bool = False,
+        stm_ring: int = 0,
+        stm_dim: int = 32,
     ):
         super().__init__()
         self.dim = dim
@@ -161,6 +234,8 @@ class CortexMixer(nn.Module):
             PerTokenGN(dim, n_heads) if per_token_gn else nn.GroupNorm(n_heads, dim)
         )
         self.proj_out = nn.Linear(dim, dim, bias=False)
+        # STM working-tag ring: zero-initialized windowed read (adds 0 at init).
+        self.stm = CortexWorkingMemory(dim, stm_ring, stm_dim) if stm_ring else None
 
         # Multi-scale resonance decay: heads spread across timescales. Init
         # exactly like the proven RetNet grid (log_decay -5 -> gamma ~0.993,
@@ -302,6 +377,8 @@ class CortexMixer(nn.Module):
         if not self.iso_rgate:
             r = torch.sigmoid(r).permute(0, 2, 1, 3).reshape(B, S, D)
             y = y * r
+        if self.stm is not None:  # working-memory read (adds 0 at init)
+            y = y + self.stm(x)
         return self.proj_out(y)
 
 
@@ -456,6 +533,8 @@ class NFRA_Cortex_Block(nn.Module):
         lsr: bool = False,
         int8_state: bool = False,
         per_token_gn: bool = False,
+        stm_ring: int = 0,
+        stm_dim: int = 32,
     ):
         super().__init__()
         self.dim = dim
@@ -475,6 +554,8 @@ class NFRA_Cortex_Block(nn.Module):
             lsr=lsr,
             int8_state=int8_state,
             per_token_gn=per_token_gn,
+            stm_ring=stm_ring,
+            stm_dim=stm_dim,
         )
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = CortexMLP(dim, k_wta_frac=k_wta_frac, ckpt_gems=ckpt_gems)

@@ -183,6 +183,11 @@ DEPTH_TIME = os.environ.get("NFRA_DEPTH_TIME", "0") == "1"
 # coupling) so the retention stateful-decode dual is exact (stateful.py).
 # Requires a retrain; toggled by NFRA_PERTOKEN_GN=1.
 PER_TOKEN_GN = os.environ.get("NFRA_PERTOKEN_GN", "0") == "1"
+# STM working-tag ring (RSM short-term store): NFRA_STM_RING=k (>0) attaches a
+# zero-initialized windowed read (window k) to each Cortex mixer. Adds 0 at
+# init (no regression), O(1) decode exact via per-layer window cache.
+STM_RING = int(os.environ.get("NFRA_STM_RING", "0"))
+STM_DIM = int(os.environ.get("NFRA_STM_DIM", "32"))
 FUSE_MODEL = os.environ.get("NFRA_FUSE_MODEL", "0") == "1"
 BATCH_PASSES = os.environ.get("NFRA_BATCH_PASSES", "0") == "1"
 FUSE_NORM = os.environ.get("NFRA_FUSE_NORM", "0") == "1"
@@ -347,6 +352,8 @@ def build_nfra(
         cortex_int8_state=int8_state,
         cortex_depth_time=depth_time,
         cortex_per_token_gn=PER_TOKEN_GN,
+        cortex_stm_ring=STM_RING,
+        cortex_stm_dim=STM_DIM,
     )
     return NFRAForCausalLM(cfg)
 

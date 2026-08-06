@@ -133,6 +133,12 @@ class NFRAConfig:
     #                       channels PER TOKEN (no cross-token coupling) so the
     #                       retention dual runs O(1)-exact (stateful.py).
     cortex_per_token_gn: bool = False
+    # cortex_stm_ring : STM working-tag ring (RSM short-term store): >0 = window
+    #                   size k of a tiny windowed causal read per mixer block.
+    #                   Zero-init -> adds 0 at init (no regression); O(1) decode
+    #                   exact via cached per-layer window (stateful.py).
+    cortex_stm_ring: int = 0
+    cortex_stm_dim: int = 32
     # ckpt_gems : recompute the two biggest GEMM activations (qkvr, MLP gate_up)
     #             in backward instead of storing them. Trade compute for ~8 MB/
     #             layer of memory. Do NOT combine with torch.compile.
@@ -266,6 +272,8 @@ class NFRAForCausalLM(nn.Module):
             block_kwargs["lsr"] = config.cortex_lsr
             block_kwargs["int8_state"] = config.cortex_int8_state
             block_kwargs["per_token_gn"] = config.cortex_per_token_gn
+            block_kwargs["stm_ring"] = config.cortex_stm_ring
+            block_kwargs["stm_dim"] = config.cortex_stm_dim
         elif config.mode == "brain":
             block_kwargs["k_wta_frac"] = config.k_wta_frac
             block_kwargs["local_route"] = config.local_route

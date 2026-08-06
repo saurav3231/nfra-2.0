@@ -63,14 +63,15 @@ def make_states(model, batch=1, device="cpu"):
     st = []
     for layer in model.layers:
         m = layer.mixer
-        st.append(
-            {
-                "R": torch.zeros(
-                    batch, m.n_heads, m.head_dim, m.head_dim,
-                    device=device, dtype=torch.float32,
-                ),
-            }
-        )
+        entry = {
+            "R": torch.zeros(
+                batch, m.n_heads, m.head_dim, m.head_dim,
+                device=device, dtype=torch.float32,
+            ),
+        }
+        if m.stm is not None:  # STM working-tag ring: cached recent mixer inputs
+            entry["stm_ctx"] = []
+        st.append(entry)
     if model.global_brain is not None:
         st.append(
             {
@@ -108,6 +109,15 @@ def _mixer_step(mixer, x1, st):
     if r is not None:  # receptance gate (per-token, no state)
         rg = torch.sigmoid(r).permute(0, 2, 1, 3).reshape(B, 1, D)
         y = y * rg
+
+    if mixer.stm is not None:  # STM working-tag ring read + cache update
+        ctx = st.get("stm_ctx")
+        if ctx is None:
+            ctx = st["stm_ctx"] = []
+        y = y + mixer.stm.read_step(x1, ctx)
+        ctx.append(x1)
+        if len(ctx) > mixer.stm.window:
+            del ctx[0]
     return mixer.proj_out(y), st
 
 
