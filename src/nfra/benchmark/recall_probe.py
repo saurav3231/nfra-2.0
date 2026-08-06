@@ -1,13 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# recall_probe — RSM STM single-lag recall test (auxiliary memory objective)
+# recall_probe — RSM STM recall/generalization A/B (stable hierarchical task)
 #
-# Copy-recall with ONE lag, copy-density = 1.0, so the task is learnable
-# (every position is a copy of the token `lag` back). Ring-off vs ring-on, same
-# init, same batches. Accuracy measured on UNSEEN content at the same lag.
-#   * run with NFRA_RECALL_LAG <= NFRA_STM_WINDOW  -> ring should dominate
-#   * run with NFRA_RECALL_LAG >>  NFRA_STM_WINDOW -> both rely on matrix state
-# Env: NFRA_RECALL_STEPS, NFRA_RECALL_LAG, NFRA_STM_WINDOW, NFRA_STM_DIM,
-#      NFRA_STM_SIZE_M
+# The pure copy-recall task (density 1.0, single lag) destabilized training
+# (logits blew up -> eval ~138) and is NOT a reliable probe. This version uses
+# the same HierarchicalDataset pipeline that big_night trains stably to ~8.3:
+#   train = seq_seed SEED   |   eval = seq_seed SEED+1  (UNSEEN content, same
+# grammar) -> real generalization/recall, not memorization.
+# Ring-off vs ring-on, identical init, identical batches, longer training.
+# Verdict: HELPS (Δ<=-0.004) / PASS (-0.004<Δ<=+0.004) / REGRESSED (Δ>+0.004).
+# Env: NFRA_RECALL_STEPS, NFRA_STM_WINDOW, NFRA_STM_DIM, NFRA_STM_SIZE_M
 # ═══════════════════════════════════════════════════════════════════════════
 import os, sys, copy, time
 sys.path.insert(0, r"A:\Project\NFRA-2.0\src")
@@ -21,67 +22,26 @@ import nfra.benchmark.arena as A
 import nfra.benchmark.compare as C
 importlib.reload(C)
 importlib.reload(A)
-from torch.utils.data import Dataset, DataLoader
-from nfra.benchmark.compare import HierarchicalDataset
+from nfra.benchmark.compare import HierarchicalDataset, DataLoader, SEQ_LEN, BATCH
 from nfra.core.cortex import CortexWorkingMemory
+from nfra.core.stateful import stateful_generate_metrics
 
 DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-STEPS   = int(os.environ.get("NFRA_RECALL_STEPS", "1500"))
-LAG     = int(os.environ.get("NFRA_RECALL_LAG", "4"))
+STEPS   = int(os.environ.get("NFRA_RECALL_STEPS", "2000"))
 WINDOW  = int(os.environ.get("NFRA_STM_WINDOW", "16"))
 STM_DIM = int(os.environ.get("NFRA_STM_DIM", "32"))
 SIZE_M  = int(os.environ.get("NFRA_STM_SIZE_M", "20"))
 SEED    = int(os.environ.get("NFRA_STM_SEED", "42"))
 VOCAB   = HierarchicalDataset.VOCAB_SIZE  # 4096
-SEQ     = 257
 
 
-class CopyDataset(Dataset):
-    """Next-token copy-recall with one lag, density `frac`.
-    row[i] = row[i-lag] with prob `frac` (i>=lag). Returns (x, y) where
-    y[j] == x[j+1-lag] at copied positions."""
-
-    def __init__(self, num, seq_len, vocab, lag, frac, seed):
-        g = torch.Generator().manual_seed(seed)
-        self.data = torch.randint(0, vocab, (num, seq_len), generator=g)
-        for i in range(lag, seq_len):
-            if torch.rand(1, generator=g).item() < frac:
-                self.data[:, i] = self.data[:, i - lag]
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        row = self.data[idx]
-        return row[:-1], row[1:]
-
-
-def make_loader(num, lag, frac, seed, shuffle=True, batch=16):
-    ds = CopyDataset(num, SEQ, VOCAB, lag, frac, seed)
-    return DataLoader(ds, batch_size=batch, shuffle=shuffle,
-                      generator=torch.Generator().manual_seed(seed) if shuffle else None)
-
-
-def recall_accuracy(model, loader, lag, max_batches=25):
-    """Fraction of copied positions (target = token `lag` back) predicted exactly."""
-    model.eval()
-    corr = tot = 0
-    with torch.no_grad():
-        for bi, (x, y) in enumerate(loader):
-            if bi >= max_batches:
-                break
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            pred = model(x)["logits"].argmax(-1)          # (B, S)
-            S = x.shape[1]
-            j = torch.arange(S, device=DEVICE)
-            mask = j >= lag - 1
-            idx = mask.nonzero().squeeze(-1)
-            predsel = pred[:, mask]
-            targsel = x[:, idx + (1 - lag)]
-            corr += (predsel == targsel).sum().item()
-            tot += predsel.numel()
-    model.train()
-    return corr / max(tot, 1)
+def make_loaders():
+    ds_tr = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1, seed=SEED, seq_seed=SEED)
+    ds_ev = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED, seq_seed=SEED + 1)  # unseen content
+    tr = DataLoader(ds_tr, batch_size=BATCH, shuffle=True,
+                    generator=torch.Generator().manual_seed(SEED), num_workers=0)
+    ev = DataLoader(ds_ev, batch_size=BATCH, shuffle=False, num_workers=0)
+    return tr, ev
 
 
 def build():
@@ -104,27 +64,28 @@ if __name__ == "__main__":
 
     def run(model):
         from nfra.benchmark.arena import train_one
-        tr = make_loader(2048, LAG, 1.0, SEED, shuffle=True)         # learnable copy task
-        ev = make_loader(512, LAG, 0.0, SEED + 7, shuffle=False)   # LM-free (no copies)
+        _tr, _ev = make_loaders()  # fresh, same seed => identical batches both arms
         t0 = time.perf_counter()
-        h = train_one(model, VOCAB, STEPS, tr, ev, eval_gap=max(20, STEPS // 4),
+        h = train_one(model, VOCAB, STEPS, _tr, _ev, eval_gap=max(20, STEPS // 4),
                       ema_decay=float(C.EMA_DECAY), surprise=False, seed=SEED)
         dt = time.perf_counter() - t0
         fin = h["eval_hist"][-1][1] if h["eval_hist"] else float("nan")
-        return fin, dt * 1000 / STEPS
+        tr_last = h["loss_hist"][-1] if h["loss_hist"] else float("nan")
+        return fin, tr_last, dt * 1000 / STEPS
 
-    lm_off, ms_off = run(base)
-    lm_on, ms_on = run(on)
+    lm_off, tr_off, ms_off = run(base)
+    lm_on, tr_on, ms_on = run(on)
+    delta = lm_on - lm_off
 
-    ev_off = make_loader(512, LAG, 1.0, SEED + 99, shuffle=False)  # unseen content, pure copy
-    ev_on = make_loader(512, LAG, 1.0, SEED + 99, shuffle=False)
-    a_off = recall_accuracy(base, ev_off, LAG)
-    a_on = recall_accuracy(on, ev_on, LAG)
-
-    print("\n──────────── RSM single-lag recall ────────────")
-    print(f"  task: copy token {LAG} back   |   ring window = {WINDOW}")
-    print(f"  LM eval   off {lm_off:.3f}  on {lm_on:.3f}    {ms_off:.1f}/{ms_on:.1f} ms/step")
-    print(f"  recall @lag={LAG}   off {a_off*100:6.2f}%   on {a_on*100:6.2f}%   Δ {a_on-a_off:+.2%}")
-    verdict = ("RING-HYPO-CONFIRMED" if LAG <= WINDOW and a_on > a_off
-               else "RING-HYP-REVERSED" if a_on < a_off else "RING-TIE")
+    print("\n──────────── RSM recall/generalization A/B (unseen content) ────────────")
+    print(f"  ring window = {WINDOW}    steps = {STEPS}")
+    print(f"  train-loss final  off {tr_off:.3f}  on {tr_on:.3f}")
+    print(f"  eval (unseen)     off {lm_off:.3f}  on {lm_on:.3f}   Δ {delta:+.3f}")
+    print(f"  speed             off {ms_off:.1f}  on {ms_on:.1f} ms/step   (Δ {ms_on/ms_off*100-100:+.1f}%)")
+    sf = stateful_generate_metrics(on, VOCAB, prompt_len=64, gen_len=16, device=DEVICE)
+    if sf["sf_ok"] is None:
+        print("  O(1) stateful = UNSUPPORTED")
+    else:
+        print(f"  O(1) stateful = sf_ok {sf['sf_ok']}  max_rel {sf['sf_rel']:.2e}  gen_sf {sf['gen_sf']:.1f}/s")
+    verdict = "HELPS" if delta <= -0.004 else ("REGRESSED" if delta > 0.004 else "PASS")
     print("PROBE_DONE " + verdict)
