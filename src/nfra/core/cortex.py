@@ -124,16 +124,22 @@ class CortexWorkingMemory(nn.Module):
         return (q4 @ k4.transpose(-2, -1)) * (self.stm_dim ** -0.5)  # [B,1,S1,S2]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Banded O(S*W) windowed attention — no full SxS materialization.
         B, S, _D = x.shape
-        q, k, v = self.wq(x), self.wk(x), self.wv(x)
+        W = self.window
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)          # [B,S,sd]
+        pad = x.new_zeros(B, W, self.stm_dim)
+        kp = torch.cat([pad, k], dim=1)                       # [B,S+W,sd]
+        vp = torch.cat([pad, v], dim=1)
+        kb = kp.unfold(1, W + 1, 1).permute(0, 1, 3, 2)       # [B,S,W+1,sd]
+        vb = vp.unfold(1, W + 1, 1).permute(0, 1, 3, 2)
+        scores = torch.einsum("bsd,bswd->bsw", q, kb) * (self.stm_dim ** -0.5)  # [B,S,W+1]
         ids = torch.arange(S, device=x.device)
-        rel = ids.view(S, 1) - ids.view(1, S)  # [S,S]
-        mask = (rel >= 0) & (rel <= self.window)  # causal, recent window only
-        scores = self._score(q, k)  # [B,1,S,S]
-        scores = scores.masked_fill(~mask.view(1, 1, S, S), float("-inf"))
+        mask = torch.arange(W + 1, device=x.device)[None, :] >= (W - ids[:, None])  # j>=0
+        scores = scores.masked_fill(~mask[None], float("-inf"))
         att = torch.softmax(scores, dim=-1)
-        out = att @ v.view(B, 1, S, self.stm_dim)  # [B,1,S,sd]
-        return self.w_out(out.view(B, S, self.stm_dim))
+        out = torch.einsum("bsw,bswd->bsd", att, vb)          # [B,S,sd]
+        return self.w_out(out)
 
     @torch.no_grad()
     def read_step(self, x1: torch.Tensor, ctx: list) -> torch.Tensor:
