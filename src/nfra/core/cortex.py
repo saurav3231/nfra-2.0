@@ -124,21 +124,22 @@ class CortexWorkingMemory(nn.Module):
         return (q4 @ k4.transpose(-2, -1)) * (self.stm_dim ** -0.5)  # [B,1,S1,S2]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Banded O(S*W) windowed attention — no full SxS materialization.
+        # Banded O(S*W) windowed attention — no full SxS materialization, and
+        # kept in the AMP compute dtype (pad matches k, so no fp32 promotion).
         B, S, _D = x.shape
         W = self.window
         q, k, v = self.wq(x), self.wk(x), self.wv(x)          # [B,S,sd]
-        pad = x.new_zeros(B, W, self.stm_dim)
+        pad = k.new_zeros(B, W, self.stm_dim)
         kp = torch.cat([pad, k], dim=1)                       # [B,S+W,sd]
         vp = torch.cat([pad, v], dim=1)
         kb = kp.unfold(1, W + 1, 1).permute(0, 1, 3, 2)       # [B,S,W+1,sd]
         vb = vp.unfold(1, W + 1, 1).permute(0, 1, 3, 2)
-        scores = torch.einsum("bsd,bswd->bsw", q, kb) * (self.stm_dim ** -0.5)  # [B,S,W+1]
+        scores = (q.unsqueeze(2) @ kb.transpose(-1, -2)).squeeze(2) * (self.stm_dim ** -0.5)  # [B,S,W+1]
         ids = torch.arange(S, device=x.device)
         mask = torch.arange(W + 1, device=x.device)[None, :] >= (W - ids[:, None])  # j>=0
         scores = scores.masked_fill(~mask[None], float("-inf"))
         att = torch.softmax(scores, dim=-1)
-        out = torch.einsum("bsw,bswd->bsd", att, vb)          # [B,S,sd]
+        out = (att.unsqueeze(2) @ vb).squeeze(2)              # [B,S,sd]
         return self.w_out(out)
 
     @torch.no_grad()
