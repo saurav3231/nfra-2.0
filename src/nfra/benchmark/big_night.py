@@ -1,6 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # NFRA-2.0 · OVERNIGHT BIG-RUN — max T4, streaming output, credible cross-family
-#   NFRA (recommended recipe)  vs  RetNet  vs  RWKV  vs  GPT-2   (NO Mamba)
+#   NFRA (recommended recipe)  vs  RetNet  vs  GPT-2   (rwkv dropped: diverges on
+#   this task; Mamba excluded entirely)
 #   • multi-size (5/20/50M) × multi-seed (mean±std) × matched params
 #   • real WikiText-2 char data, AdamW + cosine, EMA, AMP, big steps
 #   • wall-clock budget (NFRA_WALL min) so it always finishes before Kaggle's
@@ -37,7 +38,7 @@ SIZES_M = [int(x) for x in os.environ.get("NFRA_BIG_SIZES", "20,50").split(",") 
 SEED_CNT = int(os.environ.get("NFRA_BIG_SEEDS", "3"))
 STEPS_BIG = int(os.environ.get("NFRA_BIG_STEPS", "3000"))
 WALL_MIN = int(os.environ.get("NFRA_WALL", "480"))   # wall-clock budget (min)
-FAMILIES = ["nfra", "retnet", "rwkv", "gpt2"]        # Mamba intentionally excluded
+FAMILIES = ["nfra", "retnet", "gpt2"]        # rwkv dropped (diverges on this task); Mamba excluded
 EVAL_GAP = max(50, STEPS_BIG // 8)
 
 import torch
@@ -218,14 +219,17 @@ summary = {}
 for size in SIZES_M:
     for fam in FAMILIES:
         vals = [all_results[f"{fam}|{size}M|{s}"]["final_eval"] for s in SEEDS
-                if f"{fam}|{size}M|{s}" in all_results]
+                if f"{fam}|{size}M|{s}" in all_results
+                and math.isfinite(all_results[f"{fam}|{size}M|{s}"]["final_eval"])]
         if not vals:
+            print(f"  {fam:6s} {size:>3d}M  (no valid seeds — training diverged/NaN)")
             continue
-        mean, std = sum(vals) / len(vals), (sum((v - sum(vals)/len(vals))**2 for v in vals)/len(vals))**0.5
+        mean = sum(vals) / len(vals)
+        std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         tok = all_results[f"{fam}|{size}M|{SEEDS[0]}"]["tok_s"]
         mem = all_results[f"{fam}|{size}M|{SEEDS[0]}"]["mem"]
         sf = all_results[f"{fam}|{size}M|{SEEDS[0]}"].get("gen_sf")
-        line = f"  {fam:6s} {size:>3d}M  eval {mean:7.4f} ± {std:.4f}   ppl≈{math.exp(min(mean,30)):6.1f}  tok/s {tok:>7,}  mem {mem:5.2f}G"
+        line = f"  {fam:6s} {size:>3d}M  eval {mean:7.4f} ± {std:.4f}  (n={len(vals)})  ppl≈{math.exp(min(mean,30)):6.1f}  tok/s {tok:>7,}  mem {mem:5.2f}G"
         if sf:
             line += f"  gen_sf {sf:.0f}/s ok={all_results[f'{fam}|{size}M|{SEEDS[0]}']['sf_ok']}"
         print(line)
