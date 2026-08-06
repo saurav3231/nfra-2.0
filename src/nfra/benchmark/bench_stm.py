@@ -46,7 +46,7 @@ def build():
         mode="brain", vocab_size=VOCAB, hidden_size=dim, num_layers=depth,
         depth_shared=False, unique_blocks=depth, use_cortex=True, n_bands=16,
         gradient_checkpointing=True, k_wta_frac=0.0, cortex_lsr=False,
-        iso_gland=False, iso_vgate=True, iso_phase=True, iso_exit=False,
+        iso_gland=True, iso_vgate=True, iso_rgate=False, iso_phase=True, iso_exit=True,
         cortex_per_token_gn=True, cortex_stm_ring=0, cortex_stm_dim=STM_DIM,
         dropout=0.1,
     )
@@ -56,7 +56,7 @@ def build():
 
 def make_loaders():
     ds_tr = HierarchicalDataset(max(4096, BATCH * 8), SEQ_LEN + 1, seed=SEED, seq_seed=SEED)
-    ds_ev = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED, seq_seed=SEED + 1)
+    ds_ev = HierarchicalDataset(512, SEQ_LEN + 1, seed=SEED, seq_seed=SEED)
     tr = DataLoader(ds_tr, batch_size=BATCH, shuffle=True,
                     generator=torch.Generator().manual_seed(SEED), num_workers=0)
     ev = DataLoader(ds_ev, batch_size=BATCH, shuffle=False, num_workers=0)
@@ -82,8 +82,9 @@ tr, ev = make_loaders()
 
 def run(model):
     from nfra.benchmark.arena import train_one
+    _tr, _ev = make_loaders()  # fresh, same seed => identical batches for both arms
     t0 = time.perf_counter()
-    h = train_one(model, VOCAB, steps, tr, ev, eval_gap=max(20, steps // 4),
+    h = train_one(model, VOCAB, steps, _tr, _ev, eval_gap=max(20, steps // 4),
                   ema_decay=float(C.EMA_DECAY), surprise=False, seed=SEED)
     dt = time.perf_counter() - t0
     final = h["eval_hist"][-1][1] if h["eval_hist"] else float("nan")
@@ -102,5 +103,8 @@ print(f"  Δ eval (on - off) = {f_on - f_off:+.3f}   (<=0 = no regression)")
 print(f"  speed Δ          = {ms_on / ms_off * 100 - 100:+.1f}%")
 print(f"  ring params      = {n_ring:,}")
 sf = stateful_generate_metrics(on, VOCAB, prompt_len=64, gen_len=16, device=DEVICE)
-print(f"  O(1) stateful    = sf_ok {sf['sf_ok']}  max_rel {sf['sf_rel']:.2e}  gen_sf {sf['gen_sf']:.1f}/s")
+if sf["sf_ok"] is None:
+    print("  O(1) stateful    = UNSUPPORTED (check iso flags / per-token GN)")
+else:
+    print(f"  O(1) stateful    = sf_ok {sf['sf_ok']}  max_rel {sf['sf_rel']:.2e}  gen_sf {sf['gen_sf']:.1f}/s")
 print("BENCH_DONE")
